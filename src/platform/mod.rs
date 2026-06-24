@@ -44,10 +44,17 @@ pub trait Platform {
     fn exit(&self, code: i32) -> !;
 }
 
-#[cfg(target_os = "linux")]
+// The Linux backend is raw `aarch64` syscalls — its syscall numbers and
+// register usage are architecture-specific, so it must be gated by arch, not
+// just OS. Building for Linux on another architecture is a clear error rather
+// than silently wrong syscalls.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub use linux::Os;
+
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+compile_error!("Titan's Linux platform backend currently supports aarch64 only");
 
 #[cfg(target_os = "macos")]
 mod macos;
