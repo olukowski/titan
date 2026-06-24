@@ -1,0 +1,17 @@
+[package]
+name = "titan"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "An agent-native game engine in no_std, zero-dependency, stable Rust."
+repository = "https://github.com/titan-engine/titan"
+
+# A freestanding binary has no unwinder, and `eh_personality` is an unstable
+# lang item — so we abort on panic everywhere. (`cargo test` ignores this for the
+# test harness and links the lib against std; see CI, which tests the lib
+# separately from building the no_std example.)
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

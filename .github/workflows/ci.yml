@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The whole point of the platform layer is the cross-OS story, so we gate on
+# both native aarch64 runners: Linux (raw syscalls) and macOS (libSystem).
+jobs:
+  ci:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-26]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc -vV
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The freestanding example can't compile under the unwinding test profile,
+      # so we test the library explicitly (--lib and --doc; they can't be mixed
+      # in one invocation) rather than running a bare `cargo test`.
+      - name: Test (library)
+        run: cargo test --lib
+
+      - name: Test (doc)
+        run: cargo test --doc
+
+      # Build and run the no_std, zero-dependency example, asserting it prints
+      # "hello" and exits 0 — the actual proof the platform layer works on this
+      # OS (Linux raw syscalls / macOS libSystem).
+      - name: Build example
+        run: cargo build --example hello
+
+      - name: Run example and assert output
+        shell: bash
+        run: |
+          out="$(cargo run --quiet --example hello)"
+          echo "stdout: [$out]"
+          test "$out" = "hello"
