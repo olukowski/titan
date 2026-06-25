@@ -15,7 +15,7 @@ use titan::platform::{Console, Os, Process, STDOUT};
 /// [`Console`] and [`Process`] — rather than any concrete OS or the whole
 /// platform surface: write the greeting, then exit cleanly through the platform.
 fn run(platform: &(impl Console + Process)) -> ! {
-    // `Platform::write` carries the raw `write(2)` contract: a write may be
+    // `Console::write` carries the raw `write(2)` contract: a write may be
     // short, so loop until every byte is delivered. For "hello\n" this never
     // actually loops, but the example should model the contract it depends on.
     let mut remaining: &[u8] = b"hello\n";

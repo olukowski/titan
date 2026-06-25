@@ -82,9 +82,13 @@ impl<'a> Bump<'a> {
 
     /// Free every allocation at once by rewinding the arena to empty.
     ///
-    /// Takes `&mut self`: this invalidates every pointer previously handed out,
-    /// and the exclusive borrow proves none are still held.
-    pub fn reset(&mut self) {
+    /// # Safety
+    /// This invalidates every pointer previously returned by
+    /// [`alloc`](Allocator::alloc). The caller must ensure none of them — nor any
+    /// value still backed by them — is used afterwards. `&mut self` alone cannot
+    /// prove this: allocations are handed out as raw pointers that carry no borrow
+    /// of the arena, so the borrow checker does not track them.
+    pub unsafe fn reset(&mut self) {
         self.used.set(0);
     }
 
@@ -96,10 +100,20 @@ impl<'a> Bump<'a> {
 
 // SAFETY: blocks are carved sequentially from a single exclusively-borrowed
 // region and so never overlap; a returned pointer stays valid until the arena is
-// reset or dropped, both of which require `&mut self` and thus that no block is
-// still borrowed.
+// dropped or explicitly `reset` (which is `unsafe` precisely because it
+// invalidates outstanding blocks).
 unsafe impl Allocator for Bump<'_> {
     fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
+        // A zero-sized request needs no storage: return a dangling but aligned
+        // pointer without consuming the arena, so it always succeeds (the pointer
+        // must never be dereferenced). This also stops over-aligned ZST requests
+        // like `(0, 16)` from failing or burning alignment padding near the end.
+        if layout.size() == 0 {
+            // SAFETY: `Layout::align` is a non-zero power of two, so using it as
+            // an address yields a non-null, correctly aligned pointer.
+            return Some(unsafe { NonNull::new_unchecked(layout.align() as *mut u8) });
+        }
+
         let used = self.used.get();
         // The cursor as an absolute address — alignment is a property of the
         // address, not of the offset, so we must align this, not `used`.
@@ -165,7 +179,9 @@ mod tests {
         assert!(bump.alloc(layout(7, 1)).is_none());
         assert_eq!(bump.used(), 10);
 
-        bump.reset();
+        // SAFETY: no allocation from this arena is live across the reset — the
+        // pointer from the `alloc` above was discarded.
+        unsafe { bump.reset() };
         assert_eq!(bump.used(), 0);
         // The whole region is available again after reset.
         assert!(bump.alloc(layout(16, 1)).is_some());
@@ -189,5 +205,19 @@ mod tests {
         let bump = Bump::new(&mut buf);
         assert!(bump.alloc(layout(0, 1)).is_some());
         assert_eq!(bump.used(), 0, "a zero-sized request consumes nothing");
+    }
+
+    #[test]
+    fn over_aligned_zero_sized_request_consumes_nothing() {
+        // Fill the arena, then ask for a heavily over-aligned zero-sized block:
+        // it must still succeed (aligned, non-null) without touching the region.
+        let mut buf = [0u8; 8];
+        let bump = Bump::new(&mut buf);
+        bump.alloc(layout(8, 1)).unwrap();
+        assert_eq!(bump.used(), 8);
+
+        let p = bump.alloc(layout(0, 16)).unwrap();
+        assert_eq!(p.as_ptr() as usize % 16, 0, "ZST pointer must be aligned");
+        assert_eq!(bump.used(), 8, "a zero-sized request consumes nothing");
     }
 }
