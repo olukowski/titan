@@ -9,11 +9,12 @@
 #![no_std]
 #![no_main]
 
-use titan::platform::{Os, Platform, STDOUT};
+use titan::platform::{Console, Os, Process, STDOUT};
 
-/// The actual work, written against the [`Platform`] interface rather than any
-/// concrete OS: write the greeting, then exit cleanly through the platform.
-fn run(platform: &impl Platform) -> ! {
+/// The actual work, written against the platform capabilities it actually uses —
+/// [`Console`] and [`Process`] — rather than any concrete OS or the whole
+/// platform surface: write the greeting, then exit cleanly through the platform.
+fn run(platform: &(impl Console + Process)) -> ! {
     // `Platform::write` carries the raw `write(2)` contract: a write may be
     // short, so loop until every byte is delivered. For "hello\n" this never
     // actually loops, but the example should model the contract it depends on.
@@ -32,7 +33,7 @@ fn run(platform: &impl Platform) -> ! {
 /// `_start` (see `build.rs`, which drops the C runtime startup files for the
 /// example). We own the entry point and never return.
 #[cfg(target_os = "linux")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     run(&Os)
 }
@@ -40,7 +41,7 @@ pub extern "C" fn _start() -> ! {
 /// macOS: libSystem's C runtime provides `start`, which calls `main`. We ignore
 /// `argc`/`argv` and exit through the platform instead of returning to the crt.
 #[cfg(target_os = "macos")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
     run(&Os)
 }
