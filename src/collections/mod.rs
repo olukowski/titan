@@ -122,8 +122,10 @@ impl<'a, T, A: Allocator> Array<'a, T, A> {
 
     /// View the initialized elements as a slice.
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: `ptr` is valid for `len` initialized, contiguous elements (a
-        // dangling-but-aligned `ptr` is sound for `len == 0`).
+        // SAFETY: for a sized `T`, `ptr` is valid for `len` initialized,
+        // contiguous elements. For a zero-sized `T`, `len` may be > 0 over a
+        // dangling `ptr`; that is sound because a ZST slice needs only a non-null,
+        // aligned pointer (which `NonNull::dangling` is) and no backing storage.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
@@ -250,6 +252,24 @@ mod tests {
             Ok(()) => panic!("push should have failed on an exhausted allocator"),
         }
         assert!(xs.is_empty());
+    }
+
+    #[test]
+    fn failed_growth_preserves_existing_elements() {
+        // Room for the first 4-element i32 block (16 bytes + a little alignment
+        // slack) but not the 32-byte block the next growth would need.
+        let mut storage = [0u8; 40];
+        let bump = Bump::new(&mut storage);
+        let mut xs: Array<i32, _> = Array::new_in(&bump);
+
+        for v in 0..4 {
+            assert!(xs.push(v).is_ok());
+        }
+        // The 5th push must grow 4 -> 8, which the arena cannot satisfy.
+        assert_eq!(xs.push(99), Err(99));
+        // The failed growth leaves the array exactly as it was.
+        assert_eq!(xs.len(), 4);
+        assert_eq!(xs.as_slice(), &[0, 1, 2, 3]);
     }
 
     #[test]
