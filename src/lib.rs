@@ -8,4 +8,5 @@
 //! the test harness, `#[test]`, and assertions keep working.
 #![cfg_attr(not(test), no_std)]
 
+pub mod alloc;
 pub mod platform;
