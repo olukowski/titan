@@ -317,16 +317,6 @@ impl Validator<'_> {
             match component.key.as_str() {
                 "transform" => self.validate_transform(&component.value, &component_path),
                 "velocity" => self.validate_velocity(&component.value, &component_path),
-                "mesh" | "camera" | "light" => {
-                    if object_members(&component.value).is_none() {
-                        self.push(
-                            "TSF_SCHEMA",
-                            "component payload must be an object",
-                            component_path,
-                            component.value.span,
-                        );
-                    }
-                }
                 _ => self.push(
                     "TSF_UNKNOWN_COMPONENT",
                     format!("unknown component '{}'", component.key),
@@ -338,16 +328,11 @@ impl Validator<'_> {
     }
 
     fn validate_transform(&mut self, value: &Value, path: &str) {
-        self.validate_payload_vectors(
-            value,
-            path,
-            &[("translation", 3), ("rotation", 4), ("scale", 3)],
-            "transform",
-        );
+        self.validate_payload_vectors(value, path, &[("translation", 3)], "transform");
     }
 
     fn validate_velocity(&mut self, value: &Value, path: &str) {
-        self.validate_payload_vectors(value, path, &[("linear", 3), ("angular", 3)], "velocity");
+        self.validate_payload_vectors(value, path, &[("linear", 3)], "velocity");
     }
 
     fn validate_payload_vectors(
@@ -366,6 +351,16 @@ impl Validator<'_> {
             );
             return;
         };
+        for member in members {
+            if !fields.iter().any(|(field, _)| *field == member.key) {
+                self.push(
+                    "TSF_UNKNOWN_COMPONENT_FIELD",
+                    format!("{component} field '{}' is not supported", member.key),
+                    json_pointer_join(path, &member.key),
+                    member.key_span,
+                );
+            }
+        }
         for (field, len) in fields {
             match member(members, field) {
                 Some(entry) => self.validate_number_array(
@@ -403,13 +398,24 @@ impl Validator<'_> {
             );
         }
         for (index, value) in values.iter().enumerate() {
-            if !matches!(value.kind, ValueKind::Number(_)) {
-                self.push(
-                    "TSF_SCHEMA",
-                    format!("{label}[{index}] must be a number"),
-                    format!("{path}/{index}"),
-                    value.span,
-                );
+            match &value.kind {
+                ValueKind::Number(number) if !fits_f32_without_underflow(number.value) => {
+                    self.push(
+                        "TSF_INVALID_NUMBER",
+                        format!("{label}[{index}] must fit in f32 without underflow"),
+                        format!("{path}/{index}"),
+                        value.span,
+                    );
+                }
+                ValueKind::Number(_) => {}
+                _ => {
+                    self.push(
+                        "TSF_SCHEMA",
+                        format!("{label}[{index}] must be a number"),
+                        format!("{path}/{index}"),
+                        value.span,
+                    );
+                }
             }
         }
     }
@@ -522,6 +528,11 @@ fn object_members(value: &Value) -> Option<&[Member]> {
         ValueKind::Object(members) => Some(members),
         _ => None,
     }
+}
+
+fn fits_f32_without_underflow(value: f64) -> bool {
+    let converted = value as f32;
+    converted.is_finite() && (value == 0.0 || converted != 0.0)
 }
 
 fn member<'a>(members: &'a [Member], key: &str) -> Option<&'a Member> {

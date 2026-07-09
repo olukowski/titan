@@ -65,7 +65,7 @@ fn validate_reports_structured_diagnostics_for_invalid_scene() {
         .code(1)
         .stdout("")
         .stderr(predicate::str::contains("TSF_UNKNOWN_COMPONENT"))
-        .stderr(predicate::str::contains(":18:"));
+        .stderr(predicate::str::contains(":16:"));
 
     let json = stderr_json(
         titan()
@@ -81,7 +81,7 @@ fn validate_reports_structured_diagnostics_for_invalid_scene() {
         json["errors"][0]["path"],
         "/entities/entity:mover/components/velocty"
     );
-    assert_eq!(json["errors"][0]["span"]["start"]["line"], 18);
+    assert_eq!(json["errors"][0]["span"]["start"]["line"], 16);
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn query_by_entity_id_returns_value_span_and_resolved_pointer() {
     assert_eq!(json["path"], "/entities/entity:mover/components/velocity");
     assert_eq!(json["resolved_pointer"], "/entities/0/components/velocity");
     assert_eq!(json["value"]["linear"][0], 0.1);
-    assert_eq!(json["span"]["start"]["line"], 18);
+    assert_eq!(json["span"]["start"]["line"], 16);
 }
 
 #[test]

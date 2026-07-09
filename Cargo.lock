@@ -441,6 +441,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "titan_core",
  "titan_scene",
 ]
 

@@ -1,4 +1,5 @@
-use titan_scene::{Number, ValueKind, edit, fmt, parse, query, validate};
+use titan_core::phase1_component_registry;
+use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
 
@@ -13,6 +14,71 @@ fn moving_entity_round_trips_and_format_is_idempotent() {
     let reparsed = parse(Some("moving_entity.tsf"), &formatted).expect("parse formatted fixture");
     let reformatted = fmt(&reparsed);
     assert_eq!(reformatted, formatted);
+}
+
+#[test]
+fn load_world_assigns_scene_entity_ids_independent_of_array_order() {
+    let first = parse(
+        Some("ordered.tsf"),
+        r#"{
+  tsf: 1,
+  scene: { id: "scene:test" },
+  assets: {},
+  entities: [
+    {
+      id: "entity:b",
+      components: {
+        transform: { translation: [2.0, 0.0, 0.0] },
+      },
+    },
+    {
+      id: "entity:a",
+      components: {
+        transform: { translation: [1.0, 0.0, 0.0] },
+      },
+    },
+  ],
+}
+"#,
+    )
+    .expect("parse first scene");
+    let second = parse(
+        Some("reordered.tsf"),
+        r#"{
+  tsf: 1,
+  scene: { id: "scene:test" },
+  assets: {},
+  entities: [
+    {
+      id: "entity:a",
+      components: {
+        transform: { translation: [1.0, 0.0, 0.0] },
+      },
+    },
+    {
+      id: "entity:b",
+      components: {
+        transform: { translation: [2.0, 0.0, 0.0] },
+      },
+    },
+  ],
+}
+"#,
+    )
+    .expect("parse reordered scene");
+
+    let first = load_world(&first, phase1_component_registry().unwrap())
+        .unwrap()
+        .dump_state()
+        .unwrap();
+    let second = load_world(&second, phase1_component_registry().unwrap())
+        .unwrap()
+        .dump_state()
+        .unwrap();
+
+    assert_eq!(first.entity_ids, second.entity_ids);
+    assert_eq!(first.entity_ids.get("entity:a"), Some(&1));
+    assert_eq!(first.entity_ids.get("entity:b"), Some(&2));
 }
 
 #[test]
@@ -211,6 +277,53 @@ fn invalid_entity_parent_is_diagnostic() {
     assert!(error.errors.iter().any(|diagnostic| {
         diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/entities/entity:mover/parent"
     }));
+}
+
+#[test]
+fn unsupported_runtime_components_are_diagnostic() {
+    for component in ["mesh", "camera", "light"] {
+        let source = MOVING_ENTITY.replace(
+            "        velocity: {",
+            &format!("        {component}: {{}},\n        velocity: {{"),
+        );
+        let document = parse(Some("unsupported-component.tsf"), &source).expect("parse");
+        let error = validate(&document).expect_err("unsupported component should fail");
+
+        assert!(
+            error.errors.iter().any(|diagnostic| {
+                diagnostic.code == "TSF_UNKNOWN_COMPONENT"
+                    && diagnostic.path == format!("/entities/entity:mover/components/{component}")
+            }),
+            "missing diagnostic for {component}: {:?}",
+            error.errors
+        );
+    }
+}
+
+#[test]
+fn unsupported_runtime_component_fields_are_diagnostic() {
+    for (component, field, payload) in [
+        ("transform", "rotation", "[0.0, 0.0, 0.0, 1.0]"),
+        ("transform", "scale", "[1.0, 1.0, 1.0]"),
+        ("velocity", "angular", "[0.0, 0.0, 0.0]"),
+    ] {
+        let source = MOVING_ENTITY.replace(
+            &format!("        {component}: {{"),
+            &format!("        {component}: {{\n          {field}: {payload},"),
+        );
+        let document = parse(Some("unsupported-field.tsf"), &source).expect("parse");
+        let error = validate(&document).expect_err("unsupported field should fail");
+
+        assert!(
+            error.errors.iter().any(|diagnostic| {
+                diagnostic.code == "TSF_UNKNOWN_COMPONENT_FIELD"
+                    && diagnostic.path
+                        == format!("/entities/entity:mover/components/{component}/{field}")
+            }),
+            "missing diagnostic for {component}.{field}: {:?}",
+            error.errors
+        );
+    }
 }
 
 #[test]

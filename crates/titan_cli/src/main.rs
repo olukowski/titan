@@ -7,7 +7,13 @@ use std::{
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use serde::Serialize;
-use titan_scene::{Diagnostic, DiagnosticSpan, Document, Position, Span, TsfError};
+use titan_core::{
+    DEFAULT_FIXED_DT, DEFAULT_RUN_SEED, FixedStepContext, Schedule, phase1_component_registry,
+    velocity_integration_system,
+};
+use titan_scene::{
+    Diagnostic, DiagnosticSpan, Document, Position, Span, TsfError, load_world, parse,
+};
 
 const APP_NAME: &str = "titan";
 const EXIT_FAILURE: u8 = 1;
@@ -30,6 +36,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a scene in the deterministic headless runtime.
+    Run(RunArgs),
     /// Print version information.
     Version,
     /// Validate, query, edit, and format Titan Scene Format files.
@@ -73,11 +81,42 @@ enum SceneCommand {
     },
 }
 
+#[derive(Debug, Parser)]
+struct RunArgs {
+    /// Scene file to load.
+    scene: PathBuf,
+
+    /// Run headless. This is the only runtime mode in Phase 1.
+    #[arg(long)]
+    headless: bool,
+
+    /// Number of fixed-timestep frames to simulate.
+    #[arg(long)]
+    frames: u64,
+
+    /// Deterministic run seed.
+    #[arg(long, default_value_t = DEFAULT_RUN_SEED)]
+    seed: u64,
+
+    /// Fixed timestep in seconds.
+    #[arg(long, default_value_t = DEFAULT_FIXED_DT)]
+    dt: f32,
+
+    /// Write the final state dump JSON to this file.
+    #[arg(long)]
+    dump_state: Option<PathBuf>,
+
+    /// Write the event log as JSONL to this file.
+    #[arg(long)]
+    event_log: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 struct TitanError {
     code: &'static str,
     message: String,
     exit_code: u8,
+    diagnostics: Option<Vec<Diagnostic>>,
 }
 
 enum SceneLoadError {
@@ -95,6 +134,16 @@ impl TitanError {
             code,
             message: message.into(),
             exit_code,
+            diagnostics: None,
+        }
+    }
+
+    fn from_tsf(message: impl Into<String>, error: titan_scene::TsfError) -> Self {
+        Self {
+            code: "TITAN_TSF_ERROR",
+            message: message.into(),
+            exit_code: EXIT_FAILURE,
+            diagnostics: Some(error.errors),
         }
     }
 }
@@ -110,6 +159,8 @@ struct ErrorBody<'a> {
     message: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<&'a [Diagnostic]>,
 }
 
 #[derive(Serialize)]
@@ -194,6 +245,7 @@ fn run() -> Result<ExitCode, TitanError> {
     }
 
     match cli.command {
+        Some(Command::Run(args)) => run_runtime(args, cli.json),
         Some(Command::Version) => print_version(cli.json),
         Some(Command::Scene { command }) => return run_scene(command, cli.json),
         None => {
@@ -209,6 +261,90 @@ fn run() -> Result<ExitCode, TitanError> {
     }?;
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
+    if !args.dt.is_finite() || args.dt <= 0.0 {
+        return Err(TitanError::new(
+            "TITAN_CLI_ARGUMENT_ERROR",
+            "--dt must be finite and positive",
+        ));
+    }
+
+    let source = fs::read_to_string(&args.scene).map_err(|source| {
+        TitanError::new(
+            "TITAN_SCENE_READ",
+            format!("failed to read {}: {source}", args.scene.display()),
+        )
+    })?;
+    let file = args.scene.to_string_lossy();
+    let document = parse(Some(&file), &source)
+        .map_err(|error| TitanError::from_tsf("failed to parse scene", error))?;
+    let registry = phase1_component_registry().map_err(|source| {
+        TitanError::new(
+            "TITAN_COMPONENT_REGISTRY",
+            format!("failed to build component registry: {source}"),
+        )
+    })?;
+    let mut world = load_world(&document, registry)
+        .map_err(|error| TitanError::from_tsf("failed to load scene", error))?;
+    world.set_runtime_metadata(0, args.seed);
+
+    let mut schedule = Schedule::new();
+    schedule.add_system(
+        "titan.core.velocity_integration",
+        velocity_integration_system,
+    );
+    for frame in 1..=args.frames {
+        schedule
+            .run_fixed_step(&mut world, FixedStepContext::new(args.dt, frame, args.seed))
+            .map_err(|source| {
+                TitanError::new(
+                    "TITAN_RUNTIME_SYSTEM",
+                    format!("runtime system failed: {source}"),
+                )
+            })?;
+    }
+
+    let dump = world.dump_state().map_err(|source| {
+        TitanError::new(
+            "TITAN_STATE_DUMP",
+            format!("failed to create state dump: {source}"),
+        )
+    })?;
+    let dump_json = serde_json::to_string(&dump).map_err(|source| {
+        TitanError::new(
+            "TITAN_OUTPUT_SERIALIZE",
+            format!("failed to encode state dump JSON: {source}"),
+        )
+    })?;
+    if let Some(path) = args.dump_state {
+        fs::write(&path, dump_json).map_err(|source| {
+            TitanError::new(
+                "TITAN_STATE_DUMP_WRITE",
+                format!("failed to write {}: {source}", path.display()),
+            )
+        })?;
+    } else if json {
+        println!("{dump_json}");
+    }
+
+    if let Some(path) = args.event_log {
+        let jsonl = world.event_log().to_jsonl().map_err(|source| {
+            TitanError::new(
+                "TITAN_EVENT_LOG",
+                format!("failed to encode event log: {source}"),
+            )
+        })?;
+        fs::write(&path, jsonl).map_err(|source| {
+            TitanError::new(
+                "TITAN_EVENT_LOG_WRITE",
+                format!("failed to write {}: {source}", path.display()),
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 fn print_version(json: bool) -> Result<(), TitanError> {
@@ -238,6 +374,7 @@ fn report_error(error: &TitanError) {
             code: error.code,
             message: &error.message,
             location: None,
+            diagnostics: error.diagnostics.as_deref(),
         },
     };
 
