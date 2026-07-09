@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use titan_core::{Component, ComponentRegistry, EntityId, Transform, Velocity, World};
 
 use crate::tsf::{
-    Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind, json_pointer_join,
-    validate,
+    Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind,
+    fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate,
 };
 
 /// Loads a validated TSF document into a deterministic Titan world.
@@ -181,7 +181,77 @@ fn transform_payload(
         )
     })?;
     let translation = required_vec3(document, members, "translation", path)?;
-    Ok(serde_json::json!({ "translation": translation }))
+    let rotation = optional_quaternion(document, members, path)?;
+    Ok(serde_json::json!({
+        "translation": translation,
+        "rotation": rotation.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+    }))
+}
+
+fn optional_quaternion(
+    document: &Document,
+    members: &[Member],
+    parent_path: &str,
+) -> TsfResult<Option<[f32; 4]>> {
+    let Some(entry) = member(members, "rotation") else {
+        return Ok(None);
+    };
+    let path = json_pointer_join(parent_path, "rotation");
+    let ValueKind::Array(values) = &entry.value.kind else {
+        return Err(one(
+            document,
+            "TSF_SCHEMA",
+            "rotation must be an array",
+            path,
+            entry.value.span,
+        ));
+    };
+    if values.len() != 4 {
+        return Err(one(
+            document,
+            "TSF_SCHEMA",
+            "rotation must contain 4 numbers",
+            path,
+            entry.value.span,
+        ));
+    }
+    let mut rotation = [0.0; 4];
+    for (index, value) in values.iter().enumerate() {
+        let ValueKind::Number(number) = &value.kind else {
+            return Err(one(
+                document,
+                "TSF_SCHEMA",
+                format!("rotation[{index}] must be a number"),
+                format!("{path}/{index}"),
+                value.span,
+            ));
+        };
+        let converted = number.value as f32;
+        if !number.value.is_finite() || !fits_f32_without_underflow(number.value) {
+            return Err(one(
+                document,
+                "TSF_INVALID_NUMBER",
+                if !number.value.is_finite() {
+                    format!("rotation[{index}] must be finite")
+                } else {
+                    format!("rotation[{index}] must fit in f32 without underflow")
+                },
+                format!("{path}/{index}"),
+                value.span,
+            ));
+        }
+        rotation[index] = converted;
+    }
+    let Some(rotation) = normalized_quaternion(rotation) else {
+        return Err(one(
+            document,
+            "TSF_INVALID_QUATERNION",
+            "rotation quaternion must have unit norm within 1e-5",
+            path,
+            entry.value.span,
+        ));
+    };
+    Ok(Some(rotation))
 }
 
 fn velocity_payload(

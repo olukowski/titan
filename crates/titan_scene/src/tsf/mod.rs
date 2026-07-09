@@ -10,6 +10,33 @@ pub use parse::parse;
 pub use path::{QueryResult, edit, query};
 pub use validate::validate;
 
+pub(crate) const QUATERNION_TOLERANCE: f32 = 1e-5;
+
+pub(crate) fn fits_f32_without_underflow(value: f64) -> bool {
+    let converted = value as f32;
+    converted.is_finite() && (value == 0.0 || converted != 0.0)
+}
+
+/// Returns a deterministic f32 quaternion normalization after validating its f32 norm.
+pub(crate) fn normalized_quaternion(rotation: [f32; 4]) -> Option<[f32; 4]> {
+    let norm = rotation
+        .iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt();
+    if norm == 0.0 || !norm.is_finite() || (norm - 1.0).abs() > QUATERNION_TOLERANCE {
+        return None;
+    }
+
+    // Normalize in f64, then round once to f32 for the loader's runtime value.
+    let norm = rotation
+        .iter()
+        .map(|component| f64::from(*component) * f64::from(*component))
+        .sum::<f64>()
+        .sqrt();
+    Some(rotation.map(|component| (f64::from(component) / norm) as f32))
+}
+
 pub type TsfResult<T> = Result<T, TsfError>;
 
 #[derive(Clone, Debug, PartialEq)]

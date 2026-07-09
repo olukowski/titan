@@ -1,4 +1,5 @@
-use titan_core::phase1_component_registry;
+use rand::{Rng, SeedableRng, rngs::StdRng};
+use titan_core::{Component, Transform, phase1_component_registry};
 use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
@@ -303,7 +304,6 @@ fn unsupported_runtime_components_are_diagnostic() {
 #[test]
 fn unsupported_runtime_component_fields_are_diagnostic() {
     for (component, field, payload) in [
-        ("transform", "rotation", "[0.0, 0.0, 0.0, 1.0]"),
         ("transform", "scale", "[1.0, 1.0, 1.0]"),
         ("velocity", "angular", "[0.0, 0.0, 0.0]"),
     ] {
@@ -324,6 +324,221 @@ fn unsupported_runtime_component_fields_are_diagnostic() {
             error.errors
         );
     }
+}
+
+fn transform_scene(rotation: &str) -> String {
+    format!(
+        r#"{{
+  tsf: 1,
+  scene: {{ id: "scene:test" }},
+  assets: {{}},
+  entities: [{{
+    id: "entity:test",
+        components: {{ transform: {{ translation: [1.0, 2.0, 3.0]{} }} }},
+  }}],
+}}
+"#,
+        if rotation.is_empty() {
+            String::new()
+        } else {
+            format!(", rotation: {rotation}")
+        }
+    )
+}
+
+#[test]
+fn transform_v1_shape_loads_with_identity_and_dump_is_v2() {
+    let document = parse(None, &transform_scene("")).expect("parse");
+    validate(&document).expect("validate");
+    let world = load_world(&document, phase1_component_registry().unwrap()).expect("load");
+    let transform = world
+        .get::<Transform>(titan_core::EntityId::from_raw(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(transform.rotation, [0.0, 0.0, 0.0, 1.0]);
+    let dump = world.dump_state().unwrap();
+    assert_eq!(
+        dump.entities[0].components[Transform::NAME].schema_version,
+        2
+    );
+    assert_eq!(
+        dump.entities[0].components[Transform::NAME].value["rotation"],
+        serde_json::json!([0.0, 0.0, 0.0, 1.0])
+    );
+}
+
+#[test]
+fn quaternion_validation_accepts_tolerance_and_rejects_just_beyond_and_zero_length() {
+    for rotation in ["[0.0, 0.0, 0.0, 1.000009]", "[0.0, 0.0, 0.0, 1.00002]"] {
+        let document = parse(None, &transform_scene(rotation)).expect("parse");
+        let result = validate(&document);
+        if rotation.ends_with("1.000009]") {
+            assert!(result.is_ok(), "boundary should be accepted: {rotation}");
+        } else {
+            let error = result.expect_err("out-of-tolerance quaternion should fail");
+            assert!(
+                error
+                    .errors
+                    .iter()
+                    .any(|d| d.code == "TSF_INVALID_QUATERNION" && d.path.ends_with("/rotation"))
+            );
+        }
+    }
+    {
+        let rotation = "[0.0, 0.0, 0.0, 0.0]";
+        let document = parse(None, &transform_scene(rotation)).expect("parse");
+        let error = validate(&document).expect_err("invalid quaternion should fail");
+        assert!(
+            error
+                .errors
+                .iter()
+                .any(|d| d.code == "TSF_INVALID_QUATERNION" && d.path.contains("/rotation"))
+        );
+    }
+}
+
+#[test]
+fn non_finite_transform_rotation_numbers_are_diagnostic() {
+    let mut document = parse(None, &transform_scene("[0.0, 0.0, 0.0, 1.0]")).expect("parse");
+    let ValueKind::Object(root) = &mut document.root.kind else {
+        unreachable!("scene root is an object");
+    };
+    let entities = root
+        .iter_mut()
+        .find(|member| member.key == "entities")
+        .expect("entities");
+    let ValueKind::Array(entities) = &mut entities.value.kind else {
+        unreachable!("entities is an array");
+    };
+    let ValueKind::Object(entity) = &mut entities[0].kind else {
+        unreachable!("entity is an object");
+    };
+    let components = entity
+        .iter_mut()
+        .find(|member| member.key == "components")
+        .expect("components");
+    let ValueKind::Object(components) = &mut components.value.kind else {
+        unreachable!("components is an object");
+    };
+    let transform = components
+        .iter_mut()
+        .find(|member| member.key == "transform")
+        .expect("transform");
+    let ValueKind::Object(transform) = &mut transform.value.kind else {
+        unreachable!("transform is an object");
+    };
+    let rotation = transform
+        .iter_mut()
+        .find(|member| member.key == "rotation")
+        .expect("rotation");
+    let ValueKind::Array(rotation) = &mut rotation.value.kind else {
+        unreachable!("rotation is an array");
+    };
+    for value in rotation {
+        let ValueKind::Number(number) = &mut value.kind else {
+            unreachable!("rotation component is a number");
+        };
+        number.value = f64::NAN;
+    }
+
+    let error = validate(&document).expect_err("non-finite rotation should fail");
+    for index in 0..4 {
+        let path = format!("/entities/0/components/transform/rotation/{index}");
+        let diagnostics: Vec<_> = error.errors.iter().filter(|d| d.path == path).collect();
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics at {path}: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "TSF_INVALID_NUMBER");
+        assert_eq!(diagnostics[0].message, "number must be finite");
+    }
+}
+
+#[test]
+fn formatter_orders_and_canonicalizes_transform_rotation() {
+    let document = parse(None, &transform_scene("[0.0, 0.0, 0.0, 1.000005]")).expect("parse");
+    validate(&document).expect("validate");
+    let formatted = fmt(&document);
+    assert!(formatted.contains("translation: [1.0, 2.0, 3.0],\n"));
+    assert!(
+        !formatted.contains("rotation:"),
+        "identity rotation is a default and is omitted"
+    );
+
+    let document = parse(None, &transform_scene("[0.0, 0.0, 0.707111, 0.707111]")).expect("parse");
+    validate(&document).expect("validate");
+    let formatted = fmt(&document);
+    assert!(formatted.find("translation:").unwrap() < formatted.find("rotation:").unwrap());
+    assert!(formatted.contains("rotation: [0.0, 0.0, 0.707111, 0.707111]"));
+}
+
+#[test]
+fn formatter_is_idempotent_for_near_unit_rotations() {
+    for rotation in [
+        "[0.0, 0.0, 0.707111, 0.707111]",
+        "[0.000001, -0.000002, 0.707111, 0.707111]",
+        "[0.0, 0.70710678, 0.70710678, 0.0]",
+        "[0.0, 0.999995, 0.0, 0.0]",
+    ] {
+        let document = parse(None, &transform_scene(rotation)).expect("parse");
+        if let Err(error) = validate(&document) {
+            panic!("validate {rotation}: {error:?}");
+        }
+        let first = fmt(&document);
+        let reparsed = parse(None, &first).expect("parse formatted scene");
+        let second = fmt(&reparsed);
+        assert_eq!(second, first, "formatter was not idempotent for {rotation}");
+    }
+}
+
+#[test]
+fn formatter_is_idempotent_for_seeded_random_near_unit_rotations() {
+    let mut rng = StdRng::seed_from_u64(0x5eed_cafe);
+
+    for case in 0..2_000 {
+        let mut components = [
+            rng.random_range(-1.0_f64..=1.0),
+            rng.random_range(-1.0_f64..=1.0),
+            rng.random_range(-1.0_f64..=1.0),
+            rng.random_range(-1.0_f64..=1.0),
+        ];
+        let norm = components
+            .iter()
+            .map(|component| component * component)
+            .sum::<f64>()
+            .sqrt();
+        if norm == 0.0 {
+            components[3] = 1.0;
+        } else {
+            for component in &mut components {
+                *component /= norm;
+            }
+        }
+        let rotation = format!(
+            "[{:.8}, {:.8}, {:.8}, {:.8}]",
+            components[0], components[1], components[2], components[3]
+        );
+        let document = parse(None, &transform_scene(&rotation)).expect("parse generated scene");
+        validate(&document).unwrap_or_else(|error| panic!("validate case {case}: {error:?}"));
+        let first = fmt(&document);
+        let reparsed = parse(None, &first).expect("parse formatted generated scene");
+        validate(&reparsed)
+            .unwrap_or_else(|error| panic!("validate formatted case {case}: {error:?}"));
+        let second = fmt(&reparsed);
+        assert_eq!(
+            second, first,
+            "formatter was not idempotent for case {case}: {rotation}"
+        );
+    }
+}
+
+#[test]
+fn explicit_identity_rotation_loads_and_dump_round_trips() {
+    let document = parse(None, &transform_scene("[0.0, 0.0, 0.0, 1.0]")).expect("parse");
+    let world = load_world(&document, phase1_component_registry().unwrap()).expect("load");
+    let value = &world.dump_state().unwrap().entities[0].components[Transform::NAME].value;
+    assert_eq!(value["rotation"], serde_json::json!([0.0, 0.0, 0.0, 1.0]));
 }
 
 #[test]

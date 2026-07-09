@@ -1009,12 +1009,22 @@ impl CommandBuffer {
 pub struct Transform {
     /// World-space translation.
     pub translation: Vec3,
+    /// World-space orientation as a normalized `[x, y, z, w]` quaternion.
+    #[serde(default = "identity_rotation")]
+    pub rotation: [f32; 4],
+}
+
+const fn identity_rotation() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
 }
 
 impl Transform {
     /// Creates a transform at the provided translation.
     pub const fn from_translation(translation: Vec3) -> Self {
-        Self { translation }
+        Self {
+            translation,
+            rotation: identity_rotation(),
+        }
     }
 }
 
@@ -1022,13 +1032,14 @@ impl Default for Transform {
     fn default() -> Self {
         Self {
             translation: Vec3::ZERO,
+            rotation: identity_rotation(),
         }
     }
 }
 
 impl Component for Transform {
     const NAME: &'static str = "titan.core.Transform";
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 /// A minimal velocity component used by deterministic simulation tests.

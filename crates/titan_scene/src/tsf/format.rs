@@ -1,4 +1,6 @@
-use super::{Document, Member, Number, Value, ValueKind};
+use super::{
+    Document, Member, Number, Value, ValueKind, fits_f32_without_underflow, normalized_quaternion,
+};
 
 pub fn fmt(document: &Document) -> String {
     let mut out = String::new();
@@ -74,12 +76,16 @@ fn write_object(out: &mut String, members: &[Member], indent: usize, context: Co
         push_indent(out, indent + 2);
         write_key(out, &member.key);
         out.push_str(": ");
-        write_value(
-            out,
-            &member.value,
-            indent + 2,
-            child_context(context, &member.key),
-        );
+        if context == Context::Component("transform") && member.key == "rotation" {
+            write_value(out, &member.value, indent + 2, Context::Other);
+        } else {
+            write_value(
+                out,
+                &member.value,
+                indent + 2,
+                child_context(context, &member.key),
+            );
+        }
         out.push_str(",\n");
     }
     push_indent(out, indent);
@@ -102,13 +108,50 @@ fn child_context<'a>(context: Context<'a>, key: &'a str) -> Context<'a> {
 }
 
 fn ordered_members<'a>(members: &'a [Member], context: Context<'_>) -> Vec<&'a Member> {
-    let mut ordered: Vec<_> = members.iter().collect();
+    let mut ordered: Vec<_> = members
+        .iter()
+        .filter(|member| {
+            !(context == Context::Component("transform")
+                && member.key == "rotation"
+                && rotation_is_identity(&member.value))
+        })
+        .collect();
     ordered.sort_by(|a, b| {
         let ar = rank(context, &a.key);
         let br = rank(context, &b.key);
         ar.cmp(&br).then_with(|| a.key.cmp(&b.key))
     });
     ordered
+}
+
+fn rotation_is_identity(value: &Value) -> bool {
+    let Some(rotation) = normalized_rotation(value) else {
+        return false;
+    };
+    rotation == [0.0, 0.0, 0.0, 1.0]
+}
+
+fn normalized_rotation(value: &Value) -> Option<[f32; 4]> {
+    let ValueKind::Array(values) = &value.kind else {
+        return None;
+    };
+    if values.len() != 4 {
+        return None;
+    }
+    let mut rotation = [0.0; 4];
+    for (index, value) in values.iter().enumerate() {
+        let ValueKind::Number(number) = &value.kind else {
+            return None;
+        };
+        if !fits_f32_without_underflow(number.value) {
+            return None;
+        }
+        rotation[index] = number.value as f32;
+        if !rotation[index].is_finite() {
+            return None;
+        }
+    }
+    normalized_quaternion(rotation)
 }
 
 fn rank(context: Context<'_>, key: &str) -> usize {
@@ -129,7 +172,7 @@ fn rank(context: Context<'_>, key: &str) -> usize {
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("transform") => ["translation"]
+        Context::Component("transform") => ["translation", "rotation"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
