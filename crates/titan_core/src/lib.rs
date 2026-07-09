@@ -279,8 +279,7 @@ impl World {
     }
 
     pub fn spawn(&mut self) -> EntityId {
-        let id = EntityId(self.next_id);
-        self.next_id += 1;
+        let id = self.allocate_entity_id();
         self.allocated_entities.insert(id);
         self.entities.insert(id);
         self.event_log.push(EventKind::EntitySpawned { entity: id });
@@ -296,6 +295,20 @@ impl World {
         self.entities.insert(id);
         self.event_log.push(EventKind::EntitySpawned { entity: id });
         Ok(id)
+    }
+
+    fn allocate_entity_id(&mut self) -> EntityId {
+        loop {
+            let id = EntityId(self.next_id);
+            if !self.allocated_entities.contains(&id) {
+                self.next_id = self.next_id.saturating_add(1);
+                return id;
+            }
+            if self.next_id == u64::MAX {
+                panic!("entity id space exhausted");
+            }
+            self.next_id += 1;
+        }
     }
 
     pub fn despawn(&mut self, id: EntityId) -> Result<()> {
@@ -799,7 +812,7 @@ impl Schedule {
         world.frame = ctx.frame;
         world.seed = ctx.seed;
         for (system_index, (name, system)) in self.systems.iter().enumerate() {
-            let mut commands = CommandBuffer::new();
+            let mut commands = CommandBuffer::for_world(world);
             let mut system_ctx = ctx;
             system_ctx.rng = DeterministicRng::for_system(ctx.seed, ctx.frame, system_index as u64);
             let result = {
@@ -852,9 +865,20 @@ impl SystemWorld<'_> {
 type Command = Box<dyn FnOnce(&mut World) -> Result<()> + Send>;
 
 /// Structural changes recorded by systems and applied after each system.
-#[derive(Default)]
 pub struct CommandBuffer {
     commands: Vec<Command>,
+    allocated_entities: BTreeSet<EntityId>,
+    next_id: u64,
+}
+
+impl Default for CommandBuffer {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            allocated_entities: BTreeSet::new(),
+            next_id: 1,
+        }
+    }
 }
 
 impl CommandBuffer {
@@ -862,14 +886,24 @@ impl CommandBuffer {
         Self::default()
     }
 
-    pub fn spawn(&mut self) {
-        self.commands.push(Box::new(|world| {
-            world.spawn();
-            Ok(())
-        }));
+    fn for_world(world: &World) -> Self {
+        Self {
+            commands: Vec::new(),
+            allocated_entities: world.allocated_entities.clone(),
+            next_id: world.next_id,
+        }
+    }
+
+    pub fn spawn(&mut self) -> EntityId {
+        let id = self.allocate_entity_id();
+        self.commands
+            .push(Box::new(move |world| world.spawn_with_id(id).map(|_| ())));
+        id
     }
 
     pub fn spawn_with_id(&mut self, id: EntityId) {
+        self.next_id = self.next_id.max(id.raw().saturating_add(1));
+        self.allocated_entities.insert(id);
         self.commands
             .push(Box::new(move |world| world.spawn_with_id(id).map(|_| ())));
     }
@@ -891,6 +925,21 @@ impl CommandBuffer {
     pub fn set<T: Component>(&mut self, id: EntityId, component: T) {
         self.commands
             .push(Box::new(move |world| world.set(id, component)));
+    }
+
+    fn allocate_entity_id(&mut self) -> EntityId {
+        loop {
+            let id = EntityId(self.next_id);
+            if !self.allocated_entities.contains(&id) {
+                self.next_id = self.next_id.saturating_add(1);
+                self.allocated_entities.insert(id);
+                return id;
+            }
+            if self.next_id == u64::MAX {
+                panic!("entity id space exhausted");
+            }
+            self.next_id += 1;
+        }
     }
 
     fn apply(self, world: &mut World) -> Result<()> {
@@ -978,6 +1027,19 @@ mod tests {
         _ctx: FixedStepContext,
     ) -> Result<()> {
         commands.despawn(EntityId::from_raw(999));
+        Ok(())
+    }
+
+    fn spawn_and_initialize(
+        _world: &mut SystemWorld<'_>,
+        commands: &mut CommandBuffer,
+        _ctx: FixedStepContext,
+    ) -> Result<()> {
+        let entity = commands.spawn();
+        commands.insert(
+            entity,
+            Transform::from_translation(Vec3::new(4.0, 5.0, 6.0)),
+        );
         Ok(())
     }
 
@@ -1160,6 +1222,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_spawns_skip_reserved_max_id_and_exhaust_cleanly() {
+        let mut world = World::new(registry());
+        world
+            .spawn_with_id(EntityId::from_raw(u64::MAX - 1))
+            .unwrap();
+
+        let max = world.spawn();
+        assert_eq!(max, EntityId::from_raw(u64::MAX));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.spawn();
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn runtime_spawns_do_not_reuse_reserved_max_id() {
+        let mut world = World::new(registry());
+        world.spawn_with_id(EntityId::from_raw(u64::MAX)).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.spawn();
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn schedule_logs_command_buffer_failures_as_system_errors() {
         let mut world = World::new(registry());
         let mut schedule = Schedule::new();
@@ -1184,6 +1273,23 @@ mod tests {
                 message: "entity 999 does not exist".to_string()
             }
         );
+    }
+
+    #[test]
+    fn command_buffer_spawn_returns_reserved_id_for_initialization() {
+        let mut world = World::new(registry());
+        let mut schedule = Schedule::new();
+        schedule.add_system("spawn_and_initialize", spawn_and_initialize);
+
+        schedule
+            .run_fixed_step(&mut world, FixedStepContext::new(0.25, 1, 99))
+            .unwrap();
+
+        let transform = world
+            .get::<Transform>(EntityId::from_raw(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(transform.translation, Vec3::new(4.0, 5.0, 6.0));
     }
 
     #[test]
