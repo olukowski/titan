@@ -62,6 +62,7 @@ Expose the ECS through Titan-owned types. Do not expose storage internals or thi
 pub struct World;
 pub struct Schedule;
 pub struct CommandBuffer;
+pub struct SystemWorld<'a>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct EntityId(u64);
@@ -102,7 +103,15 @@ impl World {
 Required scheduling operations:
 
 ```rust
-pub type SystemFn = fn(&mut World, &mut CommandBuffer, FixedStepContext) -> Result<()>;
+pub type SystemFn =
+    fn(&mut SystemWorld<'_>, &mut CommandBuffer, FixedStepContext) -> Result<()>;
+
+impl<'a> SystemWorld<'a> {
+    pub fn get<T: Component>(&self, id: EntityId) -> Result<Option<&T>>;
+    pub fn get_mut<T: Component>(&mut self, id: EntityId) -> Result<Option<&mut T>>;
+    pub fn query<Q: Query>(&self) -> QueryIter<'_, Q>;
+    pub fn query_mut<Q: QueryMut>(&mut self) -> QueryMutIter<'_, Q>;
+}
 
 impl Schedule {
     pub fn new() -> Self;
@@ -111,7 +120,14 @@ impl Schedule {
 }
 ```
 
-The scheduler runs systems in insertion order in deterministic mode. Systems record structural changes into `CommandBuffer`; the scheduler applies one buffer after each system, in command insertion order. A later parallel scheduler may exist only as a separate non-default mode and must never be used by determinism CI.
+The scheduler runs systems in insertion order in deterministic mode. Systems
+receive a restricted `SystemWorld` view for reads and in-place component edits.
+They cannot call `World::spawn`, `World::despawn`, `World::insert`,
+`World::remove`, or `World::set` directly during schedule execution. Systems
+record structural changes into `CommandBuffer`; the scheduler applies one buffer
+after each system, in command insertion order. A later parallel scheduler may
+exist only as a separate non-default mode and must never be used by determinism
+CI.
 
 ### Entity identity
 
