@@ -18,4 +18,4 @@ Pre-alpha; design and foundation phase. See [docs/ROADMAP.md](docs/ROADMAP.md) f
 
 ## Contributing
 
-Work happens in forks with PRs to this repo, reviewed automatically by AI agents. Keep PRs small and single-purpose; significant designs get a doc in `docs/design/` first.
+Work happens in the fork `olukowski/titan`; PRs target upstream `titan-engine/titan` and are reviewed automatically by AI agents. Keep PRs small and single-purpose; significant designs get a doc in `docs/design/` first.
