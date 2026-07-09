@@ -328,11 +328,74 @@ impl Validator<'_> {
     }
 
     fn validate_transform(&mut self, value: &Value, path: &str) {
-        self.validate_payload_vectors(value, path, &[("translation", 3)], "transform");
+        self.validate_payload_vectors(
+            value,
+            path,
+            &[("translation", 3)],
+            &["rotation"],
+            "transform",
+        );
+        if let Some(members) = object_members(value)
+            && let Some(rotation) = member(members, "rotation")
+        {
+            self.validate_quaternion(&rotation.value, &json_pointer_join(path, "rotation"));
+        }
     }
 
     fn validate_velocity(&mut self, value: &Value, path: &str) {
-        self.validate_payload_vectors(value, path, &[("linear", 3)], "velocity");
+        self.validate_payload_vectors(value, path, &[("linear", 3)], &[], "velocity");
+    }
+
+    fn validate_quaternion(&mut self, value: &Value, path: &str) {
+        let ValueKind::Array(values) = &value.kind else {
+            self.push(
+                "TSF_SCHEMA",
+                "transform.rotation must be an array",
+                path,
+                value.span,
+            );
+            return;
+        };
+        if values.len() != 4 {
+            self.push(
+                "TSF_SCHEMA",
+                "transform.rotation must contain 4 numbers",
+                path,
+                value.span,
+            );
+            return;
+        }
+        let mut rotation = [0.0_f32; 4];
+        for (index, value) in values.iter().enumerate() {
+            match &value.kind {
+                ValueKind::Number(number) if fits_f32_without_underflow(number.value) => {
+                    rotation[index] = number.value as f32;
+                }
+                ValueKind::Number(_) => self.push(
+                    "TSF_INVALID_NUMBER",
+                    format!("transform.rotation[{index}] must fit in f32 without underflow"),
+                    format!("{path}/{index}"),
+                    value.span,
+                ),
+                _ => self.push(
+                    "TSF_SCHEMA",
+                    format!("transform.rotation[{index}] must be a number"),
+                    format!("{path}/{index}"),
+                    value.span,
+                ),
+            }
+        }
+        if values.iter().all(|value| matches!(&value.kind, ValueKind::Number(number) if fits_f32_without_underflow(number.value))) {
+            let norm = rotation.iter().map(|component| component * component).sum::<f32>().sqrt();
+            if norm == 0.0 || !norm.is_finite() || (norm - 1.0).abs() > 1e-5 {
+                self.push(
+                    "TSF_INVALID_QUATERNION",
+                    "transform.rotation quaternion must have unit norm within 1e-5",
+                    path,
+                    value.span,
+                );
+            }
+        }
     }
 
     fn validate_payload_vectors(
@@ -340,6 +403,7 @@ impl Validator<'_> {
         value: &Value,
         path: &str,
         fields: &[(&str, usize)],
+        optional_fields: &[&str],
         component: &str,
     ) {
         let Some(members) = object_members(value) else {
@@ -352,7 +416,9 @@ impl Validator<'_> {
             return;
         };
         for member in members {
-            if !fields.iter().any(|(field, _)| *field == member.key) {
+            if !fields.iter().any(|(field, _)| *field == member.key)
+                && !optional_fields.contains(&member.key.as_str())
+            {
                 self.push(
                     "TSF_UNKNOWN_COMPONENT_FIELD",
                     format!("{component} field '{}' is not supported", member.key),

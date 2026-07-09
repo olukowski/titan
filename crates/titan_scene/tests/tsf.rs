@@ -1,4 +1,4 @@
-use titan_core::phase1_component_registry;
+use titan_core::{Component, Transform, phase1_component_registry};
 use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
@@ -303,7 +303,6 @@ fn unsupported_runtime_components_are_diagnostic() {
 #[test]
 fn unsupported_runtime_component_fields_are_diagnostic() {
     for (component, field, payload) in [
-        ("transform", "rotation", "[0.0, 0.0, 0.0, 1.0]"),
         ("transform", "scale", "[1.0, 1.0, 1.0]"),
         ("velocity", "angular", "[0.0, 0.0, 0.0]"),
     ] {
@@ -324,6 +323,103 @@ fn unsupported_runtime_component_fields_are_diagnostic() {
             error.errors
         );
     }
+}
+
+fn transform_scene(rotation: &str) -> String {
+    format!(
+        r#"{{
+  tsf: 1,
+  scene: {{ id: "scene:test" }},
+  assets: {{}},
+  entities: [{{
+    id: "entity:test",
+        components: {{ transform: {{ translation: [1.0, 2.0, 3.0]{} }} }},
+  }}],
+}}
+"#,
+        if rotation.is_empty() {
+            String::new()
+        } else {
+            format!(", rotation: {rotation}")
+        }
+    )
+}
+
+#[test]
+fn transform_v1_shape_loads_with_identity_and_dump_is_v2() {
+    let document = parse(None, &transform_scene("")).expect("parse");
+    validate(&document).expect("validate");
+    let world = load_world(&document, phase1_component_registry().unwrap()).expect("load");
+    let transform = world
+        .get::<Transform>(titan_core::EntityId::from_raw(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(transform.rotation, [0.0, 0.0, 0.0, 1.0]);
+    let dump = world.dump_state().unwrap();
+    assert_eq!(
+        dump.entities[0].components[Transform::NAME].schema_version,
+        2
+    );
+    assert_eq!(
+        dump.entities[0].components[Transform::NAME].value["rotation"],
+        serde_json::json!([0.0, 0.0, 0.0, 1.0])
+    );
+}
+
+#[test]
+fn quaternion_validation_accepts_tolerance_and_rejects_just_beyond_zero_and_nonfinite() {
+    for rotation in ["[0.0, 0.0, 0.0, 1.000009]", "[0.0, 0.0, 0.0, 1.00002]"] {
+        let document = parse(None, &transform_scene(rotation)).expect("parse");
+        let result = validate(&document);
+        if rotation.ends_with("1.000009]") {
+            assert!(result.is_ok(), "boundary should be accepted: {rotation}");
+        } else {
+            let error = result.expect_err("out-of-tolerance quaternion should fail");
+            assert!(
+                error
+                    .errors
+                    .iter()
+                    .any(|d| d.code == "TSF_INVALID_QUATERNION" && d.path.ends_with("/rotation"))
+            );
+        }
+    }
+    {
+        let rotation = "[0.0, 0.0, 0.0, 0.0]";
+        let document = parse(None, &transform_scene(rotation)).expect("parse");
+        let error = validate(&document).expect_err("invalid quaternion should fail");
+        assert!(
+            error
+                .errors
+                .iter()
+                .any(|d| d.code == "TSF_INVALID_QUATERNION" && d.path.contains("/rotation"))
+        );
+    }
+}
+
+#[test]
+fn formatter_orders_and_canonicalizes_transform_rotation() {
+    let document = parse(None, &transform_scene("[0.0, 0.0, 0.0, 1.000005]")).expect("parse");
+    validate(&document).expect("validate");
+    let formatted = fmt(&document);
+    assert!(formatted.contains("translation: [1.0, 2.0, 3.0],\n"));
+    assert!(
+        !formatted.contains("rotation:"),
+        "identity rotation is a default and is omitted"
+    );
+
+    let document = parse(None, &transform_scene("[0.0, 0.0, 0.707111, 0.707111]")).expect("parse");
+    validate(&document).expect("validate");
+    let formatted = fmt(&document);
+    assert!(formatted.find("translation:").unwrap() < formatted.find("rotation:").unwrap());
+    assert!(formatted.contains("rotation: [0.0, 0.0, 0.70710677, 0.70710677]"));
+}
+
+#[test]
+fn explicit_identity_rotation_loads_and_dump_round_trips() {
+    let document = parse(None, &transform_scene("[0.0, 0.0, 0.0, 1.0]")).expect("parse");
+    let world = load_world(&document, phase1_component_registry().unwrap()).expect("load");
+    let value = &world.dump_state().unwrap().entities[0].components[Transform::NAME].value;
+    assert_eq!(value["rotation"], serde_json::json!([0.0, 0.0, 0.0, 1.0]));
 }
 
 #[test]
