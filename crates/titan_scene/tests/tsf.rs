@@ -367,7 +367,7 @@ fn transform_v1_shape_loads_with_identity_and_dump_is_v2() {
 }
 
 #[test]
-fn quaternion_validation_accepts_tolerance_and_rejects_just_beyond_zero_and_nonfinite() {
+fn quaternion_validation_accepts_tolerance_and_rejects_just_beyond_and_zero_length() {
     for rotation in ["[0.0, 0.0, 0.0, 1.000009]", "[0.0, 0.0, 0.0, 1.00002]"] {
         let document = parse(None, &transform_scene(rotation)).expect("parse");
         let result = validate(&document);
@@ -392,6 +392,64 @@ fn quaternion_validation_accepts_tolerance_and_rejects_just_beyond_zero_and_nonf
                 .errors
                 .iter()
                 .any(|d| d.code == "TSF_INVALID_QUATERNION" && d.path.contains("/rotation"))
+        );
+    }
+}
+
+#[test]
+fn non_finite_transform_rotation_numbers_are_diagnostic() {
+    let mut document = parse(None, &transform_scene("[0.0, 0.0, 0.0, 1.0]")).expect("parse");
+    let ValueKind::Object(root) = &mut document.root.kind else {
+        unreachable!("scene root is an object");
+    };
+    let entities = root
+        .iter_mut()
+        .find(|member| member.key == "entities")
+        .expect("entities");
+    let ValueKind::Array(entities) = &mut entities.value.kind else {
+        unreachable!("entities is an array");
+    };
+    let ValueKind::Object(entity) = &mut entities[0].kind else {
+        unreachable!("entity is an object");
+    };
+    let components = entity
+        .iter_mut()
+        .find(|member| member.key == "components")
+        .expect("components");
+    let ValueKind::Object(components) = &mut components.value.kind else {
+        unreachable!("components is an object");
+    };
+    let transform = components
+        .iter_mut()
+        .find(|member| member.key == "transform")
+        .expect("transform");
+    let ValueKind::Object(transform) = &mut transform.value.kind else {
+        unreachable!("transform is an object");
+    };
+    let rotation = transform
+        .iter_mut()
+        .find(|member| member.key == "rotation")
+        .expect("rotation");
+    let ValueKind::Array(rotation) = &mut rotation.value.kind else {
+        unreachable!("rotation is an array");
+    };
+    for value in rotation {
+        let ValueKind::Number(number) = &mut value.kind else {
+            unreachable!("rotation component is a number");
+        };
+        number.value = f64::NAN;
+    }
+
+    let error = validate(&document).expect_err("non-finite rotation should fail");
+    for index in 0..4 {
+        assert!(
+            error.errors.iter().any(|diagnostic| {
+                diagnostic.code == "TSF_INVALID_NUMBER"
+                    && diagnostic.path
+                        == format!("/entities/0/components/transform/rotation/{index}")
+            }),
+            "missing diagnostic for rotation component {index}: {:?}",
+            error.errors
         );
     }
 }
