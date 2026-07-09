@@ -6,12 +6,20 @@ use titan_math::Vec3;
 
 fn seeded_motion_system(
     world: &mut SystemWorld<'_>,
-    _commands: &mut titan_core::CommandBuffer,
+    commands: &mut titan_core::CommandBuffer,
     ctx: FixedStepContext,
 ) -> Result<()> {
     let mut rng = ctx.rng;
     for (_, (transform, velocity)) in world.query_mut::<(&mut Transform, &Velocity)>() {
         transform.translation.y += rng.next_f32() * velocity.linear.x;
+    }
+    if ctx.frame == 1 {
+        let spawned = EntityId::from_raw(1000);
+        commands.spawn_with_id(spawned);
+        commands.insert(
+            spawned,
+            Transform::from_translation(Vec3::new(rng.next_f32(), 0.0, 0.0)),
+        );
     }
     Ok(())
 }
@@ -48,7 +56,7 @@ fn run(seed: u64) -> (String, String) {
 }
 
 #[test]
-fn same_seed_and_inputs_produce_byte_identical_state_and_event_dumps() {
+fn same_seed_produces_byte_identical_state_and_structural_event_dumps() {
     let first = run(0x5eed);
     let second = run(0x5eed);
 
@@ -57,7 +65,7 @@ fn same_seed_and_inputs_produce_byte_identical_state_and_event_dumps() {
 }
 
 #[test]
-fn different_seeds_produce_different_state_dumps() {
+fn different_seeds_produce_different_state_dumps_in_test_local_seeded_system() {
     let first = run(1);
     let second = run(2);
 
