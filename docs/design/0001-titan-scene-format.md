@@ -74,16 +74,9 @@ Top-level structure:
       components: {
         transform: {
           translation: [0.0, 0.0, 0.0],
-          rotation: [0.0, 0.0, 0.0, 1.0],
-          scale: [1.0, 1.0, 1.0],
         },
         velocity: {
           linear: [1.0, 0.0, 0.0],
-          angular: [0.0, 0.0, 0.0],
-        },
-        mesh: {
-          geometry: { ref: "asset:cube_mesh" },
-          material: { ref: "asset:red_material" },
         },
       },
     },
@@ -100,8 +93,8 @@ under `components`.
 
 Component mapping to ECS:
 
-- Each key in `components` is a registered component type ID, for example
-  `transform`, `velocity`, `camera`, `mesh`.
+- Each key in `components` is a registered component type ID. Phase 1 runtime
+  scenes support `transform` and `velocity`.
 - Each value is the component's serialized payload.
 - Deserialization looks up the component type in the component registry, validates
   the payload against that component's schema, and inserts the typed component
@@ -133,8 +126,8 @@ Canonical ordering and formatting:
 - `scene` order is `id`, `name`, `metadata`.
 - Entity order is `id`, `name`, `parent`, `components`.
 - Component keys sort lexicographically unless a component registry supplies a
-  higher-priority canonical order for built-ins. v1 built-in order:
-  `transform`, `velocity`, `mesh`, `camera`, `light`.
+  higher-priority canonical order for built-ins. Phase 1 built-in order:
+  `transform`, `velocity`.
 - Payload object keys sort lexicographically unless the component schema declares
   a field order. Built-ins should declare field order for readability.
 - Asset aliases sort lexicographically.
@@ -172,12 +165,9 @@ Complete Phase 1 example:
       components: {
         transform: {
           translation: [0.0, 0.0, 0.0],
-          rotation: [0.0, 0.0, 0.0, 1.0],
-          scale: [1.0, 1.0, 1.0],
         },
         velocity: {
           linear: [0.1, 0.0, 0.0],
-          angular: [0.0, 0.0, 0.0],
         },
       },
     },

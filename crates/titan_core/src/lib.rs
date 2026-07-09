@@ -451,10 +451,16 @@ impl World {
                 components,
             });
         }
+        let entity_ids = self
+            .scene_entity_ids
+            .iter()
+            .filter(|(_, entity)| self.entities.contains(&EntityId::from_raw(**entity)))
+            .map(|(scene_id, entity)| (scene_id.clone(), *entity))
+            .collect();
         Ok(StateDump {
             frame: self.frame,
             seed: self.seed,
-            entity_ids: self.scene_entity_ids.clone(),
+            entity_ids,
             entities,
         })
     }
@@ -1259,6 +1265,30 @@ mod tests {
                 "titan.core.Transform".to_string(),
                 "titan.core.Velocity".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn state_dump_omits_scene_ids_for_despawned_entities() {
+        let mut world = World::new(registry());
+        let live = world.spawn_with_id(EntityId::from_raw(3)).unwrap();
+        let despawned = world.spawn_with_id(EntityId::from_raw(9)).unwrap();
+        world.bind_scene_entity_id("entity:live", live).unwrap();
+        world
+            .bind_scene_entity_id("entity:despawned", despawned)
+            .unwrap();
+        world.despawn(despawned).unwrap();
+
+        let dump = world.dump_state().unwrap();
+
+        assert_eq!(dump.entity_ids.get("entity:live"), Some(&3));
+        assert!(!dump.entity_ids.contains_key("entity:despawned"));
+        assert_eq!(
+            dump.entities
+                .iter()
+                .map(|entity| entity.id)
+                .collect::<Vec<_>>(),
+            vec![3]
         );
     }
 
