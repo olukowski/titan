@@ -94,7 +94,21 @@ rather than silently rendered incorrectly.
 ### Cameras and lighting
 
 `Camera` is an entity component. The camera's entity `transform` defines its
-world position and orientation; the camera payload defines projection. Phase 2
+world position and orientation; the camera payload defines projection. This
+requires an explicit Phase 2 schema change to the Phase 1 `Transform`: add an
+optional quaternion `rotation: [x, y, z, w]` (not Euler angles, because a
+quaternion has no gimbal-lock convention and is the representation already
+anticipated by 0001's normalized-quaternion validation rule). The field is
+omitted for source compatibility and defaults to the identity quaternion;
+`Transform` becomes schema version 2, while version-1 payloads continue to
+load. A supplied quaternion must be finite, non-zero, and normalized within
+the validator's documented tolerance; invalid values are rejected rather than
+silently normalized. `from_translation` and the Rust default continue to use
+identity rotation. The core type, scene validator/loader, canonical formatter,
+state-dump expectations, and regression tests are all updated in the same
+small Transform-schema PR before camera loading is implemented.
+
+Phase 2
 supports perspective and orthographic projections:
 
 ```json5
@@ -144,13 +158,27 @@ mesh: {
 }
 ```
 
-The geometry asset is an entry in the TSF `assets` object with `kind:
-"geometry"`. `titan_render` consumes a small resolved `MeshAsset` interface
-(positions, normals, UVs when present, indices, and submesh ranges). Phase 2
-may ship a minimal fixture geometry loader and built-in test meshes so the
-renderer can prove the red-cube path; it must not encode a second scene syntax.
-The Phase 3 TitanGeo loader will produce the same resolved interface, and glTF
-import remains an escape hatch rather than a Phase 2 requirement.
+The Phase 2 red-cube fixture deliberately uses a built-in, renderer-owned
+primitive rather than leaving an asset format open. Its TSF asset entry is
+`{ path: "builtin/geometry/cube-v1", kind: "geometry" }`, and the mesh
+component refers to it as `{ ref: "asset:cube_mesh" }`. The reserved
+`builtin/geometry/...` path is resolved by the shared asset resolver and never
+read from disk; ordinary relative paths continue to resolve from the
+containing `.tsf` directory as specified by 0001. `cube-v1` is the complete
+version identifier: it is a unit cube centered at the origin with six
+outward-facing faces, 24 face-split vertices, 36 `u32` indices, one submesh,
+per-face unit normals, and deterministic UVs. The built-in is Phase 2 fixture
+input only, is not a public geometry-file format, and is removed from the
+design's open questions. Phase 3 TitanGeo and later glTF import must produce
+the same resolved `MeshAsset` interface.
+
+For `pbr` materials, normals are required: every resolved mesh used by a PBR
+draw must provide one finite unit normal per vertex. Missing or invalid normals
+are a validation/load error (`RENDER_MISSING_NORMALS` or
+`RENDER_INVALID_NORMALS`); there is no generated-normal or unlit fallback in
+Phase 2. Unlit meshes may omit normals because their shader does not read
+them. This rule makes PBR output independent of asset-loader triangulation or
+normal-generation choices.
 
 `Material` is a component with a material asset/reference plus the supported
 shading values. Keeping the values in the component makes the simplest agent
@@ -183,18 +211,45 @@ be attributed to renderer changes.
 
 ### TSF serialization and component registration
 
-The component IDs are the lowercase registered names `camera`,
-`directional_light`, `mesh`, and `material`, alongside the existing
-`transform`. They are serialized under an entity's `components` object exactly
-as specified by design doc 0001. References are objects with a `ref` key,
-never bare asset strings. A representative scene fragment is:
+TSF component IDs are short, lowercase aliases; they are not the registered
+names used by `titan_core` state dumps. The canonical Phase 2 mapping is:
+
+| TSF ID | Registered component name | Schema |
+| --- | --- | --- |
+| `transform` | `titan.core.Transform` | 2 (rotation optional; identity default) |
+| `velocity` | `titan.core.Velocity` | 1 |
+| `camera` | `titan.core.Camera` | 1 |
+| `directional_light` | `titan.core.DirectionalLight` | 1 |
+| `mesh` | `titan.core.Mesh` | 1 |
+| `material` | `titan.core.Material` | 1 |
+
+The `titan.core.*` names follow 0002's stable registry convention even though
+the latter four are consumed first by `titan_render`. Before any TSF load, the
+Phase 2 registry builder registers all six types (and the Phase 1 registry
+continues to register only `Transform` and `Velocity`); duplicate names,
+types, or schema versions are errors. The shared scene loader owns this table:
+it validates the TSF alias payload, translates the alias to the registered
+name, and calls the registry's typed deserialize path. Renderer code does not
+add a private component registry or special-case TSF loading. Unknown aliases
+remain `TSF_UNKNOWN_COMPONENT` errors.
+
+State dumps and registry metadata use the registered `titan.core.*` names and
+include `{ schema_version, value }` as specified by 0002. TSF paths, formatter
+ordering, CLI scene editing, and diagnostics use the lowercase aliases. The
+loader and formatter must therefore be extended together with the registry;
+the current hard-coded `transform`/`velocity` loader switch is the Phase 1
+implementation being replaced by this shared mapping.
+
+They are serialized under an entity's `components` object exactly as specified
+by design doc 0001. References are objects with a `ref` key, never bare asset
+strings. A representative scene fragment is:
 
 ```json5
 {
   tsf: 1,
   scene: { id: "scene:examples/red_cube" },
   assets: {
-    cube_mesh: { path: "../assets/cube.mesh", kind: "geometry" },
+    cube_mesh: { path: "builtin/geometry/cube-v1", kind: "geometry" },
   },
   entities: [
     {
@@ -308,22 +363,29 @@ three levels of verification:
 - Render stats are exact, structured checks. CI can assert camera resolution,
   visible mesh count, draw calls, triangle count, material model counts, and
   resource errors without comparing pixels.
-- PNG goldens are opt-in and compared with a documented per-channel tolerance
-  and an allowed differing-pixel percentage. Goldens are pinned to a named
-  backend/adapter class, shader version, output size, and color format; they
-  are not expected to be byte-identical across GPUs.
+- PNG goldens run only in a pinned `ubuntu-24.04` Linux CI job using Mesa's
+  Vulkan llvmpipe adapter. The job sets `WGPU_BACKEND=vulkan` and
+  `WGPU_ADAPTER_NAME=llvmpipe` (the latter is the exact wgpu adapter-selection
+  variable; adapter selection is a case-insensitive name match), then asserts
+  that the selected adapter name contains `llvmpipe` and that its backend is
+  Vulkan. The render target is `Rgba8UnormSrgb`, the PNG is 8-bit RGBA in sRGB,
+  and the golden comparison is max absolute per-channel difference <= 2 with
+  no more than 0.1% of pixels differing. A missing or mismatched adapter is a
+  required-job failure with `RENDER_NO_ADAPTER`, never a skipped test.
 - A small set of camera/frustum and asset-resolution tests can run without a
   GPU by testing the CPU-side render extraction and stats input.
 
 The default backend is `wgpu`'s Vulkan/Metal/DX12 selection on native systems.
 Headless initialization must not create a window or require a display server.
-CI has two supported paths: a GPU-backed runner for pixel goldens and a
-software backend such as llvmpipe for portable headless smoke tests and stats.
-The first implementation should detect adapter/backend availability and return
-an actionable structured `RENDER_NO_ADAPTER` error; it must not silently skip
-the render test. If a software adapter is not available on a platform, that
-platform runs CPU extraction tests and marks GPU tests as an explicit CI
-capability requirement rather than weakening the render contract.
+All other CI jobs and developer environments are stats-only: they assert
+structured render facts and CPU extraction, but do not compare pixels. They
+may report `RENDER_NO_ADAPTER` for GPU smoke tests without weakening the
+required Linux golden job. The golden job records the wgpu version, adapter
+info, shader version, dimensions, format, and comparison policy in its JSON
+artifact. Goldens are regenerated only by an explicit `just render-golden`
+style command in that same container/job, followed by review of the changed
+PNG and metadata; a shader, wgpu, Mesa, fixture, or color-policy change
+requires intentional regeneration and a golden version bump.
 
 Shader math must avoid unordered iteration and unspecified resource selection.
 Entity, light, and material grouping order is stable. Statistics are computed
@@ -349,8 +411,9 @@ Keep implementation PRs small and independently reviewable:
    and structured diagnostics.
 7. Add `titan run --capture-every`, deterministic frame naming, JSONL capture
    stats, and end-to-end fixed-timestep capture tests.
-8. Add CI capability detection, software-backend smoke coverage, and narrowly
-   scoped pixel goldens with tolerance. Do not modify workflow files in the
+8. Add the required `ubuntu-24.04` llvmpipe/Vulkan golden job, stats-only
+   behavior for all other environments, and narrowly scoped pixel goldens with
+   the pinned tolerance and regeneration procedure. Do not modify workflow files in the
    design-doc PR; workflow changes belong in the implementation PR that adds
    the tests.
 9. Later, add `titan view` as a surface-only shell over `RenderService`.
@@ -420,10 +483,6 @@ cube occupies the expected image region on the pinned CI adapter.
 
 ## Open questions
 
-- Whether the Phase 2 fixture geometry format should remain private test data,
-  or become the first public non-procedural mesh asset format before glTF
-  import.
-- Which CI runner and adapter identity should be pinned for pixel goldens.
 - Whether `--camera` should accept only entity names/IDs or also a future
   scene-level camera alias map.
 - Whether material values should move to `.tmat` assets once Phase 3 asset
