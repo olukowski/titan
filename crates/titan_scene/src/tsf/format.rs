@@ -125,19 +125,15 @@ fn rank(context: Context<'_>, key: &str) -> usize {
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Components => ["transform", "velocity", "mesh", "camera", "light"]
+        Context::Components => ["transform", "velocity"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("transform") => ["translation", "rotation", "scale"]
+        Context::Component("transform") => ["translation"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("velocity") => ["linear", "angular"]
-            .iter()
-            .position(|candidate| *candidate == key)
-            .unwrap_or(1000),
-        Context::Component("mesh") => ["geometry", "material"]
+        Context::Component("velocity") => ["linear"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),

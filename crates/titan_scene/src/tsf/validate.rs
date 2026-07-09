@@ -328,16 +328,11 @@ impl Validator<'_> {
     }
 
     fn validate_transform(&mut self, value: &Value, path: &str) {
-        self.validate_payload_vectors(
-            value,
-            path,
-            &[("translation", 3), ("rotation", 4), ("scale", 3)],
-            "transform",
-        );
+        self.validate_payload_vectors(value, path, &[("translation", 3)], "transform");
     }
 
     fn validate_velocity(&mut self, value: &Value, path: &str) {
-        self.validate_payload_vectors(value, path, &[("linear", 3), ("angular", 3)], "velocity");
+        self.validate_payload_vectors(value, path, &[("linear", 3)], "velocity");
     }
 
     fn validate_payload_vectors(
@@ -356,6 +351,16 @@ impl Validator<'_> {
             );
             return;
         };
+        for member in members {
+            if !fields.iter().any(|(field, _)| *field == member.key) {
+                self.push(
+                    "TSF_UNKNOWN_COMPONENT_FIELD",
+                    format!("{component} field '{}' is not supported", member.key),
+                    json_pointer_join(path, &member.key),
+                    member.key_span,
+                );
+            }
+        }
         for (field, len) in fields {
             match member(members, field) {
                 Some(entry) => self.validate_number_array(

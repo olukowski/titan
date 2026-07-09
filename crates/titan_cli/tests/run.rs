@@ -134,7 +134,6 @@ fn loader_reports_bad_component_payload_with_path_and_span() {
       components: {
         velocity: {
           linear: ["fast", 0.0, 0.0],
-          angular: [0.0, 0.0, 0.0],
         },
       },
     },
@@ -182,12 +181,9 @@ fn loader_rejects_vector_values_that_do_not_fit_f32() {
       components: {{
         transform: {{
           translation: [{value}, 0.0, 0.0],
-          rotation: [0.0, 0.0, 0.0, 1.0],
-          scale: [1.0, 1.0, 1.0],
         }},
         velocity: {{
           linear: [0.0, 0.0, 0.0],
-          angular: [0.0, 0.0, 0.0],
         }},
       }},
     }},
@@ -214,6 +210,33 @@ fn loader_rejects_vector_values_that_do_not_fit_f32() {
         assert_eq!(
             diagnostic["path"],
             "/entities/entity:mover/components/transform/translation/0"
+        );
+    }
+}
+
+#[test]
+fn run_rejects_non_finite_or_non_positive_dt() {
+    for dt in ["NaN", "inf", "0", "-0.01"] {
+        let output = titan()
+            .args([
+                "run",
+                MOVING_ENTITY,
+                "--headless",
+                "--frames",
+                "1",
+                &format!("--dt={dt}"),
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let error: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(error["error"]["code"], "TITAN_CLI_ARGUMENT_ERROR");
+        assert_eq!(
+            error["error"]["message"],
+            "--dt must be finite and positive"
         );
     }
 }

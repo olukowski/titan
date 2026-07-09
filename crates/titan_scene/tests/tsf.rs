@@ -218,6 +218,32 @@ fn unsupported_runtime_components_are_diagnostic() {
 }
 
 #[test]
+fn unsupported_runtime_component_fields_are_diagnostic() {
+    for (component, field, payload) in [
+        ("transform", "rotation", "[0.0, 0.0, 0.0, 1.0]"),
+        ("transform", "scale", "[1.0, 1.0, 1.0]"),
+        ("velocity", "angular", "[0.0, 0.0, 0.0]"),
+    ] {
+        let source = MOVING_ENTITY.replace(
+            &format!("        {component}: {{"),
+            &format!("        {component}: {{\n          {field}: {payload},"),
+        );
+        let document = parse(Some("unsupported-field.tsf"), &source).expect("parse");
+        let error = validate(&document).expect_err("unsupported field should fail");
+
+        assert!(
+            error.errors.iter().any(|diagnostic| {
+                diagnostic.code == "TSF_UNKNOWN_COMPONENT_FIELD"
+                    && diagnostic.path
+                        == format!("/entities/entity:mover/components/{component}/{field}")
+            }),
+            "missing diagnostic for {component}.{field}: {:?}",
+            error.errors
+        );
+    }
+}
+
+#[test]
 fn direct_non_finite_numbers_are_diagnostic() {
     let mut document = parse(Some("nonfinite.tsf"), MOVING_ENTITY).expect("parse");
     let ValueKind::Object(root) = &mut document.root.kind else {

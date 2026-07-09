@@ -155,6 +155,13 @@ fn run() -> Result<(), TitanError> {
 }
 
 fn run_scene(args: RunArgs, json: bool) -> Result<(), TitanError> {
+    if !args.dt.is_finite() || args.dt <= 0.0 {
+        return Err(TitanError::new(
+            "TITAN_CLI_ARGUMENT_ERROR",
+            "--dt must be finite and positive",
+        ));
+    }
+
     let source = fs::read_to_string(&args.scene).map_err(|source| {
         TitanError::new(
             "TITAN_SCENE_READ",
