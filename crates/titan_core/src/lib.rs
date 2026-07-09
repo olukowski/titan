@@ -261,6 +261,7 @@ pub struct World {
     event_log: EventLog,
     frame: u64,
     seed: u64,
+    scene_entity_ids: BTreeMap<String, u64>,
 }
 
 impl World {
@@ -275,6 +276,7 @@ impl World {
             event_log: EventLog::default(),
             frame: 0,
             seed: 0,
+            scene_entity_ids: BTreeMap::new(),
         }
     }
 
@@ -331,6 +333,28 @@ impl World {
         self.event_log.push(EventKind::ComponentInserted {
             entity: id,
             component: T::NAME.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn insert_serialized(
+        &mut self,
+        id: EntityId,
+        component_name: &str,
+        value: Value,
+    ) -> Result<()> {
+        self.require_entity(id)?;
+        let meta = self.registry.meta_by_name(component_name)?.clone();
+        let component = meta.deserialize(value)?;
+        self.store_names.insert(meta.name, meta.type_id);
+        self.stores_by_type
+            .entry(meta.type_id)
+            .or_insert_with(ComponentStore::new)
+            .components
+            .insert(id, component);
+        self.event_log.push(EventKind::ComponentInserted {
+            entity: id,
+            component: meta.name.to_string(),
         });
         Ok(())
     }
@@ -430,12 +454,28 @@ impl World {
         Ok(StateDump {
             frame: self.frame,
             seed: self.seed,
+            entity_ids: self.scene_entity_ids.clone(),
             entities,
         })
     }
 
     pub fn event_log(&self) -> &EventLog {
         &self.event_log
+    }
+
+    pub fn set_runtime_metadata(&mut self, frame: u64, seed: u64) {
+        self.frame = frame;
+        self.seed = seed;
+    }
+
+    pub fn bind_scene_entity_id(
+        &mut self,
+        scene_id: impl Into<String>,
+        entity: EntityId,
+    ) -> Result<()> {
+        self.require_entity(entity)?;
+        self.scene_entity_ids.insert(scene_id.into(), entity.raw());
+        Ok(())
     }
 
     fn require_entity(&self, id: EntityId) -> Result<()> {
@@ -653,6 +693,8 @@ impl<A: Component, B: Component> QueryMut for (&'static mut A, &'static B) {
 pub struct StateDump {
     pub frame: u64,
     pub seed: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entity_ids: BTreeMap<String, u64>,
     pub entities: Vec<EntityDump>,
 }
 
@@ -792,6 +834,12 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 pub type SystemFn = fn(&mut SystemWorld<'_>, &mut CommandBuffer, FixedStepContext) -> Result<()>;
+
+/// Default seed used by deterministic Phase 1 headless runs.
+pub const DEFAULT_RUN_SEED: u64 = 0x5449_5441_4e50_4831;
+
+/// Default fixed timestep used by deterministic Phase 1 headless runs.
+pub const DEFAULT_FIXED_DT: f32 = 1.0 / 60.0;
 
 /// Deterministic insertion-ordered system schedule.
 #[derive(Default)]
@@ -992,6 +1040,28 @@ impl Velocity {
 impl Component for Velocity {
     const NAME: &'static str = "titan.core.Velocity";
     const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Creates the built-in Phase 1 component registry.
+pub fn phase1_component_registry() -> Result<ComponentRegistry> {
+    let mut registry = ComponentRegistry::new();
+    registry.register::<Transform>()?;
+    registry.register::<Velocity>()?;
+    Ok(registry)
+}
+
+/// Phase 1 deterministic velocity integration.
+pub fn velocity_integration_system(
+    world: &mut SystemWorld<'_>,
+    _commands: &mut CommandBuffer,
+    ctx: FixedStepContext,
+) -> Result<()> {
+    for (_, (transform, velocity)) in world.query_mut::<(&mut Transform, &Velocity)>() {
+        transform.translation.x += velocity.linear.x * ctx.fixed_dt;
+        transform.translation.y += velocity.linear.y * ctx.fixed_dt;
+        transform.translation.z += velocity.linear.z * ctx.fixed_dt;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

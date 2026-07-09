@@ -1,0 +1,25 @@
+{
+  tsf: 1,
+  scene: {
+    id: "scene:tests/moving_entity",
+    name: "Moving Entity",
+  },
+  assets: {},
+  entities: [
+    {
+      id: "entity:mover",
+      name: "Mover",
+      components: {
+        transform: {
+          translation: [0.0, 0.0, 0.0],
+          rotation: [0.0, 0.0, 0.0, 1.0],
+          scale: [1.0, 1.0, 1.0],
+        },
+        velocity: {
+          linear: [0.1, 0.0, 0.0],
+          angular: [0.0, 0.0, 0.0],
+        },
+      },
+    },
+  ],
+}

@@ -357,6 +357,8 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
+ "titan_core",
+ "titan_scene",
 ]
 
 [[package]]

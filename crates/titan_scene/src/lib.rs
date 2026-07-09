@@ -1,7 +1,9 @@
 //! Scene graph types for Titan's text-first authoring pipeline.
 
+pub mod load;
 pub mod tsf;
 
+pub use load::load_world;
 pub use tsf::{
     Diagnostic, DiagnosticSpan, Document, Member, Number, Position, QueryResult, Span, TsfError,
     TsfResult, Value, ValueKind, edit, fmt, parse, query, validate,

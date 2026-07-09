@@ -152,7 +152,7 @@ impl Value {
     }
 }
 
-fn diagnostic(
+pub(crate) fn diagnostic(
     file: Option<&str>,
     code: &str,
     message: impl Into<String>,
@@ -175,7 +175,7 @@ fn json_pointer_escape(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 
-fn json_pointer_join(parent: &str, segment: &str) -> String {
+pub(crate) fn json_pointer_join(parent: &str, segment: &str) -> String {
     if parent.is_empty() {
         format!("/{}", json_pointer_escape(segment))
     } else {
