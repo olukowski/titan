@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::{Component, Path};
 
 use super::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind, diagnostic,
@@ -377,7 +378,9 @@ impl Validator<'_> {
     fn validate_refs(&mut self, value: &Value, path: &str) {
         match &value.kind {
             ValueKind::Object(members) => {
-                if let Some(ref_member) = member(members, "ref") {
+                if path != "/assets"
+                    && let Some(ref_member) = member(members, "ref")
+                {
                     if let Some(target) = string_value(&ref_member.value) {
                         self.validate_ref(target, path, ref_member.value.span);
                     } else {
@@ -487,7 +490,7 @@ fn valid_entity_slug(slug: &str) -> bool {
 
 fn valid_external_ref(value: &str) -> bool {
     if let Some(path) = value.strip_prefix("file:") {
-        return !path.is_empty();
+        return valid_relative_path(path);
     }
     let Some(target) = value.strip_prefix("scene:") else {
         return false;
@@ -495,7 +498,16 @@ fn valid_external_ref(value: &str) -> bool {
     let Some((path, slug)) = target.split_once("#entity:") else {
         return false;
     };
-    !path.is_empty() && valid_entity_slug(slug)
+    valid_relative_path(path) && valid_entity_slug(slug)
+}
+
+fn valid_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.contains(':')
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn entity_path(entity: &Value, index: usize) -> String {

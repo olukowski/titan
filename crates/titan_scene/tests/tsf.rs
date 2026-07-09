@@ -100,6 +100,34 @@ fn malformed_external_references_are_diagnostic() {
 }
 
 #[test]
+fn non_relative_external_references_are_diagnostic() {
+    let source = MOVING_ENTITY.replace(
+        "assets: {},",
+        "assets: {},\n  absolute_file: { ref: \"file:/tmp/mesh.tgeo\" },\n  parent_scene: { ref: \"scene:../scene.tsf#entity:mover\" },",
+    );
+    let document = parse(Some("bad-external-ref.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("non-relative external references should fail");
+
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/absolute_file/ref"
+    }));
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/parent_scene/ref"
+    }));
+}
+
+#[test]
+fn asset_alias_named_ref_is_not_a_reference_object() {
+    let source = MOVING_ENTITY.replace(
+        "assets: {},",
+        "assets: { ref: { path: \"meshes/cube.tgeo\", kind: \"geometry\" } },",
+    );
+    let document = parse(Some("asset-ref-alias.tsf"), &source).expect("parse");
+
+    validate(&document).expect("asset alias named ref should validate");
+}
+
+#[test]
 fn invalid_entity_parent_is_diagnostic() {
     let source = MOVING_ENTITY.replace(
         "      id: \"entity:mover\",\n",
@@ -122,6 +150,14 @@ fn invalid_entity_parent_is_diagnostic() {
     assert!(error.errors.iter().any(|diagnostic| {
         diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/entities/entity:mover/parent"
     }));
+}
+
+#[test]
+fn formatter_preserves_nonzero_exponent_numbers() {
+    let document = parse(None, "{ value: 1e-100 }").expect("parse exponent");
+    let formatted = fmt(&document);
+
+    assert!(formatted.contains("value: 1e-100"));
 }
 
 #[test]

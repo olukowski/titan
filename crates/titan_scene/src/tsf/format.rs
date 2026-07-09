@@ -203,11 +203,10 @@ fn format_number(number: &Number) -> String {
         } else {
             format!("{value:.0}")
         }
+    } else if value.abs() < 0.000001 {
+        format!("{value:e}")
     } else {
         let mut text = value.to_string();
-        if text.contains('e') || text.contains('E') {
-            text = format!("{value:.15}");
-        }
         while text.contains('.') && text.ends_with('0') {
             text.pop();
         }
