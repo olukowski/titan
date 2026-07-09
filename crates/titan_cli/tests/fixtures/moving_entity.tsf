@@ -1,7 +1,7 @@
 {
   tsf: 1,
   scene: {
-    id: "scene:examples/moving_entity",
+    id: "scene:tests/moving_entity",
     name: "Moving Entity",
   },
   assets: {},
