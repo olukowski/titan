@@ -112,6 +112,31 @@ fn query_by_entity_id_returns_value_span_and_resolved_pointer() {
 }
 
 #[test]
+fn query_reads_parseable_invalid_scene() {
+    let dir = TempDir::new().expect("tempdir");
+    let invalid = MOVING_ENTITY.replace("velocity:", "velocty:");
+    let path = write_scene(&dir, "invalid.tsf", &invalid);
+    let path = path_string(&path);
+
+    titan()
+        .args(["scene", "validate", path.as_str()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TSF_UNKNOWN_COMPONENT"));
+
+    let json = stdout_json(
+        titan()
+            .args(["--json", "scene", "query", path.as_str(), "/scene/name"])
+            .assert()
+            .success()
+            .stderr(""),
+    );
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["value"], "Moving Entity");
+}
+
+#[test]
 fn edit_updates_one_line_and_leaves_file_canonical() {
     let dir = TempDir::new().expect("tempdir");
     let path = write_scene(&dir, "moving.tsf", MOVING_ENTITY);
@@ -175,6 +200,32 @@ fn edit_can_repair_parseable_invalid_scene() {
         .args(["scene", "validate", path_str.as_str()])
         .assert()
         .success();
+}
+
+#[test]
+fn edit_replacement_parse_errors_use_replacement_location() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = write_scene(&dir, "moving.tsf", MOVING_ENTITY);
+    let path_str = path_string(&path);
+
+    let json = stderr_json(
+        titan()
+            .args([
+                "--json",
+                "scene",
+                "edit",
+                path_str.as_str(),
+                "/scene/name",
+                "[",
+            ])
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(""),
+    );
+
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["errors"][0]["span"]["file"], "<replacement>");
 }
 
 #[test]
@@ -256,6 +307,38 @@ fn fmt_rewrites_symlink_target_without_replacing_link() {
         .args(["scene", "fmt", target_str.as_str(), "--check"])
         .assert()
         .success();
+}
+
+#[test]
+fn fmt_canonicalizes_parseable_invalid_scene() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = write_scene(
+        &dir,
+        "invalid.tsf",
+        "{ entities: [ { id: 'entity:mover', components: { velocty: {} } } ], assets: {}, scene: { name: 'Demo', id: 'scene:demo' }, tsf: 1 }\n",
+    );
+    let path_str = path_string(&path);
+
+    titan()
+        .args(["scene", "validate", path_str.as_str()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TSF_UNKNOWN_COMPONENT"));
+
+    titan()
+        .args(["scene", "fmt", path_str.as_str()])
+        .assert()
+        .success()
+        .stderr("");
+    titan()
+        .args(["scene", "fmt", path_str.as_str(), "--check"])
+        .assert()
+        .success();
+    titan()
+        .args(["scene", "validate", path_str.as_str()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TSF_UNKNOWN_COMPONENT"));
 }
 
 #[test]

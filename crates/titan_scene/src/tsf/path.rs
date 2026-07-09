@@ -20,7 +20,7 @@ pub fn query(document: &Document, path: &str) -> TsfResult<QueryResult> {
 }
 
 pub fn edit(document: &Document, path: &str, new_json5_value: &str) -> TsfResult<String> {
-    let replacement = parse(document.file.as_deref(), new_json5_value)?.root;
+    let replacement = parse(Some("<replacement>"), new_json5_value)?.root;
     let mut edited = document.clone();
     let resolved_pointer = {
         let (_, resolved_pointer) = resolve(&edited, path)?;

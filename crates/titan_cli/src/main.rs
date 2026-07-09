@@ -277,7 +277,7 @@ fn run_scene(command: SceneCommand, json: bool) -> Result<ExitCode, TitanError> 
             }
         }
         SceneCommand::Query { path, pointer } => {
-            let document = match load_valid_scene(&path) {
+            let document = match read_scene(&path) {
                 Ok(document) => document,
                 Err(SceneLoadError::Tsf(error)) => {
                     report_scene_error(&error, json);
@@ -361,7 +361,7 @@ fn run_scene(command: SceneCommand, json: bool) -> Result<ExitCode, TitanError> 
             }
         }
         SceneCommand::Fmt { path, check } => {
-            let document = match load_valid_scene(&path) {
+            let document = match read_scene(&path) {
                 Ok(document) => document,
                 Err(SceneLoadError::Tsf(error)) => {
                     report_scene_error(&error, json);
@@ -429,12 +429,6 @@ fn read_scene(path: &Path) -> Result<Document, SceneLoadError> {
         ))
     })?;
     titan_scene::parse(Some(&path.display().to_string()), &source).map_err(SceneLoadError::Tsf)
-}
-
-fn load_valid_scene(path: &Path) -> Result<Document, SceneLoadError> {
-    let document = read_scene(path)?;
-    titan_scene::validate(&document).map_err(SceneLoadError::Tsf)?;
-    Ok(document)
 }
 
 fn write_scene_atomic(path: &Path, source: &str) -> Result<(), TitanError> {
