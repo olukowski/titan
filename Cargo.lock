@@ -462,6 +462,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "titan_render"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "titan_core",
+ "titan_math",
+]
+
+[[package]]
 name = "titan_scene"
 version = "0.1.0"
 dependencies = [
