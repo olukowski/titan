@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use titan_core::{Component, ComponentRegistry, EntityId, Transform, Velocity, World};
 
 use crate::tsf::{
-    Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind, json_pointer_join,
-    validate,
+    Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind,
+    fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate,
 };
 
 /// Loads a validated TSF document into a deterministic Titan world.
@@ -227,23 +227,22 @@ fn optional_quaternion(
             ));
         };
         let converted = number.value as f32;
-        if !converted.is_finite() || (number.value != 0.0 && converted == 0.0) {
+        if !number.value.is_finite() || !fits_f32_without_underflow(number.value) {
             return Err(one(
                 document,
                 "TSF_INVALID_NUMBER",
-                format!("rotation[{index}] must fit in f32 without underflow"),
+                if !number.value.is_finite() {
+                    format!("rotation[{index}] must be finite")
+                } else {
+                    format!("rotation[{index}] must fit in f32 without underflow")
+                },
                 format!("{path}/{index}"),
                 value.span,
             ));
         }
         rotation[index] = converted;
     }
-    let norm = rotation
-        .iter()
-        .map(|component| component * component)
-        .sum::<f32>()
-        .sqrt();
-    if norm == 0.0 || !norm.is_finite() || (norm - 1.0).abs() > 1e-5 {
+    let Some(rotation) = normalized_quaternion(rotation) else {
         return Err(one(
             document,
             "TSF_INVALID_QUATERNION",
@@ -251,10 +250,7 @@ fn optional_quaternion(
             path,
             entry.value.span,
         ));
-    }
-    for component in &mut rotation {
-        *component /= norm;
-    }
+    };
     Ok(Some(rotation))
 }
 

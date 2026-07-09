@@ -1,4 +1,6 @@
-use super::{Document, Member, Number, Value, ValueKind};
+use super::{
+    Document, Member, Number, Value, ValueKind, fits_f32_without_underflow, normalized_quaternion,
+};
 
 pub fn fmt(document: &Document) -> String {
     let mut out = String::new();
@@ -141,23 +143,15 @@ fn normalized_rotation(value: &Value) -> Option<[f32; 4]> {
         let ValueKind::Number(number) = &value.kind else {
             return None;
         };
+        if !fits_f32_without_underflow(number.value) {
+            return None;
+        }
         rotation[index] = number.value as f32;
         if !rotation[index].is_finite() {
             return None;
         }
     }
-    let norm = rotation
-        .iter()
-        .map(|component| component * component)
-        .sum::<f32>()
-        .sqrt();
-    if norm == 0.0 || !norm.is_finite() || (norm - 1.0).abs() > 1e-5 {
-        return None;
-    }
-    for component in &mut rotation {
-        *component /= norm;
-    }
-    Some(rotation)
+    normalized_quaternion(rotation)
 }
 
 fn write_normalized_rotation(out: &mut String, value: &Value, indent: usize) {
@@ -170,13 +164,10 @@ fn write_normalized_rotation(out: &mut String, value: &Value, indent: usize) {
         if index > 0 {
             out.push_str(", ");
         }
-        let mut text = component.to_string();
-        if text == "-0" {
-            text = "0".to_owned();
-        } else if !text.contains('.') && !text.contains('e') {
-            text.push_str(".0");
-        }
-        out.push_str(&text);
+        out.push_str(&format_number(&Number {
+            value: f64::from(*component),
+            had_fraction: true,
+        }));
     }
     out.push(']');
 }

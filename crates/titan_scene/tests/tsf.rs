@@ -442,15 +442,15 @@ fn non_finite_transform_rotation_numbers_are_diagnostic() {
 
     let error = validate(&document).expect_err("non-finite rotation should fail");
     for index in 0..4 {
-        assert!(
-            error.errors.iter().any(|diagnostic| {
-                diagnostic.code == "TSF_INVALID_NUMBER"
-                    && diagnostic.path
-                        == format!("/entities/0/components/transform/rotation/{index}")
-            }),
-            "missing diagnostic for rotation component {index}: {:?}",
-            error.errors
+        let path = format!("/entities/0/components/transform/rotation/{index}");
+        let diagnostics: Vec<_> = error.errors.iter().filter(|d| d.path == path).collect();
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics at {path}: {diagnostics:?}"
         );
+        assert_eq!(diagnostics[0].code, "TSF_INVALID_NUMBER");
+        assert_eq!(diagnostics[0].message, "number must be finite");
     }
 }
 
@@ -469,7 +469,26 @@ fn formatter_orders_and_canonicalizes_transform_rotation() {
     validate(&document).expect("validate");
     let formatted = fmt(&document);
     assert!(formatted.find("translation:").unwrap() < formatted.find("rotation:").unwrap());
-    assert!(formatted.contains("rotation: [0.0, 0.0, 0.70710677, 0.70710677]"));
+    assert!(formatted.contains("rotation: [0.0, 0.0, 0.7071067690849304, 0.7071067690849304]"));
+}
+
+#[test]
+fn formatter_is_idempotent_for_near_unit_rotations() {
+    for rotation in [
+        "[0.0, 0.0, 0.707111, 0.707111]",
+        "[0.000001, -0.000002, 0.707111, 0.707111]",
+        "[0.0, 0.70710678, 0.70710678, 0.0]",
+        "[0.0, 0.999995, 0.0, 0.0]",
+    ] {
+        let document = parse(None, &transform_scene(rotation)).expect("parse");
+        if let Err(error) = validate(&document) {
+            panic!("validate {rotation}: {error:?}");
+        }
+        let first = fmt(&document);
+        let reparsed = parse(None, &first).expect("parse formatted scene");
+        let second = fmt(&reparsed);
+        assert_eq!(second, first, "formatter was not idempotent for {rotation}");
+    }
 }
 
 #[test]

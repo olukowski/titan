@@ -3,7 +3,7 @@ use std::path::{Component, Path};
 
 use super::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind, diagnostic,
-    json_pointer_join,
+    fits_f32_without_underflow, json_pointer_join, normalized_quaternion,
 };
 
 pub fn validate(document: &Document) -> TsfResult<()> {
@@ -368,6 +368,7 @@ impl Validator<'_> {
         let mut rotation = [0.0_f32; 4];
         for (index, value) in values.iter().enumerate() {
             match &value.kind {
+                ValueKind::Number(number) if !number.value.is_finite() => {}
                 ValueKind::Number(number) if fits_f32_without_underflow(number.value) => {
                     rotation[index] = number.value as f32;
                 }
@@ -385,16 +386,15 @@ impl Validator<'_> {
                 ),
             }
         }
-        if values.iter().all(|value| matches!(&value.kind, ValueKind::Number(number) if fits_f32_without_underflow(number.value))) {
-            let norm = rotation.iter().map(|component| component * component).sum::<f32>().sqrt();
-            if norm == 0.0 || !norm.is_finite() || (norm - 1.0).abs() > 1e-5 {
-                self.push(
-                    "TSF_INVALID_QUATERNION",
-                    "transform.rotation quaternion must have unit norm within 1e-5",
-                    path,
-                    value.span,
-                );
-            }
+        if values.iter().all(|value| matches!(&value.kind, ValueKind::Number(number) if number.value.is_finite() && fits_f32_without_underflow(number.value)))
+            && normalized_quaternion(rotation).is_none()
+        {
+            self.push(
+                "TSF_INVALID_QUATERNION",
+                "transform.rotation quaternion must have unit norm within 1e-5",
+                path,
+                value.span,
+            );
         }
     }
 
@@ -594,11 +594,6 @@ fn object_members(value: &Value) -> Option<&[Member]> {
         ValueKind::Object(members) => Some(members),
         _ => None,
     }
-}
-
-fn fits_f32_without_underflow(value: f64) -> bool {
-    let converted = value as f32;
-    converted.is_finite() && (value == 0.0 || converted != 0.0)
 }
 
 fn member<'a>(members: &'a [Member], key: &str) -> Option<&'a Member> {
