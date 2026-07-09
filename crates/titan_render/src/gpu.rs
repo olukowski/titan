@@ -4,7 +4,7 @@ use std::env;
 
 use serde::Serialize;
 
-use crate::{OutputSize, RenderError, ServiceResult, error, validate_output_size};
+use crate::{DrawItem, Mat4, OutputSize, RenderError, ServiceResult, error, validate_output_size};
 
 /// The graphics backend selected for a Titan GPU context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -156,11 +156,12 @@ impl GpuContext {
         self.device.limits()
     }
 
-    pub(crate) fn draw_triangle(
+    pub(crate) fn draw_plan(
         &self,
         size: OutputSize,
         clear: [f32; 4],
         view_projection: [[f32; 4]; 4],
+        draw_list: &[DrawItem],
     ) -> ServiceResult<Vec<u8>> {
         let targets = self.create_render_targets(size)?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -169,17 +170,6 @@ impl GpuContext {
                 "@group(0) @binding(0) var<uniform> camera: mat4x4<f32>;\n@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n  var p = array<vec3<f32>, 3>(vec3<f32>(-0.7, -0.6, 0.0), vec3<f32>(0.0, 0.75, 0.0), vec3<f32>(0.7, -0.6, 0.0));\n  return camera * vec4<f32>(p[i], 1.0);\n}\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.95, 0.2, 0.08, 1.0); }\n",
             )),
         });
-        let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("titan camera uniform"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut bytes = [0u8; 64];
-        for (index, value) in view_projection.iter().flatten().enumerate() {
-            bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
-        }
-        self.queue.write_buffer(&uniform, 0, &bytes);
         let bind_layout = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -195,14 +185,32 @@ impl GpuContext {
                     count: None,
                 }],
             });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("titan camera bind group"),
-            layout: &bind_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
+        let bind_groups = draw_list
+            .iter()
+            .map(|item| {
+                let matrix = (Mat4(view_projection) * item.model).transpose().0;
+                let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("titan draw transform uniform"),
+                    size: 64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let mut bytes = [0u8; 64];
+                for (index, value) in matrix.iter().flatten().enumerate() {
+                    bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+                }
+                self.queue.write_buffer(&uniform, 0, &bytes);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("titan draw transform bind group"),
+                    layout: &bind_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    }],
+                });
+                (uniform, bind_group)
+            })
+            .collect::<Vec<_>>();
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -292,8 +300,10 @@ impl GpuContext {
                 multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            for (_, bind_group) in &bind_groups {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
