@@ -89,6 +89,7 @@ fn forbidden_number_values_fail() {
         ("{ value: NaN }", "NaN"),
         ("{ value: 0x10 }", "hexadecimal"),
         ("{ value: +1 }", "leading plus"),
+        ("{ value: 1e-324 }", "underflows"),
     ] {
         let error = parse(None, source).expect_err("forbidden number should fail");
         assert_eq!(error.errors[0].code, "TSF_INVALID_NUMBER", "{source}");
@@ -110,6 +111,26 @@ fn string_escapes_follow_json5() {
         query(&document, "/value").expect("query value").value,
         "A\u{b}\0"
     );
+
+    let document = parse(None, r#"{ value: "\uD83D\uDE00" }"#).expect("parse surrogate pair");
+    assert_eq!(
+        query(&document, "/value").expect("query value").value,
+        "\u{1f600}"
+    );
+
+    let error = parse(None, r#"{ value: "\uD83D" }"#).expect_err("reject lone surrogate");
+    assert_eq!(error.errors[0].code, "TSF_PARSE_ERROR");
+}
+
+#[test]
+fn overly_nested_input_fails_before_stack_overflow() {
+    let mut source = "[".repeat(130);
+    source.push_str("null");
+    source.push_str(&"]".repeat(130));
+
+    let error = parse(None, &source).expect_err("deep nesting should fail");
+    assert_eq!(error.errors[0].code, "TSF_PARSE_ERROR");
+    assert!(error.errors[0].message.contains("nesting depth"));
 }
 
 #[test]
@@ -119,6 +140,15 @@ fn formatter_quotes_hyphenated_keys() {
 
     assert!(formatted.contains("\"asset-name\": {"));
     assert!(formatted.contains("nested_key: true"));
+}
+
+#[test]
+fn crate_root_reexports_tsf_model_types() {
+    let _kind = titan_scene::ValueKind::Number(titan_scene::Number {
+        value: 1.0,
+        had_fraction: false,
+    });
+    let _members: Vec<titan_scene::Member> = Vec::new();
 }
 
 #[test]

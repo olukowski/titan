@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use super::{Document, Member, Number, Position, Span, TsfError, TsfResult, Value, ValueKind};
 
+const MAX_NESTING_DEPTH: usize = 128;
+
 pub fn parse(file: Option<&str>, source: &str) -> TsfResult<Document> {
     Parser::new(file, source).parse_document()
 }
@@ -25,7 +27,7 @@ impl<'a> Parser<'a> {
 
     fn parse_document(mut self) -> TsfResult<Document> {
         let comments = self.skip_ws_comments()?;
-        let mut root = self.parse_value_with_comments(comments)?;
+        let mut root = self.parse_value_with_comments(comments, 0)?;
         let trailing = self.skip_ws_comments()?;
         if !trailing.is_empty() {
             root.comments.extend(trailing);
@@ -44,11 +46,23 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_value_with_comments(&mut self, comments: Vec<String>) -> TsfResult<Value> {
+    fn parse_value_with_comments(
+        &mut self,
+        comments: Vec<String>,
+        depth: usize,
+    ) -> TsfResult<Value> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(self.error(
+                "TSF_PARSE_ERROR",
+                "document exceeds maximum nesting depth",
+                "",
+                self.empty_span(),
+            ));
+        }
         let start = self.position;
         let mut value = match self.peek_char() {
-            Some('{') => self.parse_object()?,
-            Some('[') => self.parse_array()?,
+            Some('{') => self.parse_object(depth)?,
+            Some('[') => self.parse_array(depth)?,
             Some('"') | Some('\'') => self.parse_string_value()?,
             Some('t') => self.parse_literal("true", ValueKind::Bool(true))?,
             Some('f') => self.parse_literal("false", ValueKind::Bool(false))?,
@@ -97,7 +111,7 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn parse_object(&mut self) -> TsfResult<Value> {
+    fn parse_object(&mut self, depth: usize) -> TsfResult<Value> {
         let start = self.span_before();
         self.bump_char();
         let mut members = Vec::new();
@@ -131,7 +145,7 @@ impl<'a> Parser<'a> {
                 ));
             }
             let value_comments = self.skip_ws_comments()?;
-            let value = self.parse_value_with_comments(value_comments)?;
+            let value = self.parse_value_with_comments(value_comments, depth + 1)?;
             members.push(Member {
                 key,
                 key_span,
@@ -158,7 +172,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_array(&mut self) -> TsfResult<Value> {
+    fn parse_array(&mut self, depth: usize) -> TsfResult<Value> {
         let start = self.span_before();
         self.bump_char();
         let mut values = Vec::new();
@@ -171,7 +185,7 @@ impl<'a> Parser<'a> {
                     comments: Vec::new(),
                 });
             }
-            values.push(self.parse_value_with_comments(comments)?);
+            values.push(self.parse_value_with_comments(comments, depth + 1)?);
             self.skip_ws_comments()?;
             if self.consume_char(',') {
                 continue;
@@ -310,6 +324,54 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unicode_escape(&mut self) -> TsfResult<char> {
+        let value = self.parse_unicode_code_unit()?;
+        if (0xD800..=0xDBFF).contains(&value) {
+            if self.bump_char() != Some('\\') || self.bump_char() != Some('u') {
+                return Err(self.error(
+                    "TSF_PARSE_ERROR",
+                    "high surrogate must be followed by a low surrogate",
+                    "",
+                    self.empty_span(),
+                ));
+            }
+            let low = self.parse_unicode_code_unit()?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(self.error(
+                    "TSF_PARSE_ERROR",
+                    "high surrogate must be followed by a low surrogate",
+                    "",
+                    self.empty_span(),
+                ));
+            }
+            let scalar = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+            return char::from_u32(scalar).ok_or_else(|| {
+                self.error(
+                    "TSF_PARSE_ERROR",
+                    "invalid unicode scalar",
+                    "",
+                    self.empty_span(),
+                )
+            });
+        }
+        if (0xDC00..=0xDFFF).contains(&value) {
+            return Err(self.error(
+                "TSF_PARSE_ERROR",
+                "low surrogate must follow a high surrogate",
+                "",
+                self.empty_span(),
+            ));
+        }
+        char::from_u32(value).ok_or_else(|| {
+            self.error(
+                "TSF_PARSE_ERROR",
+                "invalid unicode scalar",
+                "",
+                self.empty_span(),
+            )
+        })
+    }
+
+    fn parse_unicode_code_unit(&mut self) -> TsfResult<u32> {
         let mut value = 0_u32;
         for _ in 0..4 {
             let ch = self.bump_char().ok_or_else(|| {
@@ -330,14 +392,7 @@ impl<'a> Parser<'a> {
                     )
                 })?;
         }
-        char::from_u32(value).ok_or_else(|| {
-            self.error(
-                "TSF_PARSE_ERROR",
-                "invalid unicode scalar",
-                "",
-                self.empty_span(),
-            )
-        })
+        Ok(value)
     }
 
     fn parse_identifier(&mut self) -> TsfResult<(String, Span)> {
@@ -453,6 +508,14 @@ impl<'a> Parser<'a> {
             return Err(self.error(
                 "TSF_INVALID_NUMBER",
                 "number must be finite",
+                "",
+                Span::merge(start, self.span_before()),
+            ));
+        }
+        if value == 0.0 && raw_has_nonzero_digit(raw) {
+            return Err(self.error(
+                "TSF_INVALID_NUMBER",
+                "nonzero number underflows f64",
                 "",
                 Span::merge(start, self.span_before()),
             ));
@@ -593,4 +656,10 @@ fn is_ident_start(ch: char) -> bool {
 
 fn is_ident_continue(ch: char) -> bool {
     is_ident_start(ch) || ch.is_ascii_digit() || ch == '-'
+}
+
+fn raw_has_nonzero_digit(raw: &str) -> bool {
+    raw.split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.chars().any(|ch| matches!(ch, '1'..='9')))
 }

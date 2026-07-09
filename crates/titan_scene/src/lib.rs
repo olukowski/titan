@@ -3,8 +3,8 @@
 pub mod tsf;
 
 pub use tsf::{
-    Diagnostic, DiagnosticSpan, Document, Position, QueryResult, Span, TsfError, TsfResult, Value,
-    edit, fmt, parse, query, validate,
+    Diagnostic, DiagnosticSpan, Document, Member, Number, Position, QueryResult, Span, TsfError,
+    TsfResult, Value, ValueKind, edit, fmt, parse, query, validate,
 };
 
 use titan_core::{EntityId, Transform};
