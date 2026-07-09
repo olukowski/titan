@@ -339,7 +339,13 @@ impl Validator<'_> {
                 );
                 continue;
             };
+            let diagnostics_start = self.errors.len();
             (binding.validate)(&component.value, &component_path, &mut self.errors);
+            for diagnostic in &mut self.errors[diagnostics_start..] {
+                if diagnostic.span.file.is_none() {
+                    diagnostic.span.file = self.file.map(str::to_owned);
+                }
+            }
         }
     }
 

@@ -214,6 +214,29 @@ fn projection_material_mesh_viewport_and_submesh_schema_rules_are_enforced() {
 }
 
 #[test]
+fn binding_validator_diagnostic_keeps_document_filename() {
+    let document = parse(
+        Some("binding-diagnostic.tsf"),
+        &phase2_source("transform: { translation: [1, 2] }"),
+    )
+    .expect("parse");
+    let error = validate(&document).expect_err("invalid transform should be rejected");
+
+    let diagnostic = error
+        .errors
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == "TSF_SCHEMA"
+                && diagnostic.path == "/entities/entity:test/components/transform/translation"
+        })
+        .expect("transform binding diagnostic");
+    assert_eq!(
+        diagnostic.span.file.as_deref(),
+        Some("binding-diagnostic.tsf")
+    );
+}
+
+#[test]
 fn moving_entity_round_trips_and_format_is_idempotent() {
     let document = parse(Some("moving_entity.tsf"), MOVING_ENTITY).expect("parse fixture");
     validate(&document).expect("validate fixture");
