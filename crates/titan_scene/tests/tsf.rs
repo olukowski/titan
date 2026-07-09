@@ -1,4 +1,5 @@
-use titan_scene::{Number, ValueKind, edit, fmt, parse, query, validate};
+use titan_core::phase1_component_registry;
+use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
 
@@ -13,6 +14,71 @@ fn moving_entity_round_trips_and_format_is_idempotent() {
     let reparsed = parse(Some("moving_entity.tsf"), &formatted).expect("parse formatted fixture");
     let reformatted = fmt(&reparsed);
     assert_eq!(reformatted, formatted);
+}
+
+#[test]
+fn load_world_assigns_scene_entity_ids_independent_of_array_order() {
+    let first = parse(
+        Some("ordered.tsf"),
+        r#"{
+  tsf: 1,
+  scene: { id: "scene:test" },
+  assets: {},
+  entities: [
+    {
+      id: "entity:b",
+      components: {
+        transform: { translation: [2.0, 0.0, 0.0] },
+      },
+    },
+    {
+      id: "entity:a",
+      components: {
+        transform: { translation: [1.0, 0.0, 0.0] },
+      },
+    },
+  ],
+}
+"#,
+    )
+    .expect("parse first scene");
+    let second = parse(
+        Some("reordered.tsf"),
+        r#"{
+  tsf: 1,
+  scene: { id: "scene:test" },
+  assets: {},
+  entities: [
+    {
+      id: "entity:a",
+      components: {
+        transform: { translation: [1.0, 0.0, 0.0] },
+      },
+    },
+    {
+      id: "entity:b",
+      components: {
+        transform: { translation: [2.0, 0.0, 0.0] },
+      },
+    },
+  ],
+}
+"#,
+    )
+    .expect("parse reordered scene");
+
+    let first = load_world(&first, phase1_component_registry().unwrap())
+        .unwrap()
+        .dump_state()
+        .unwrap();
+    let second = load_world(&second, phase1_component_registry().unwrap())
+        .unwrap()
+        .dump_state()
+        .unwrap();
+
+    assert_eq!(first.entity_ids, second.entity_ids);
+    assert_eq!(first.entity_ids.get("entity:a"), Some(&1));
+    assert_eq!(first.entity_ids.get("entity:b"), Some(&2));
 }
 
 #[test]

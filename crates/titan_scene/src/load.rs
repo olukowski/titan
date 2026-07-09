@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use titan_core::{Component, ComponentRegistry, EntityId, Transform, Velocity, World};
 
 use crate::tsf::{
@@ -11,6 +13,7 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
 
     let mut world = World::new(registry);
     let entities = required_array(document, &document.root, "entities", "/entities")?;
+    let entity_ids = scene_entity_ids(document, entities)?;
 
     for (index, entity) in entities.iter().enumerate() {
         let path = format!("/entities/{index}");
@@ -24,7 +27,15 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
             )
         })?;
         let scene_id = required_string(document, members, "id", &format!("{path}/id"))?;
-        let entity_id = EntityId::from_raw(index as u64 + 1);
+        let entity_id = *entity_ids.get(scene_id).ok_or_else(|| {
+            one(
+                document,
+                "TSF_LOAD_WORLD",
+                format!("missing runtime entity id for '{scene_id}'"),
+                format!("{path}/id"),
+                entity.span,
+            )
+        })?;
         world.spawn_with_id(entity_id).map_err(|error| {
             one(
                 document,
@@ -58,6 +69,32 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
     }
 
     Ok(world)
+}
+
+fn scene_entity_ids(
+    document: &Document,
+    entities: &[Value],
+) -> TsfResult<BTreeMap<String, EntityId>> {
+    let mut scene_ids = BTreeMap::new();
+    for (index, entity) in entities.iter().enumerate() {
+        let path = format!("/entities/{index}");
+        let members = object_members(entity).ok_or_else(|| {
+            one(
+                document,
+                "TSF_SCHEMA",
+                "entity must be an object",
+                &path,
+                entity.span,
+            )
+        })?;
+        let scene_id = required_string(document, members, "id", &format!("{path}/id"))?;
+        scene_ids.insert(scene_id.to_owned(), EntityId::from_raw(0));
+    }
+
+    for (index, entity_id) in scene_ids.values_mut().enumerate() {
+        *entity_id = EntityId::from_raw(index as u64 + 1);
+    }
+    Ok(scene_ids)
 }
 
 fn load_components(
