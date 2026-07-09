@@ -193,7 +193,17 @@ fn required_vec3(
                 value.span,
             ));
         };
-        out.push(number.value as f32);
+        let converted = number.value as f32;
+        if !converted.is_finite() || (number.value != 0.0 && converted == 0.0) {
+            return Err(one(
+                document,
+                "TSF_INVALID_NUMBER",
+                format!("{key}[{index}] must fit in f32 without underflow"),
+                format!("{path}/{index}"),
+                value.span,
+            ));
+        }
+        out.push(converted);
     }
     Ok(serde_json::json!({ "x": out[0], "y": out[1], "z": out[2] }))
 }

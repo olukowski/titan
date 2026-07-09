@@ -197,6 +197,27 @@ fn invalid_entity_parent_is_diagnostic() {
 }
 
 #[test]
+fn unsupported_runtime_components_are_diagnostic() {
+    for component in ["mesh", "camera", "light"] {
+        let source = MOVING_ENTITY.replace(
+            "        velocity: {",
+            &format!("        {component}: {{}},\n        velocity: {{"),
+        );
+        let document = parse(Some("unsupported-component.tsf"), &source).expect("parse");
+        let error = validate(&document).expect_err("unsupported component should fail");
+
+        assert!(
+            error.errors.iter().any(|diagnostic| {
+                diagnostic.code == "TSF_UNKNOWN_COMPONENT"
+                    && diagnostic.path == format!("/entities/entity:mover/components/{component}")
+            }),
+            "missing diagnostic for {component}: {:?}",
+            error.errors
+        );
+    }
+}
+
+#[test]
 fn direct_non_finite_numbers_are_diagnostic() {
     let mut document = parse(Some("nonfinite.tsf"), MOVING_ENTITY).expect("parse");
     let ValueKind::Object(root) = &mut document.root.kind else {

@@ -165,6 +165,60 @@ fn loader_reports_bad_component_payload_with_path_and_span() {
 }
 
 #[test]
+fn loader_rejects_vector_values_that_do_not_fit_f32() {
+    for (name, value) in [("overflow", "1e39"), ("underflow", "1e-46")] {
+        let dir = temp_dir(name);
+        let scene = dir.join(format!("{name}.tsf"));
+        fs::write(
+            &scene,
+            format!(
+                r#"{{
+  tsf: 1,
+  scene: {{ id: "scene:tests/{name}" }},
+  assets: {{}},
+  entities: [
+    {{
+      id: "entity:mover",
+      components: {{
+        transform: {{
+          translation: [{value}, 0.0, 0.0],
+          rotation: [0.0, 0.0, 0.0, 1.0],
+          scale: [1.0, 1.0, 1.0],
+        }},
+        velocity: {{
+          linear: [0.0, 0.0, 0.0],
+          angular: [0.0, 0.0, 0.0],
+        }},
+      }},
+    }},
+  ],
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let output = titan()
+            .args(["run"])
+            .arg(&scene)
+            .args(["--headless", "--frames", "1"])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let error: Value = serde_json::from_slice(&output).unwrap();
+        let diagnostic = &error["error"]["diagnostics"][0];
+
+        assert_eq!(diagnostic["code"], "TSF_INVALID_NUMBER");
+        assert_eq!(
+            diagnostic["path"],
+            "/entities/entity:mover/components/transform/translation/0"
+        );
+    }
+}
+
+#[test]
 fn event_log_jsonl_records_loading_events_in_stable_order() {
     let dir = temp_dir("event_log");
     let log = dir.join("events.jsonl");
