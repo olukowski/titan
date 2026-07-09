@@ -262,6 +262,7 @@ pub struct World {
     frame: u64,
     seed: u64,
     scene_entity_ids: BTreeMap<String, u64>,
+    scene_entity_names: BTreeMap<String, Vec<EntityId>>,
 }
 
 impl World {
@@ -277,6 +278,7 @@ impl World {
             frame: 0,
             seed: 0,
             scene_entity_ids: BTreeMap::new(),
+            scene_entity_names: BTreeMap::new(),
         }
     }
 
@@ -482,6 +484,32 @@ impl World {
         self.require_entity(entity)?;
         self.scene_entity_ids.insert(scene_id.into(), entity.raw());
         Ok(())
+    }
+
+    /// Associates a serialized entity name with an entity for name-based APIs.
+    pub fn bind_scene_entity_name(
+        &mut self,
+        name: impl Into<String>,
+        entity: EntityId,
+    ) -> Result<()> {
+        self.require_entity(entity)?;
+        self.scene_entity_names
+            .entry(name.into())
+            .or_default()
+            .push(entity);
+        Ok(())
+    }
+
+    /// Returns all entities carrying a serialized name, in stable ID order.
+    pub fn scene_entities_named(&self, name: &str) -> Vec<EntityId> {
+        let mut entities = self
+            .scene_entity_names
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        entities.sort_unstable();
+        entities.retain(|entity| self.entities.contains(entity));
+        entities
     }
 
     fn require_entity(&self, id: EntityId) -> Result<()> {
