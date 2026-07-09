@@ -101,12 +101,34 @@ quaternion has no gimbal-lock convention and is the representation already
 anticipated by 0001's normalized-quaternion validation rule). The field is
 omitted for source compatibility and defaults to the identity quaternion;
 `Transform` becomes schema version 2, while version-1 payloads continue to
-load. A supplied quaternion must be finite, non-zero, and normalized within
-the validator's documented tolerance; invalid values are rejected rather than
-silently normalized. `from_translation` and the Rust default continue to use
-identity rotation. The core type, scene validator/loader, canonical formatter,
-state-dump expectations, and regression tests are all updated in the same
-small Transform-schema PR before camera loading is implemented.
+load. A supplied quaternion must be finite, have norm greater than zero, and
+satisfy `abs(norm - 1.0) <= 1e-5` after conversion to `f32`; values outside
+that tolerance are rejected rather than silently accepted. Values inside the
+tolerance are normalized once by the loader before insertion, so the ECS and
+state dump contain a unit quaternion. `from_translation` and the Rust default
+continue to use identity rotation.
+
+The compatibility and serialization contract is precise: a v1 TSF payload has
+only `translation` and loads as identity rotation; a v2 payload may omit
+`rotation` and has the same identity default, or may provide the four-number
+quaternion. A canonical TSF formatter orders `translation` before `rotation`
+and omits identity rotation (the default is therefore not emitted); it emits a
+non-identity rotation in normalized `[x, y, z, w]` order. Typed v2 state dumps
+always report `schema_version: 2` and include the normalized `rotation` in
+`value`, including identity, so a dump is self-describing. The loader accepts
+both v1 and v2 payload shapes but rejects unknown fields, wrong lengths, and
+non-finite, zero-length, or out-of-tolerance values. Validator diagnostics use
+`TSF_SCHEMA` for shape/type errors, `TSF_INVALID_NUMBER` for non-finite or
+non-f32 values, and `TSF_INVALID_QUATERNION` for zero-length or normalization
+failure, with the component field/index as the diagnostic path; deserialization
+failures retain `TSF_COMPONENT_DESERIALIZE`.
+
+The core type, scene validator/loader, canonical formatter, state-dump
+expectations, and regression tests are all updated in the same small
+Transform-schema PR before camera loading is implemented. Tests pin v1 loading
+to identity, v2 omission and explicit identity, the field order, normalized
+state-dump output, acceptance at `1e-5`, rejection just beyond `1e-5`, zero and
+non-finite inputs, unknown fields, and the diagnostic codes/paths above.
 
 Phase 2
 supports perspective and orthographic projections:
@@ -160,17 +182,24 @@ mesh: {
 
 The Phase 2 red-cube fixture deliberately uses a built-in, renderer-owned
 primitive rather than leaving an asset format open. Its TSF asset entry is
-`{ path: "builtin/geometry/cube-v1", kind: "geometry" }`, and the mesh
-component refers to it as `{ ref: "asset:cube_mesh" }`. The reserved
-`builtin/geometry/...` path is resolved by the shared asset resolver and never
-read from disk; ordinary relative paths continue to resolve from the
-containing `.tsf` directory as specified by 0001. `cube-v1` is the complete
-version identifier: it is a unit cube centered at the origin with six
-outward-facing faces, 24 face-split vertices, 36 `u32` indices, one submesh,
-per-face unit normals, and deterministic UVs. The built-in is Phase 2 fixture
-input only, is not a public geometry-file format, and is removed from the
-design's open questions. Phase 3 TitanGeo and later glTF import must produce
-the same resolved `MeshAsset` interface.
+`{ path: "__builtin__/geometry/cube-v1", kind: "geometry" }`, and the mesh
+component refers to it as `{ ref: "asset:cube_mesh" }`. This is deliberately a
+valid normalized relative path under 0001 and the current validator:
+`valid_relative_path` permits normal and `..` components but rejects `\\`, `:`,
+and absolute/root components. The asset resolver reserves the first component
+`__builtin__` and intercepts this path before filesystem resolution; it is a
+resolver namespace, not a TSF grammar extension. Ordinary relative paths keep
+resolving from the containing `.tsf` directory. Thus no colon-bearing
+`builtin:` URI is introduced and no validator change is needed. The resolver
+must reject unknown `__builtin__` paths with `RENDER_UNKNOWN_BUILTIN`, rather
+than falling through to disk.
+
+`cube-v1` is the complete version identifier: it is a unit cube centered at
+the origin with six outward-facing faces, 24 face-split vertices, 36 `u32`
+indices, one submesh, per-face unit normals, and deterministic UVs. The
+built-in is Phase 2 fixture input only, is not a public geometry-file format,
+and is removed from the design's open questions. Phase 3 TitanGeo and later
+glTF import must produce the same resolved `MeshAsset` interface.
 
 For `pbr` materials, normals are required: every resolved mesh used by a PBR
 draw must provide one finite unit normal per vertex. Missing or invalid normals
@@ -224,21 +253,57 @@ names used by `titan_core` state dumps. The canonical Phase 2 mapping is:
 | `material` | `titan.core.Material` | 1 |
 
 The `titan.core.*` names follow 0002's stable registry convention even though
-the latter four are consumed first by `titan_render`. Before any TSF load, the
-Phase 2 registry builder registers all six types (and the Phase 1 registry
-continues to register only `Transform` and `Velocity`); duplicate names,
-types, or schema versions are errors. The shared scene loader owns this table:
-it validates the TSF alias payload, translates the alias to the registered
-name, and calls the registry's typed deserialize path. Renderer code does not
-add a private component registry or special-case TSF loading. Unknown aliases
-remain `TSF_UNKNOWN_COMPONENT` errors.
+the latter four are consumed first by `titan_render`. The actual
+`titan_core::ComponentRegistry` currently registers a Rust type and exposes
+`meta_by_name`, but has no alias API. Phase 2 therefore adds the alias layer in
+`titan_scene`, not in renderer code. Its contract is equivalent to:
+
+```rust
+struct TsfComponentBinding {
+    alias: &'static str,
+    registered_name: &'static str,
+    schema_version: u32,
+    validate: fn(&Value, &str, &mut Diagnostics),
+}
+
+struct TsfComponentRegistry {
+    by_alias: BTreeMap<&'static str, TsfComponentBinding>,
+}
+```
+
+`by_alias` is immutable after construction; aliases and registered names are
+unique, and the binding's schema version must equal
+`component_registry.meta_by_name(registered_name)?.schema_version()`. Loading
+looks up the TSF alias, validates its payload, verifies that the mapped
+registered name is present in the supplied `ComponentRegistry`, then calls
+`World::insert_serialized` with that registered name. An unknown alias is
+`TSF_UNKNOWN_COMPONENT`. A known alias whose mapped registered type is absent
+is the structured `TSF_COMPONENT_NOT_REGISTERED` error, with
+`alias`, `registered_name`, and the component JSON path in its diagnostic
+context; it must not be reported as an unknown alias or a generic deserialize
+failure. Duplicate aliases, names, or schema-version mismatches are registry
+construction errors before parsing a scene.
+
+The Phase 1 builder constructs a fresh `ComponentRegistry`, registers
+`Transform` and `Velocity` (matching the current
+`phase1_component_registry()`), and constructs bindings for those two
+aliases. The Phase 2 builder constructs a fresh registry and registers all six
+types, then constructs the six bindings in the table below. This explicit
+construction is required because the current core registry has no merge or
+alias-registration method. The shared scene loader owns lookup and typed
+deserialization; renderer code does not add a private registry or special-case
+TSF loading.
 
 State dumps and registry metadata use the registered `titan.core.*` names and
 include `{ schema_version, value }` as specified by 0002. TSF paths, formatter
 ordering, CLI scene editing, and diagnostics use the lowercase aliases. The
 loader and formatter must therefore be extended together with the registry;
-the current hard-coded `transform`/`velocity` loader switch is the Phase 1
-implementation being replaced by this shared mapping.
+the current `load_world` hard-coded `transform`/`velocity` switch and the
+validator/formatter's corresponding built-in lists are the Phase 1
+implementation being replaced by this shared mapping. Tests must cover both
+registry builders, alias-to-name lookup, duplicate binding rejection, a
+missing mapped registered type with `TSF_COMPONENT_NOT_REGISTERED`, and
+successful typed insertion through `insert_serialized`.
 
 They are serialized under an entity's `components` object exactly as specified
 by design doc 0001. References are objects with a `ref` key, never bare asset
@@ -249,7 +314,7 @@ strings. A representative scene fragment is:
   tsf: 1,
   scene: { id: "scene:examples/red_cube" },
   assets: {
-    cube_mesh: { path: "builtin/geometry/cube-v1", kind: "geometry" },
+    cube_mesh: { path: "__builtin__/geometry/cube-v1", kind: "geometry" },
   },
   entities: [
     {
@@ -264,7 +329,6 @@ strings. A representative scene fragment is:
         },
         transform: {
           translation: [0.0, 0.0, 3.0],
-          rotation: [0.0, 0.0, 0.0, 1.0],
         },
       },
     },
@@ -404,7 +468,10 @@ Keep implementation PRs small and independently reviewable:
 3. Add camera math, transform extraction, fullscreen clear, and a one-triangle
    or fixture-mesh draw. Verify projection/frustum tests and a first PNG.
 4. Add geometry asset resolution, mesh GPU buffers, stable draw ordering, and
-   exact draw-call/triangle stats.
+   exact draw-call/triangle stats. The resolver must recognize only the
+   validated virtual-relative `__builtin__/geometry/cube-v1` path, test that it
+   never reaches filesystem resolution, and return `RENDER_UNKNOWN_BUILTIN`
+   for an unknown `__builtin__` path.
 5. Add unlit and basic PBR shaders, directional-light selection, material
    validation, and the red-cube render fixture.
 6. Add `titan render` CLI wiring, PNG encoding, `--json`, camera selection,
