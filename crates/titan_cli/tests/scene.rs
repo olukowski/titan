@@ -241,7 +241,7 @@ fn edit_replacement_validation_errors_use_replacement_location() {
                 "scene",
                 "edit",
                 path_str.as_str(),
-                "/entities/entity:mover/components/velocity/linear/0",
+                "/entities/0/components/velocity/linear/0",
                 "\"bad\"",
             ])
             .assert()

@@ -26,22 +26,47 @@ pub fn edit(document: &Document, path: &str, new_json5_value: &str) -> TsfResult
         let (_, resolved_pointer) = resolve(&edited, path)?;
         resolved_pointer
     };
+    let replacement_paths = replacement_paths(&edited, path, &resolved_pointer);
     let segments = split_pointer(&resolved_pointer)?;
     let target = resolve_mut(&mut edited.root, &segments, "")?;
     *target = replacement;
-    validate(&edited)
-        .map_err(|error| replacement_validation_error(error, path, &resolved_pointer))?;
+    validate(&edited).map_err(|error| replacement_validation_error(error, &replacement_paths))?;
     Ok(fmt(&edited))
 }
 
-fn replacement_validation_error(
-    mut error: TsfError,
-    path: &str,
-    resolved_pointer: &str,
-) -> TsfError {
+fn replacement_paths(document: &Document, path: &str, resolved_pointer: &str) -> Vec<String> {
+    let mut paths = vec![path.to_owned(), resolved_pointer.to_owned()];
+    if let Some(entity_pointer) = entity_pointer(document, resolved_pointer) {
+        paths.push(entity_pointer);
+    }
+    paths
+}
+
+fn entity_pointer(document: &Document, resolved_pointer: &str) -> Option<String> {
+    let rest = resolved_pointer.strip_prefix("/entities/")?;
+    let (index, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+    let index = index.parse::<usize>().ok()?;
+    let ValueKind::Object(root) = &document.root.kind else {
+        return None;
+    };
+    let entities = root.iter().find(|member| member.key == "entities")?;
+    let ValueKind::Array(entities) = &entities.value.kind else {
+        return None;
+    };
+    let id = entity_id(entities.get(index)?)?;
+    let mut pointer = format!("/entities/{}", json_pointer_escape(&id));
+    if !suffix.is_empty() {
+        pointer.push('/');
+        pointer.push_str(suffix);
+    }
+    Some(pointer)
+}
+
+fn replacement_validation_error(mut error: TsfError, replacement_paths: &[String]) -> TsfError {
     for diagnostic in &mut error.errors {
-        if path_is_at_or_below(&diagnostic.path, path)
-            || path_is_at_or_below(&diagnostic.path, resolved_pointer)
+        if replacement_paths
+            .iter()
+            .any(|path| path_is_at_or_below(&diagnostic.path, path))
         {
             diagnostic.span.file = Some("<replacement>".to_owned());
         }

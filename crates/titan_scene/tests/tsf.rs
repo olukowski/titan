@@ -43,7 +43,7 @@ fn edit_reports_semantic_replacement_errors_at_replacement() {
     let document = parse(Some("moving_entity.tsf"), MOVING_ENTITY).expect("parse fixture");
     let error = edit(
         &document,
-        "/entities/entity:mover/components/velocity/linear/0",
+        "/entities/0/components/velocity/linear/0",
         "\"bad\"",
     )
     .expect_err("invalid replacement should fail validation");
