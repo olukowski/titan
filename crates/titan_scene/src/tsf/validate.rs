@@ -5,13 +5,46 @@ use super::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind, diagnostic,
     fits_f32_without_underflow, json_pointer_join, normalized_quaternion,
 };
+use crate::registry::TsfComponentRegistry;
 
 pub fn validate(document: &Document) -> TsfResult<()> {
+    let uses_phase2 = document_contains_phase2_component(document);
+    let registry = if uses_phase2 {
+        crate::registry::phase2_component_registry()
+            .expect("built-in TSF registry must be constructible")
+    } else {
+        crate::registry::phase1_component_registry()
+            .expect("built-in TSF registry must be constructible")
+    };
+    validate_with_registry(document, &registry)
+}
+
+fn document_contains_phase2_component(document: &Document) -> bool {
+    fn visit(value: &Value) -> bool {
+        match &value.kind {
+            ValueKind::Object(members) => members.iter().any(|member| {
+                matches!(
+                    member.key.as_str(),
+                    "camera" | "directional_light" | "mesh" | "material"
+                ) || visit(&member.value)
+            }),
+            ValueKind::Array(values) => values.iter().any(visit),
+            _ => false,
+        }
+    }
+    visit(&document.root)
+}
+
+pub fn validate_with_registry(
+    document: &Document,
+    registry: &TsfComponentRegistry,
+) -> TsfResult<()> {
     let mut validator = Validator {
         file: document.file.as_deref(),
         errors: Vec::new(),
         asset_aliases: HashSet::new(),
         entity_ids: HashSet::new(),
+        registry,
     };
     validator.validate_document(document);
     if validator.errors.is_empty() {
@@ -26,6 +59,7 @@ struct Validator<'a> {
     errors: Vec<Diagnostic>,
     asset_aliases: HashSet<String>,
     entity_ids: HashSet<String>,
+    registry: &'a TsfComponentRegistry,
 }
 
 impl Validator<'_> {
@@ -314,6 +348,16 @@ impl Validator<'_> {
         };
         for component in members {
             let component_path = json_pointer_join(path, &component.key);
+            let Some(binding) = self.registry.binding(&component.key) else {
+                self.push(
+                    "TSF_UNKNOWN_COMPONENT",
+                    format!("unknown component '{}'", component.key),
+                    component_path,
+                    component.key_span,
+                );
+                continue;
+            };
+            (binding.validate)(&component.value, &component_path, &mut self.errors);
             match component.key.as_str() {
                 "transform" => self.validate_transform(&component.value, &component_path),
                 "velocity" => self.validate_velocity(&component.value, &component_path),
@@ -323,12 +367,7 @@ impl Validator<'_> {
                 }
                 "mesh" => self.validate_mesh(&component.value, &component_path),
                 "material" => self.validate_material(&component.value, &component_path),
-                _ => self.push(
-                    "TSF_UNKNOWN_COMPONENT",
-                    format!("unknown component '{}'", component.key),
-                    component_path,
-                    component.key_span,
-                ),
+                _ => {}
             }
         }
     }
@@ -393,6 +432,17 @@ impl Validator<'_> {
                 return;
             }
         };
+        let allowed = match kind {
+            "perspective" => &[
+                "projection",
+                "vertical_fov_degrees",
+                "near",
+                "far",
+                "viewport",
+            ][..],
+            "orthographic" => &["projection", "height", "near", "far", "viewport"][..],
+            _ => unreachable!(),
+        };
         for field in required {
             self.validate_scalar(members, field, path, "camera");
         }
@@ -418,19 +468,7 @@ impl Validator<'_> {
             );
         }
         self.validate_optional_viewport(members, path);
-        self.reject_unknown(
-            members,
-            &[
-                "projection",
-                "vertical_fov_degrees",
-                "height",
-                "near",
-                "far",
-                "viewport",
-            ],
-            path,
-            "camera",
-        );
+        self.reject_unknown(members, allowed, path, "camera");
     }
 
     fn validate_directional_light(&mut self, value: &Value, path: &str) {
@@ -475,7 +513,13 @@ impl Validator<'_> {
             );
             return;
         };
-        if object_members(&geometry.value).is_none() {
+        let valid_reference = object_members(&geometry.value).is_some_and(|members| {
+            members.len() == 1
+                && member(members, "ref")
+                    .and_then(|entry| string_value(&entry.value))
+                    .is_some()
+        });
+        if !valid_reference {
             self.push(
                 "TSF_SCHEMA",
                 "mesh.geometry must be a reference object",
@@ -530,6 +574,18 @@ impl Validator<'_> {
         if model == "pbr" {
             self.validate_scalar(members, "metallic", path, "material");
             self.validate_scalar(members, "roughness", path, "material");
+        }
+        if model == "unlit" {
+            for field in ["metallic", "roughness"] {
+                if let Some(entry) = member(members, field) {
+                    self.push(
+                        "TSF_SCHEMA",
+                        format!("material.{field} is only supported for pbr"),
+                        json_pointer_join(path, field),
+                        entry.value.span,
+                    );
+                }
+            }
         }
         self.reject_unknown(
             members,
@@ -656,12 +712,27 @@ impl Validator<'_> {
                 return;
             };
             for field in ["width", "height"] {
-                self.validate_scalar(
-                    fields,
-                    field,
-                    &json_pointer_join(path, "viewport"),
-                    "camera.viewport",
-                );
+                let field_path = json_pointer_join(&json_pointer_join(path, "viewport"), field);
+                let Some(entry) = member(fields, field) else {
+                    self.push(
+                        "TSF_MISSING_KEY",
+                        format!("camera.viewport missing '{field}'"),
+                        json_pointer_join(path, "viewport"),
+                        viewport.value.span,
+                    );
+                    continue;
+                };
+                if !matches!(&entry.value.kind, ValueKind::Number(number)
+                    if number.value.is_finite() && number.value.fract() == 0.0
+                        && (1.0..=u32::MAX as f64).contains(&number.value))
+                {
+                    self.push(
+                        "TSF_SCHEMA",
+                        "camera viewport dimension must be a positive u32 integer",
+                        field_path,
+                        entry.value.span,
+                    );
+                }
             }
             self.reject_unknown(
                 fields,
@@ -725,13 +796,13 @@ impl Validator<'_> {
             );
             return;
         };
-        for value in values {
-            if !matches!(&value.kind, ValueKind::Number(number) if number.value.is_finite() && number.value.fract() == 0.0 && number.value >= 0.0)
+        for (index, value) in values.iter().enumerate() {
+            if !matches!(&value.kind, ValueKind::Number(number) if number.value.is_finite() && number.value.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&number.value))
             {
                 self.push(
                     "TSF_SCHEMA",
                     "mesh.submeshes must contain non-negative integers",
-                    path,
+                    format!("{path}/{index}"),
                     value.span,
                 );
             }

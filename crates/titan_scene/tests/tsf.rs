@@ -3,9 +3,178 @@ use titan_core::{
     Camera, Component, DirectionalLight, Material, Mesh, Transform, Velocity,
     phase1_component_registry, phase2_component_registry,
 };
-use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
+use titan_scene::{
+    Diagnostic, DiagnosticSpan, TsfComponentBinding, TsfComponentRegistry,
+    TsfComponentRegistryError, validate_with_registry,
+};
+use titan_scene::{
+    Number, ValueKind, edit, fmt, load_world, load_world_with_runtime_registry, parse, query,
+    validate,
+};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
+
+fn phase2_source(component: &str) -> String {
+    format!(
+        "{{ tsf: 1, scene: {{ id: \"scene:test\" }}, assets: {{ cube: {{ path: \"cube.mesh\", kind: \"geometry\" }} }}, entities: [{{ id: \"entity:test\", components: {{ {component} }} }}] }}"
+    )
+}
+
+fn assert_schema(component: &str, path: &str) {
+    let document = parse(Some("schema.tsf"), &phase2_source(component)).expect("parse");
+    let error = validate(&document).expect_err("schema must be rejected");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|d| d.code == "TSF_SCHEMA" && d.path == path),
+        "diagnostics: {:?}",
+        error.errors
+    );
+}
+
+#[test]
+fn registry_builders_and_binding_accessors_are_complete() {
+    let phase1 = titan_scene::phase1_component_registry().unwrap();
+    assert_eq!(
+        phase1.registered_name("transform"),
+        Some("titan.core.Transform")
+    );
+    assert!(phase1.binding("camera").is_none());
+    assert!(
+        titan_scene::phase2_component_registry()
+            .unwrap()
+            .binding("material")
+            .is_some()
+    );
+}
+
+#[test]
+fn registry_rejects_duplicates_schema_mismatch_and_missing_types() {
+    let core = phase2_component_registry().unwrap();
+    let binding = TsfComponentBinding {
+        alias: "x",
+        registered_name: "titan.core.Transform",
+        schema_version: 2,
+        validate: |_v, _p, _d| {},
+    };
+    assert!(matches!(
+        TsfComponentRegistry::new(core.clone(), [binding, binding]),
+        Err(TsfComponentRegistryError::DuplicateAlias("x"))
+    ));
+    let duplicate_name = [
+        binding,
+        TsfComponentBinding {
+            alias: "y",
+            ..binding
+        },
+    ];
+    assert!(matches!(
+        TsfComponentRegistry::new(core.clone(), duplicate_name),
+        Err(TsfComponentRegistryError::DuplicateRegisteredName(
+            "titan.core.Transform"
+        ))
+    ));
+    let mismatch = TsfComponentBinding {
+        schema_version: 1,
+        ..binding
+    };
+    assert!(matches!(
+        TsfComponentRegistry::new(core, [mismatch]),
+        Err(TsfComponentRegistryError::SchemaVersionMismatch { .. })
+    ));
+    assert!(
+        matches!(TsfComponentRegistry::new(titan_core::ComponentRegistry::new(), [binding]),
+        Err(TsfComponentRegistryError::ComponentNotRegistered(name)) if name == "titan.core.Transform")
+    );
+}
+
+fn custom_validator(_: &titan_scene::Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    diagnostics.push(Diagnostic {
+        code: "CUSTOM_VALIDATOR".into(),
+        message: "custom validator was called".into(),
+        path: path.into(),
+        span: DiagnosticSpan {
+            file: None,
+            start: Default::default(),
+            end: Default::default(),
+        },
+    });
+}
+
+#[test]
+fn custom_registry_drives_validation_and_missing_runtime_type_diagnostic() {
+    let core = phase2_component_registry().unwrap();
+    let registry = TsfComponentRegistry::new(
+        core.clone(),
+        [TsfComponentBinding {
+            alias: "custom_transform",
+            registered_name: "titan.core.Camera",
+            schema_version: 1,
+            validate: custom_validator,
+        }],
+    )
+    .unwrap();
+    let source = phase2_source(
+        "custom_transform: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10 }",
+    );
+    let document = parse(Some("custom.tsf"), &source).unwrap();
+    let error = validate_with_registry(&document, &registry).unwrap_err();
+    assert_eq!(error.errors[0].code, "CUSTOM_VALIDATOR");
+    let runtime_registry = TsfComponentRegistry::new(
+        core,
+        [TsfComponentBinding {
+            alias: "custom_transform",
+            registered_name: "titan.core.Camera",
+            schema_version: 1,
+            validate: |_value, _path, _diagnostics| {},
+        }],
+    )
+    .unwrap();
+    let error = match load_world_with_runtime_registry(
+        &document,
+        &runtime_registry,
+        titan_core::phase1_component_registry().unwrap(),
+    ) {
+        Ok(_) => panic!("mapped component should be absent from runtime registry"),
+        Err(error) => error,
+    };
+    assert_eq!(error.errors[0].code, "TSF_COMPONENT_NOT_REGISTERED");
+    assert!(error.errors[0].message.contains("custom_transform"));
+    assert!(error.errors[0].message.contains("titan.core.Camera"));
+    assert_eq!(
+        error.errors[0].path,
+        "/entities/0/components/custom_transform"
+    );
+}
+
+#[test]
+fn projection_material_mesh_viewport_and_submesh_schema_rules_are_enforced() {
+    assert_schema(
+        "camera: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, height: 2 }",
+        "/entities/entity:test/components/camera/height",
+    );
+    assert_schema(
+        "camera: { projection: \"orthographic\", height: 2, near: 0.1, far: 10, vertical_fov_degrees: 60 }",
+        "/entities/entity:test/components/camera/vertical_fov_degrees",
+    );
+    assert_schema(
+        "camera: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, viewport: { width: 1.5, height: 480 } }",
+        "/entities/entity:test/components/camera/viewport/width",
+    );
+    assert_schema(
+        "mesh: { geometry: { ref: 4 } }",
+        "/entities/entity:test/components/mesh/geometry",
+    );
+    assert_schema(
+        "mesh: { geometry: { ref: \"asset:cube\" }, submeshes: [4294967296] }",
+        "/entities/entity:test/components/mesh/submeshes/0",
+    );
+    assert_schema(
+        "material: { model: \"unlit\", base_color: [1, 1, 1, 1], metallic: 0.5 }",
+        "/entities/entity:test/components/material/metallic",
+    );
+}
 
 #[test]
 fn moving_entity_round_trips_and_format_is_idempotent() {

@@ -5,10 +5,10 @@ mod validate;
 
 use serde::Serialize;
 
-pub use format::fmt;
+pub use format::{fmt, fmt_with_registry};
 pub use parse::parse;
 pub use path::{QueryResult, edit, query};
-pub use validate::validate;
+pub use validate::{validate, validate_with_registry};
 
 pub(crate) const QUATERNION_TOLERANCE: f32 = 1e-5;
 

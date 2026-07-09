@@ -59,7 +59,23 @@ impl std::error::Error for TsfComponentRegistryError {}
 #[derive(Clone)]
 pub struct TsfComponentRegistry {
     component_registry: ComponentRegistry,
-    pub by_alias: BTreeMap<&'static str, TsfComponentBinding>,
+    by_alias: BTreeMap<&'static str, TsfComponentBinding>,
+}
+
+pub trait IntoTsfComponentRegistry {
+    fn into_tsf_component_registry(self) -> TsfComponentRegistry;
+}
+
+impl IntoTsfComponentRegistry for TsfComponentRegistry {
+    fn into_tsf_component_registry(self) -> TsfComponentRegistry {
+        self
+    }
+}
+
+impl IntoTsfComponentRegistry for ComponentRegistry {
+    fn into_tsf_component_registry(self) -> TsfComponentRegistry {
+        registry_for_core(self)
+    }
 }
 
 impl TsfComponentRegistry {
@@ -78,9 +94,14 @@ impl TsfComponentRegistry {
                     binding.registered_name,
                 ));
             }
-            if let Ok(meta) = component_registry.meta_by_name(binding.registered_name)
-                && meta.schema_version() != binding.schema_version
-            {
+            let meta = component_registry
+                .meta_by_name(binding.registered_name)
+                .map_err(|_| {
+                    TsfComponentRegistryError::ComponentNotRegistered(
+                        binding.registered_name.to_owned(),
+                    )
+                })?;
+            if meta.schema_version() != binding.schema_version {
                 return Err(TsfComponentRegistryError::SchemaVersionMismatch {
                     name: binding.registered_name,
                     expected: binding.schema_version,
@@ -99,6 +120,9 @@ impl TsfComponentRegistry {
     }
     pub fn binding(&self, alias: &str) -> Option<&TsfComponentBinding> {
         self.by_alias.get(alias)
+    }
+    pub fn registered_name(&self, alias: &str) -> Option<&'static str> {
+        self.binding(alias).map(|binding| binding.registered_name)
     }
     pub fn bindings(&self) -> impl Iterator<Item = &TsfComponentBinding> {
         self.by_alias.values()
@@ -178,7 +202,20 @@ pub fn phase2_component_registry() -> Result<TsfComponentRegistry, TsfComponentR
 }
 
 pub(crate) fn registry_for_core(registry: ComponentRegistry) -> TsfComponentRegistry {
-    TsfComponentRegistry::new(registry, PHASE2_BINDINGS).unwrap_or_else(|error| {
+    let bindings = if PHASE2_BINDINGS
+        .iter()
+        .all(|binding| registry.meta_by_name(binding.registered_name).is_ok())
+    {
+        PHASE2_BINDINGS.to_vec()
+    } else if PHASE1_BINDINGS
+        .iter()
+        .all(|binding| registry.meta_by_name(binding.registered_name).is_ok())
+    {
+        PHASE1_BINDINGS.to_vec()
+    } else {
+        panic!("core component registry is not a supported Titan scene registry")
+    };
+    TsfComponentRegistry::new(registry, bindings).unwrap_or_else(|error| {
         panic!("built-in component registry must match TSF bindings: {error}")
     })
 }

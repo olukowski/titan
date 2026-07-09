@@ -2,18 +2,52 @@ use std::collections::BTreeMap;
 
 use titan_core::{ComponentRegistry, EntityId, World};
 
-use crate::registry::registry_for_core;
+use crate::registry::{IntoTsfComponentRegistry, TsfComponentRegistry};
 use crate::tsf::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind,
-    fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate,
+    fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate_with_registry,
 };
 
 /// Loads a validated TSF document into a deterministic Titan world.
-pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult<World> {
-    validate(document)?;
+pub fn load_world<R: IntoTsfComponentRegistry>(
+    document: &Document,
+    registry: R,
+) -> TsfResult<World> {
+    let tsf_registry = registry.into_tsf_component_registry();
+    load_world_with_registry(document, &tsf_registry)
+}
 
-    let tsf_registry = registry_for_core(registry);
-    let mut world = World::new(tsf_registry.component_registry().clone());
+pub fn load_world_with_registry(
+    document: &Document,
+    tsf_registry: &TsfComponentRegistry,
+) -> TsfResult<World> {
+    validate_with_registry(document, tsf_registry)?;
+    load_document(
+        document,
+        tsf_registry,
+        tsf_registry.component_registry().clone(),
+    )
+}
+
+/// Loads with a TSF mapping but an independently supplied runtime registry.
+/// This preserves the distinction between an unknown alias and a mapped type
+/// that is unavailable in the current world runtime.
+pub fn load_world_with_runtime_registry(
+    document: &Document,
+    tsf_registry: &TsfComponentRegistry,
+    component_registry: ComponentRegistry,
+) -> TsfResult<World> {
+    validate_with_registry(document, tsf_registry)?;
+    load_document(document, tsf_registry, component_registry)
+}
+
+fn load_document(
+    document: &Document,
+    tsf_registry: &TsfComponentRegistry,
+    component_registry: ComponentRegistry,
+) -> TsfResult<World> {
+    let runtime_registry = component_registry.clone();
+    let mut world = World::new(component_registry);
     let entities = required_array(document, &document.root, "entities", "/entities")?;
     let entity_ids = scene_entity_ids(document, entities)?;
 
@@ -72,7 +106,8 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
                 entity_id,
                 &components.value,
                 &format!("{path}/components"),
-                &tsf_registry,
+                tsf_registry,
+                &runtime_registry,
             )?;
         }
     }
@@ -113,6 +148,7 @@ fn load_components(
     value: &Value,
     path: &str,
     tsf_registry: &crate::registry::TsfComponentRegistry,
+    runtime_registry: &ComponentRegistry,
 ) -> TsfResult<()> {
     let members = object_members(value).ok_or_else(|| {
         one(
@@ -135,8 +171,7 @@ fn load_components(
                 component.key_span,
             ));
         };
-        if tsf_registry
-            .component_registry()
+        if runtime_registry
             .meta_by_name(binding.registered_name)
             .is_err()
         {

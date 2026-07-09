@@ -1,12 +1,17 @@
 use super::{
     Document, Member, Number, Value, ValueKind, fits_f32_without_underflow, normalized_quaternion,
 };
+use crate::registry::TsfComponentRegistry;
 
 pub fn fmt(document: &Document) -> String {
     let mut out = String::new();
     write_value(&mut out, &document.root, 0, Context::Top);
     out.push('\n');
     out
+}
+
+pub fn fmt_with_registry(document: &Document, _registry: &TsfComponentRegistry) -> String {
+    fmt(document)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
