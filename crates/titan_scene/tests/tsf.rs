@@ -39,6 +39,23 @@ fn edit_scalar_changes_one_line() {
 }
 
 #[test]
+fn edit_reports_semantic_replacement_errors_at_replacement() {
+    let document = parse(Some("moving_entity.tsf"), MOVING_ENTITY).expect("parse fixture");
+    let error = edit(
+        &document,
+        "/entities/entity:mover/components/velocity/linear/0",
+        "\"bad\"",
+    )
+    .expect_err("invalid replacement should fail validation");
+
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_SCHEMA"
+            && diagnostic.path == "/entities/entity:mover/components/velocity/linear/0"
+            && diagnostic.span.file.as_deref() == Some("<replacement>")
+    }));
+}
+
+#[test]
 fn duplicate_key_fails_before_validation() {
     let error = parse(None, "{ tsf: 1, tsf: 2 }").expect_err("duplicate key should fail");
     assert_eq!(error.errors[0].code, "TSF_DUPLICATE_KEY");

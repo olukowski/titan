@@ -29,8 +29,31 @@ pub fn edit(document: &Document, path: &str, new_json5_value: &str) -> TsfResult
     let segments = split_pointer(&resolved_pointer)?;
     let target = resolve_mut(&mut edited.root, &segments, "")?;
     *target = replacement;
-    validate(&edited)?;
+    validate(&edited)
+        .map_err(|error| replacement_validation_error(error, path, &resolved_pointer))?;
     Ok(fmt(&edited))
+}
+
+fn replacement_validation_error(
+    mut error: TsfError,
+    path: &str,
+    resolved_pointer: &str,
+) -> TsfError {
+    for diagnostic in &mut error.errors {
+        if path_is_at_or_below(&diagnostic.path, path)
+            || path_is_at_or_below(&diagnostic.path, resolved_pointer)
+        {
+            diagnostic.span.file = Some("<replacement>".to_owned());
+        }
+    }
+    error
+}
+
+fn path_is_at_or_below(path: &str, parent: &str) -> bool {
+    if parent.is_empty() {
+        return true;
+    }
+    path == parent || path.starts_with(&format!("{parent}/"))
 }
 
 fn resolve<'a>(document: &'a Document, path: &str) -> TsfResult<(&'a Value, String)> {

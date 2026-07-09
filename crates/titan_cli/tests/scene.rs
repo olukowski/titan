@@ -229,6 +229,33 @@ fn edit_replacement_parse_errors_use_replacement_location() {
 }
 
 #[test]
+fn edit_replacement_validation_errors_use_replacement_location() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = write_scene(&dir, "moving.tsf", MOVING_ENTITY);
+    let path_str = path_string(&path);
+
+    let json = stderr_json(
+        titan()
+            .args([
+                "--json",
+                "scene",
+                "edit",
+                path_str.as_str(),
+                "/entities/entity:mover/components/velocity/linear/0",
+                "\"bad\"",
+            ])
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(""),
+    );
+
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["errors"][0]["code"], "TSF_SCHEMA");
+    assert_eq!(json["errors"][0]["span"]["file"], "<replacement>");
+}
+
+#[test]
 fn edit_accepts_negative_replacement_value() {
     let dir = TempDir::new().expect("tempdir");
     let path = write_scene(&dir, "negative.tsf", MOVING_ENTITY);
