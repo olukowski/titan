@@ -1,12 +1,18 @@
 //! Scene graph types for Titan's text-first authoring pipeline.
 
 pub mod load;
+pub mod registry;
 pub mod tsf;
 
-pub use load::load_world;
+pub use load::{load_world, load_world_with_registry, load_world_with_runtime_registry};
+pub use registry::{
+    IntoTsfComponentRegistry, TsfComponentBinding, TsfComponentRegistry, TsfComponentRegistryError,
+    phase1_component_registry, phase2_component_registry,
+};
 pub use tsf::{
     Diagnostic, DiagnosticSpan, Document, Member, Number, Position, QueryResult, Span, TsfError,
-    TsfResult, Value, ValueKind, edit, fmt, parse, query, validate,
+    TsfResult, Value, ValueKind, edit, fmt, fmt_with_registry, parse, query, validate,
+    validate_with_registry,
 };
 
 use titan_core::{EntityId, Transform};

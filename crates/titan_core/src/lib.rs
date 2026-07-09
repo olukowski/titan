@@ -1048,6 +1048,108 @@ pub struct Velocity {
     pub linear: Vec3,
 }
 
+/// Projection parameters for an entity camera.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "projection", rename_all = "lowercase")]
+pub enum CameraProjection {
+    Perspective {
+        vertical_fov_degrees: f32,
+        near: f32,
+        far: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewport: Option<Viewport>,
+    },
+    Orthographic {
+        height: f32,
+        near: f32,
+        far: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewport: Option<Viewport>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Camera {
+    #[serde(flatten)]
+    pub projection: CameraProjection,
+}
+
+impl Component for Camera {
+    const NAME: &'static str = "titan.core.Camera";
+    const SCHEMA_VERSION: u32 = 1;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectionalLight {
+    pub color: [f32; 3],
+    pub illuminance: f32,
+    pub ambient: f32,
+}
+
+impl Component for DirectionalLight {
+    const NAME: &'static str = "titan.core.DirectionalLight";
+    const SCHEMA_VERSION: u32 = 1;
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetReference {
+    #[serde(rename = "ref")]
+    pub ref_: String,
+}
+
+impl AssetReference {
+    pub fn new(reference: impl Into<String>) -> Self {
+        Self {
+            ref_: reference.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mesh {
+    pub geometry: AssetReference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submeshes: Option<Vec<u32>>,
+}
+
+impl Component for Mesh {
+    const NAME: &'static str = "titan.core.Mesh";
+    const SCHEMA_VERSION: u32 = 1;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaterialModel {
+    Unlit,
+    Pbr,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Material {
+    pub model: MaterialModel,
+    pub base_color: [f32; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metallic: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<f32>,
+}
+
+impl Component for Material {
+    const NAME: &'static str = "titan.core.Material";
+    const SCHEMA_VERSION: u32 = 1;
+}
+
 impl Velocity {
     pub const fn new(linear: Vec3) -> Self {
         Self { linear }
@@ -1064,6 +1166,16 @@ pub fn phase1_component_registry() -> Result<ComponentRegistry> {
     let mut registry = ComponentRegistry::new();
     registry.register::<Transform>()?;
     registry.register::<Velocity>()?;
+    Ok(registry)
+}
+
+/// Creates the built-in Phase 2 component registry.
+pub fn phase2_component_registry() -> Result<ComponentRegistry> {
+    let mut registry = phase1_component_registry()?;
+    registry.register::<Camera>()?;
+    registry.register::<DirectionalLight>()?;
+    registry.register::<Mesh>()?;
+    registry.register::<Material>()?;
     Ok(registry)
 }
 

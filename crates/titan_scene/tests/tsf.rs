@@ -1,8 +1,256 @@
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use titan_core::{Component, Transform, phase1_component_registry};
-use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
+use titan_core::{
+    Camera, CameraProjection, Component, DirectionalLight, EventKind, Material, Mesh, Transform,
+    Velocity, phase1_component_registry, phase2_component_registry,
+};
+use titan_scene::{
+    Diagnostic, DiagnosticSpan, TsfComponentBinding, TsfComponentRegistry,
+    TsfComponentRegistryError, validate_with_registry,
+};
+use titan_scene::{
+    Number, ValueKind, edit, fmt, fmt_with_registry, load_world, load_world_with_runtime_registry,
+    parse, query, validate,
+};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
+
+fn phase2_source(component: &str) -> String {
+    format!(
+        "{{ tsf: 1, scene: {{ id: \"scene:test\" }}, assets: {{ cube: {{ path: \"cube.mesh\", kind: \"geometry\" }} }}, entities: [{{ id: \"entity:test\", components: {{ {component} }} }}] }}"
+    )
+}
+
+fn assert_schema(component: &str, path: &str) {
+    let document = parse(Some("schema.tsf"), &phase2_source(component)).expect("parse");
+    let error = validate(&document).expect_err("schema must be rejected");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|d| d.code == "TSF_SCHEMA" && d.path == path),
+        "diagnostics: {:?}",
+        error.errors
+    );
+}
+
+#[test]
+fn registry_builders_and_binding_accessors_are_complete() {
+    let phase1 = titan_scene::phase1_component_registry().unwrap();
+    assert_eq!(
+        phase1.registered_name("transform"),
+        Some("titan.core.Transform")
+    );
+    assert!(phase1.binding("camera").is_none());
+    assert!(
+        titan_scene::phase2_component_registry()
+            .unwrap()
+            .binding("material")
+            .is_some()
+    );
+}
+
+#[test]
+fn load_world_rejects_unsupported_core_registry_without_panicking() {
+    let document = parse(
+        Some("unsupported-registry.tsf"),
+        &phase2_source("transform: { translation: [0, 0, 0] }"),
+    )
+    .expect("parse");
+    let error = match load_world(&document, titan_core::ComponentRegistry::new()) {
+        Ok(_) => panic!("unsupported registry should return a diagnostic"),
+        Err(error) => error,
+    };
+    assert_eq!(error.errors.len(), 1);
+    assert_eq!(error.errors[0].code, "TSF_REGISTRY");
+    assert!(error.errors[0].message.contains("not a supported"));
+}
+
+#[test]
+fn registry_rejects_duplicates_schema_mismatch_and_missing_types() {
+    let core = phase2_component_registry().unwrap();
+    let binding = TsfComponentBinding {
+        alias: "x",
+        registered_name: "titan.core.Transform",
+        schema_version: 2,
+        validate: |_v, _p, _d| {},
+    };
+    assert!(matches!(
+        TsfComponentRegistry::new(core.clone(), [binding, binding]),
+        Err(TsfComponentRegistryError::DuplicateAlias("x"))
+    ));
+    let duplicate_name = [
+        binding,
+        TsfComponentBinding {
+            alias: "y",
+            ..binding
+        },
+    ];
+    assert!(matches!(
+        TsfComponentRegistry::new(core.clone(), duplicate_name),
+        Err(TsfComponentRegistryError::DuplicateRegisteredName(
+            "titan.core.Transform"
+        ))
+    ));
+    let mismatch = TsfComponentBinding {
+        schema_version: 1,
+        ..binding
+    };
+    assert!(matches!(
+        TsfComponentRegistry::new(core, [mismatch]),
+        Err(TsfComponentRegistryError::SchemaVersionMismatch { .. })
+    ));
+    assert!(
+        matches!(TsfComponentRegistry::new(titan_core::ComponentRegistry::new(), [binding]),
+        Err(TsfComponentRegistryError::ComponentNotRegistered(name)) if name == "titan.core.Transform")
+    );
+}
+
+fn custom_validator(_: &titan_scene::Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    diagnostics.push(Diagnostic {
+        code: "CUSTOM_VALIDATOR".into(),
+        message: "custom validator was called".into(),
+        path: path.into(),
+        span: DiagnosticSpan {
+            file: None,
+            start: Default::default(),
+            end: Default::default(),
+        },
+    });
+}
+
+#[test]
+fn custom_registry_drives_validation_and_missing_runtime_type_diagnostic() {
+    let core = phase2_component_registry().unwrap();
+    let registry = TsfComponentRegistry::new(
+        core.clone(),
+        [TsfComponentBinding {
+            alias: "custom_transform",
+            registered_name: "titan.core.Camera",
+            schema_version: 1,
+            validate: custom_validator,
+        }],
+    )
+    .unwrap();
+    let source = phase2_source(
+        "custom_transform: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10 }",
+    );
+    let document = parse(Some("custom.tsf"), &source).unwrap();
+    let error = validate_with_registry(&document, &registry).unwrap_err();
+    assert_eq!(error.errors[0].code, "CUSTOM_VALIDATOR");
+    let runtime_registry = TsfComponentRegistry::new(
+        core,
+        [TsfComponentBinding {
+            alias: "custom_transform",
+            registered_name: "titan.core.Camera",
+            schema_version: 1,
+            validate: |_value, _path, _diagnostics| {},
+        }],
+    )
+    .unwrap();
+    let error = match load_world_with_runtime_registry(
+        &document,
+        &runtime_registry,
+        titan_core::phase1_component_registry().unwrap(),
+    ) {
+        Ok(_) => panic!("mapped component should be absent from runtime registry"),
+        Err(error) => error,
+    };
+    assert_eq!(error.errors[0].code, "TSF_COMPONENT_NOT_REGISTERED");
+    assert!(error.errors[0].message.contains("custom_transform"));
+    assert!(error.errors[0].message.contains("titan.core.Camera"));
+    assert_eq!(
+        error.errors[0].path,
+        "/entities/0/components/custom_transform"
+    );
+}
+
+#[test]
+fn custom_camera_alias_preserves_integer_json_values() {
+    let registry = TsfComponentRegistry::new(
+        titan_core::phase2_component_registry().unwrap(),
+        [TsfComponentBinding {
+            alias: "lens",
+            registered_name: "titan.core.Camera",
+            schema_version: 1,
+            validate: |_value, _path, _diagnostics| {},
+        }],
+    )
+    .unwrap();
+    let document = parse(
+        Some("custom-camera.tsf"),
+        &phase2_source(
+            "lens: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, viewport: { width: 640, height: 480 } }",
+        ),
+    )
+    .unwrap();
+
+    let world = load_world(&document, registry).expect("custom camera alias should load");
+    let camera = world
+        .get::<Camera>(titan_core::EntityId::from_raw(1))
+        .unwrap()
+        .expect("camera should be inserted");
+    match camera.projection {
+        CameraProjection::Perspective {
+            viewport: Some(viewport),
+            ..
+        } => {
+            assert_eq!(viewport.width, 640);
+            assert_eq!(viewport.height, 480);
+        }
+        projection => panic!("unexpected projection: {projection:?}"),
+    }
+}
+
+#[test]
+fn projection_material_mesh_viewport_and_submesh_schema_rules_are_enforced() {
+    assert_schema(
+        "camera: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, height: 2 }",
+        "/entities/entity:test/components/camera/height",
+    );
+    assert_schema(
+        "camera: { projection: \"orthographic\", height: 2, near: 0.1, far: 10, vertical_fov_degrees: 60 }",
+        "/entities/entity:test/components/camera/vertical_fov_degrees",
+    );
+    assert_schema(
+        "camera: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, viewport: { width: 1.5, height: 480 } }",
+        "/entities/entity:test/components/camera/viewport/width",
+    );
+    assert_schema(
+        "mesh: { geometry: { ref: 4 } }",
+        "/entities/entity:test/components/mesh/geometry",
+    );
+    assert_schema(
+        "mesh: { geometry: { ref: \"asset:cube\" }, submeshes: [4294967296] }",
+        "/entities/entity:test/components/mesh/submeshes/0",
+    );
+    assert_schema(
+        "material: { model: \"unlit\", base_color: [1, 1, 1, 1], metallic: 0.5 }",
+        "/entities/entity:test/components/material/metallic",
+    );
+}
+
+#[test]
+fn binding_validator_diagnostic_keeps_document_filename() {
+    let document = parse(
+        Some("binding-diagnostic.tsf"),
+        &phase2_source("transform: { translation: [1, 2] }"),
+    )
+    .expect("parse");
+    let error = validate(&document).expect_err("invalid transform should be rejected");
+
+    let diagnostic = error
+        .errors
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == "TSF_SCHEMA"
+                && diagnostic.path == "/entities/entity:test/components/transform/translation"
+        })
+        .expect("transform binding diagnostic");
+    assert_eq!(
+        diagnostic.span.file.as_deref(),
+        Some("binding-diagnostic.tsf")
+    );
+}
 
 #[test]
 fn moving_entity_round_trips_and_format_is_idempotent() {
@@ -15,6 +263,160 @@ fn moving_entity_round_trips_and_format_is_idempotent() {
     let reparsed = parse(Some("moving_entity.tsf"), &formatted).expect("parse formatted fixture");
     let reformatted = fmt(&reparsed);
     assert_eq!(reformatted, formatted);
+}
+
+#[test]
+fn phase2_components_validate_format_and_insert_as_typed_values() {
+    let source = r#"{
+  tsf: 1,
+  scene: { id: "scene:red_cube" },
+  assets: { cube_mesh: { path: "cube.mesh", kind: "geometry" } },
+  entities: [{
+    id: "entity:cube",
+    components: {
+      material: { model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] },
+      mesh: { geometry: { ref: "asset:cube_mesh" }, submeshes: [0, 3] },
+      directional_light: { color: [4.0, -2.0, 100.0], illuminance: 1.0, ambient: 0.05 },
+      camera: { projection: "perspective", vertical_fov_degrees: 60.0, near: 0.1, far: 100.0, viewport: { width: 640, height: 480 } },
+      velocity: { linear: [0.0, 0.0, 0.0] },
+      transform: { translation: [0.0, 0.0, 0.0] },
+    },
+  }],
+}
+"#;
+    let document = parse(Some("phase2.tsf"), source).expect("parse");
+    validate(&document).expect("validate");
+    let formatted = fmt(&document);
+    assert_eq!(fmt(&parse(None, &formatted).expect("reparse")), formatted);
+    let world = load_world(&document, phase2_component_registry().unwrap()).expect("load");
+    let entity = titan_core::EntityId::from_raw(1);
+    assert!(world.get::<Camera>(entity).unwrap().is_some());
+    assert!(world.get::<DirectionalLight>(entity).unwrap().is_some());
+    assert!(world.get::<Mesh>(entity).unwrap().is_some());
+    assert!(world.get::<Material>(entity).unwrap().is_some());
+    assert!(world.get::<Transform>(entity).unwrap().is_some());
+    assert!(world.get::<Velocity>(entity).unwrap().is_some());
+    assert_eq!(
+        world.get::<Mesh>(entity).unwrap().unwrap().submeshes,
+        Some(vec![0, 3])
+    );
+    assert_eq!(
+        world.get::<Camera>(entity).unwrap().unwrap().projection,
+        CameraProjection::Perspective {
+            vertical_fov_degrees: 60.0,
+            near: 0.1,
+            far: 100.0,
+            viewport: Some(titan_core::Viewport {
+                width: 640,
+                height: 480
+            }),
+        }
+    );
+}
+
+#[test]
+fn directional_light_unknown_field_has_one_diagnostic_and_hdr_color_is_allowed() {
+    let source = phase2_source(
+        "directional_light: { color: [4.0, -2.0, 100.0], illuminance: 1.0, ambient: 0.05, stray: true }",
+    );
+    let document = parse(Some("directional-light.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("unknown field should fail");
+    let diagnostics: Vec<_> = error
+        .errors
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.path == "/entities/entity:test/components/directional_light/stray"
+        })
+        .collect();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "TSF_UNKNOWN_COMPONENT_FIELD");
+
+    let valid = parse(
+        Some("hdr-directional-light.tsf"),
+        &phase2_source(
+            "directional_light: { color: [4.0, -2.0, 100.0], illuminance: 1.0, ambient: 0.05 }",
+        ),
+    )
+    .expect("parse");
+    validate(&valid).expect("HDR light color should be allowed");
+}
+
+#[test]
+fn formatter_uses_supplied_registry_component_order() {
+    let core = titan_core::phase2_component_registry().unwrap();
+    let registry = TsfComponentRegistry::new(
+        core,
+        [
+            titan_scene::TsfComponentBinding {
+                alias: "mesh",
+                registered_name: "titan.core.Mesh",
+                schema_version: 1,
+                validate: |_value, _path, _diagnostics| {},
+            },
+            titan_scene::TsfComponentBinding {
+                alias: "transform",
+                registered_name: "titan.core.Transform",
+                schema_version: 2,
+                validate: |_value, _path, _diagnostics| {},
+            },
+        ],
+    )
+    .unwrap();
+    let document = parse(
+        None,
+        "{ tsf: 1, scene: { id: \"scene:test\" }, assets: { cube: { path: \"cube.mesh\", kind: \"geometry\" } }, entities: [{ id: \"entity:test\", components: { transform: { translation: [0, 0, 0] }, mesh: { geometry: { ref: \"asset:cube\" } } } }] }",
+    )
+    .unwrap();
+    let formatted = fmt_with_registry(&document, &registry);
+    assert!(formatted.find("mesh:").unwrap() < formatted.find("transform:").unwrap());
+    let world = load_world(&document, registry).expect("custom registry should load");
+    let inserted: Vec<_> = world
+        .event_log()
+        .records()
+        .iter()
+        .filter_map(|record| match &record.kind {
+            EventKind::ComponentInserted { component, .. } => Some(component.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inserted, ["titan.core.Mesh", "titan.core.Transform"]);
+}
+
+#[test]
+fn formatter_uses_registered_component_identity_for_custom_aliases() {
+    let registry = TsfComponentRegistry::new(
+        titan_core::phase2_component_registry().unwrap(),
+        [
+            titan_scene::TsfComponentBinding {
+                alias: "lens",
+                registered_name: "titan.core.Camera",
+                schema_version: 1,
+                validate: |_value, _path, _diagnostics| {},
+            },
+            titan_scene::TsfComponentBinding {
+                alias: "pose",
+                registered_name: "titan.core.Transform",
+                schema_version: 2,
+                validate: |_value, _path, _diagnostics| {},
+            },
+        ],
+    )
+    .unwrap();
+    let document = parse(
+        None,
+        "{ tsf: 1, scene: { id: \"scene:test\" }, assets: {}, entities: [{ id: \"entity:test\", components: { lens: { viewport: { height: 480, width: 640 }, far: 10, near: 0.1, vertical_fov_degrees: 60, projection: \"perspective\" }, pose: { rotation: [0, 0, 0, 1], translation: [0, 0, 0] } } }] }",
+    )
+    .unwrap();
+
+    let formatted = fmt_with_registry(&document, &registry);
+    let lens = formatted.find("lens:").unwrap();
+    assert!(
+        formatted[lens..].find("projection:").unwrap()
+            < formatted[lens..].find("viewport:").unwrap()
+    );
+    let pose = formatted.find("pose:").unwrap();
+    assert!(formatted[pose..].find("translation:").is_some());
+    assert!(!formatted.contains("rotation:"));
 }
 
 #[test]
@@ -282,7 +684,7 @@ fn invalid_entity_parent_is_diagnostic() {
 
 #[test]
 fn unsupported_runtime_components_are_diagnostic() {
-    for component in ["mesh", "camera", "light"] {
+    for component in ["light", "unknown"] {
         let source = MOVING_ENTITY.replace(
             "        velocity: {",
             &format!("        {component}: {{}},\n        velocity: {{"),
@@ -599,6 +1001,57 @@ fn formatter_preserves_nonzero_exponent_numbers() {
     let formatted = fmt(&document);
 
     assert!(formatted.contains("value: 1e-100"));
+}
+
+#[test]
+fn json_conversion_uses_mathematical_integrality() {
+    let document = parse(
+        None,
+        "{ decimal: 1e-1, exponent_integer: 1e2, trailing_fraction: 100.0 }",
+    )
+    .expect("parse numbers");
+
+    assert_eq!(
+        query(&document, "/decimal").unwrap().value,
+        serde_json::json!(0.1)
+    );
+    assert_eq!(
+        query(&document, "/exponent_integer").unwrap().value,
+        serde_json::json!(100)
+    );
+    assert_eq!(
+        query(&document, "/trailing_fraction").unwrap().value,
+        serde_json::json!(100)
+    );
+}
+
+#[test]
+fn exponent_and_trailing_fraction_spellings_load_typed_camera_and_mesh_values() {
+    let document = parse(
+        None,
+        &phase2_source(
+            "camera: { projection: \"perspective\", vertical_fov_degrees: 6e1, near: 1e-1, far: 1e2, viewport: { width: 6.4e2, height: 4.8e2 } }, mesh: { geometry: { ref: \"asset:cube\" }, submeshes: [0e0, 3.0] }",
+        ),
+    )
+    .unwrap();
+    let world = load_world(&document, phase2_component_registry().unwrap()).expect("load");
+    let entity = titan_core::EntityId::from_raw(1);
+    assert_eq!(
+        world.get::<Camera>(entity).unwrap().unwrap().projection,
+        CameraProjection::Perspective {
+            vertical_fov_degrees: 60.0,
+            near: 0.1,
+            far: 100.0,
+            viewport: Some(titan_core::Viewport {
+                width: 640,
+                height: 480,
+            }),
+        }
+    );
+    assert_eq!(
+        world.get::<Mesh>(entity).unwrap().unwrap().submeshes,
+        Some(vec![0, 3])
+    );
 }
 
 #[test]

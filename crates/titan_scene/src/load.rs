@@ -1,17 +1,61 @@
 use std::collections::BTreeMap;
 
-use titan_core::{Component, ComponentRegistry, EntityId, Transform, Velocity, World};
+use titan_core::{ComponentRegistry, EntityId, World};
 
+use crate::registry::{IntoTsfComponentRegistry, TsfComponentRegistry};
 use crate::tsf::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind,
-    fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate,
+    fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate_with_registry,
 };
 
 /// Loads a validated TSF document into a deterministic Titan world.
-pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult<World> {
-    validate(document)?;
+pub fn load_world<R: IntoTsfComponentRegistry>(
+    document: &Document,
+    registry: R,
+) -> TsfResult<World> {
+    let tsf_registry = registry.into_tsf_component_registry().map_err(|error| {
+        TsfError::one(
+            document.file.as_deref(),
+            "TSF_REGISTRY",
+            error.to_string(),
+            "",
+            Span::default(),
+        )
+    })?;
+    load_world_with_registry(document, &tsf_registry)
+}
 
-    let mut world = World::new(registry);
+pub fn load_world_with_registry(
+    document: &Document,
+    tsf_registry: &TsfComponentRegistry,
+) -> TsfResult<World> {
+    validate_with_registry(document, tsf_registry)?;
+    load_document(
+        document,
+        tsf_registry,
+        tsf_registry.component_registry().clone(),
+    )
+}
+
+/// Loads with a TSF mapping but an independently supplied runtime registry.
+/// This preserves the distinction between an unknown alias and a mapped type
+/// that is unavailable in the current world runtime.
+pub fn load_world_with_runtime_registry(
+    document: &Document,
+    tsf_registry: &TsfComponentRegistry,
+    component_registry: ComponentRegistry,
+) -> TsfResult<World> {
+    validate_with_registry(document, tsf_registry)?;
+    load_document(document, tsf_registry, component_registry)
+}
+
+fn load_document(
+    document: &Document,
+    tsf_registry: &TsfComponentRegistry,
+    component_registry: ComponentRegistry,
+) -> TsfResult<World> {
+    let runtime_registry = component_registry.clone();
+    let mut world = World::new(component_registry);
     let entities = required_array(document, &document.root, "entities", "/entities")?;
     let entity_ids = scene_entity_ids(document, entities)?;
 
@@ -70,6 +114,8 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
                 entity_id,
                 &components.value,
                 &format!("{path}/components"),
+                tsf_registry,
+                &runtime_registry,
             )?;
         }
     }
@@ -109,6 +155,8 @@ fn load_components(
     entity_id: EntityId,
     value: &Value,
     path: &str,
+    tsf_registry: &crate::registry::TsfComponentRegistry,
+    runtime_registry: &ComponentRegistry,
 ) -> TsfResult<()> {
     let members = object_members(value).ok_or_else(|| {
         one(
@@ -122,35 +170,61 @@ fn load_components(
     let mut loaded = Vec::new();
     for component in members {
         let component_path = json_pointer_join(path, &component.key);
-        let (registered_name, payload) = match component.key.as_str() {
-            "transform" => (
-                Transform::NAME,
-                transform_payload(document, &component.value, &component_path)?,
-            ),
-            "velocity" => (
-                Velocity::NAME,
-                velocity_payload(document, &component.value, &component_path)?,
-            ),
-            _ => {
-                return Err(one(
-                    document,
-                    "TSF_UNKNOWN_COMPONENT",
-                    format!("unknown component '{}'", component.key),
-                    component_path,
-                    component.key_span,
-                ));
+        let Some(binding) = tsf_registry.binding(&component.key) else {
+            return Err(one(
+                document,
+                "TSF_UNKNOWN_COMPONENT",
+                format!("unknown component '{}'", component.key),
+                component_path,
+                component.key_span,
+            ));
+        };
+        if runtime_registry
+            .meta_by_name(binding.registered_name)
+            .is_err()
+        {
+            return Err(one(
+                document,
+                "TSF_COMPONENT_NOT_REGISTERED",
+                format!(
+                    "component alias '{}' maps to unregistered type '{}'",
+                    component.key, binding.registered_name
+                ),
+                component_path,
+                component.key_span,
+            ));
+        }
+        let payload = match binding.registered_name {
+            "titan.core.Transform" => {
+                transform_payload(document, &component.value, &component_path)?
             }
+            "titan.core.Velocity" => velocity_payload(document, &component.value, &component_path)?,
+            _ => component.value.to_json(),
         };
         loaded.push((
-            registered_name,
+            component.key.clone(),
+            binding.registered_name,
             payload,
             component_path,
             component.value.span,
         ));
     }
 
-    loaded.sort_by_key(|(registered_name, _, _, _)| *registered_name);
-    for (registered_name, payload, component_path, value_span) in loaded {
+    loaded.sort_by(|left, right| {
+        let left_rank = tsf_registry
+            .component_order()
+            .iter()
+            .position(|alias| *alias == left.0);
+        let right_rank = tsf_registry
+            .component_order()
+            .iter()
+            .position(|alias| *alias == right.0);
+        left_rank
+            .unwrap_or(usize::MAX)
+            .cmp(&right_rank.unwrap_or(usize::MAX))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (_, registered_name, payload, component_path, value_span) in loaded {
         world
             .insert_serialized(entity_id, registered_name, payload)
             .map_err(|error| {

@@ -1,16 +1,23 @@
 use super::{
     Document, Member, Number, Value, ValueKind, fits_f32_without_underflow, normalized_quaternion,
 };
+use crate::registry::TsfComponentRegistry;
 
 pub fn fmt(document: &Document) -> String {
+    let registry = crate::registry::phase2_component_registry()
+        .expect("built-in TSF registry must be constructible");
+    fmt_with_registry(document, &registry)
+}
+
+pub fn fmt_with_registry(document: &Document, registry: &TsfComponentRegistry) -> String {
     let mut out = String::new();
-    write_value(&mut out, &document.root, 0, Context::Top);
+    write_value(&mut out, &document.root, 0, Context::Top, registry);
     out.push('\n');
     out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Context<'a> {
+enum Context {
     Top,
     Scene,
     Assets,
@@ -18,23 +25,35 @@ enum Context<'a> {
     Entities,
     Entity,
     Components,
-    Component(&'a str),
+    Component(&'static str),
     Other,
 }
 
-fn write_value(out: &mut String, value: &Value, indent: usize, context: Context<'_>) {
+fn write_value(
+    out: &mut String,
+    value: &Value,
+    indent: usize,
+    context: Context,
+    registry: &TsfComponentRegistry,
+) {
     write_comments(out, &value.comments, indent);
     match &value.kind {
         ValueKind::Null => out.push_str("null"),
         ValueKind::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
         ValueKind::Number(number) => out.push_str(&format_number(number)),
         ValueKind::String(value) => write_string(out, value),
-        ValueKind::Array(values) => write_array(out, values, indent, context),
-        ValueKind::Object(members) => write_object(out, members, indent, context),
+        ValueKind::Array(values) => write_array(out, values, indent, context, registry),
+        ValueKind::Object(members) => write_object(out, members, indent, context, registry),
     }
 }
 
-fn write_array(out: &mut String, values: &[Value], indent: usize, context: Context<'_>) {
+fn write_array(
+    out: &mut String,
+    values: &[Value],
+    indent: usize,
+    context: Context,
+    registry: &TsfComponentRegistry,
+) {
     if values.is_empty() {
         out.push_str("[]");
         return;
@@ -45,7 +64,7 @@ fn write_array(out: &mut String, values: &[Value], indent: usize, context: Conte
             if index > 0 {
                 out.push_str(", ");
             }
-            write_value(out, value, indent, Context::Other);
+            write_value(out, value, indent, Context::Other, registry);
         }
         out.push(']');
         return;
@@ -58,32 +77,39 @@ fn write_array(out: &mut String, values: &[Value], indent: usize, context: Conte
     };
     for value in values {
         push_indent(out, indent + 2);
-        write_value(out, value, indent + 2, child_context);
+        write_value(out, value, indent + 2, child_context, registry);
         out.push_str(",\n");
     }
     push_indent(out, indent);
     out.push(']');
 }
 
-fn write_object(out: &mut String, members: &[Member], indent: usize, context: Context<'_>) {
+fn write_object(
+    out: &mut String,
+    members: &[Member],
+    indent: usize,
+    context: Context,
+    registry: &TsfComponentRegistry,
+) {
     if members.is_empty() {
         out.push_str("{}");
         return;
     }
     out.push_str("{\n");
-    for member in ordered_members(members, context) {
+    for member in ordered_members(members, context, registry) {
         write_comments(out, &member.comments, indent + 2);
         push_indent(out, indent + 2);
         write_key(out, &member.key);
         out.push_str(": ");
-        if context == Context::Component("transform") && member.key == "rotation" {
-            write_value(out, &member.value, indent + 2, Context::Other);
+        if context == Context::Component("titan.core.Transform") && member.key == "rotation" {
+            write_value(out, &member.value, indent + 2, Context::Other, registry);
         } else {
             write_value(
                 out,
                 &member.value,
                 indent + 2,
-                child_context(context, &member.key),
+                child_context(context, &member.key, registry),
+                registry,
             );
         }
         out.push_str(",\n");
@@ -92,7 +118,7 @@ fn write_object(out: &mut String, members: &[Member], indent: usize, context: Co
     out.push('}');
 }
 
-fn child_context<'a>(context: Context<'a>, key: &'a str) -> Context<'a> {
+fn child_context(context: Context, key: &str, registry: &TsfComponentRegistry) -> Context {
     match context {
         Context::Top => match key {
             "scene" => Context::Scene,
@@ -102,23 +128,29 @@ fn child_context<'a>(context: Context<'a>, key: &'a str) -> Context<'a> {
         },
         Context::Assets => Context::Asset,
         Context::Entity if key == "components" => Context::Components,
-        Context::Components => Context::Component(key),
+        Context::Components => registry.binding(key).map_or(Context::Other, |binding| {
+            Context::Component(binding.registered_name)
+        }),
         _ => Context::Other,
     }
 }
 
-fn ordered_members<'a>(members: &'a [Member], context: Context<'_>) -> Vec<&'a Member> {
+fn ordered_members<'a>(
+    members: &'a [Member],
+    context: Context,
+    registry: &TsfComponentRegistry,
+) -> Vec<&'a Member> {
     let mut ordered: Vec<_> = members
         .iter()
         .filter(|member| {
-            !(context == Context::Component("transform")
+            !(context == Context::Component("titan.core.Transform")
                 && member.key == "rotation"
                 && rotation_is_identity(&member.value))
         })
         .collect();
     ordered.sort_by(|a, b| {
-        let ar = rank(context, &a.key);
-        let br = rank(context, &b.key);
+        let ar = rank(context, &a.key, registry);
+        let br = rank(context, &b.key, registry);
         ar.cmp(&br).then_with(|| a.key.cmp(&b.key))
     });
     ordered
@@ -154,7 +186,7 @@ fn normalized_rotation(value: &Value) -> Option<[f32; 4]> {
     normalized_quaternion(rotation)
 }
 
-fn rank(context: Context<'_>, key: &str) -> usize {
+fn rank(context: Context, key: &str, registry: &TsfComponentRegistry) -> usize {
     match context {
         Context::Top => ["tsf", "scene", "assets", "entities"]
             .iter()
@@ -168,18 +200,44 @@ fn rank(context: Context<'_>, key: &str) -> usize {
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Components => ["transform", "velocity"]
+        Context::Components => registry
+            .component_order()
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("transform") => ["translation", "rotation"]
+        Context::Component("titan.core.Transform") => ["translation", "rotation"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("velocity") => ["linear"]
+        Context::Component("titan.core.Velocity") => ["linear"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
+        Context::Component("titan.core.Camera") => [
+            "projection",
+            "vertical_fov_degrees",
+            "height",
+            "near",
+            "far",
+            "viewport",
+        ]
+        .iter()
+        .position(|candidate| *candidate == key)
+        .unwrap_or(1000),
+        Context::Component("titan.core.DirectionalLight") => ["color", "illuminance", "ambient"]
+            .iter()
+            .position(|candidate| *candidate == key)
+            .unwrap_or(1000),
+        Context::Component("titan.core.Mesh") => ["geometry", "submeshes"]
+            .iter()
+            .position(|candidate| *candidate == key)
+            .unwrap_or(1000),
+        Context::Component("titan.core.Material") => {
+            ["model", "base_color", "metallic", "roughness"]
+                .iter()
+                .position(|candidate| *candidate == key)
+                .unwrap_or(1000)
+        }
         _ => 1000,
     }
 }

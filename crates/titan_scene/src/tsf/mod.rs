@@ -5,10 +5,14 @@ mod validate;
 
 use serde::Serialize;
 
-pub use format::fmt;
+pub use format::{fmt, fmt_with_registry};
 pub use parse::parse;
 pub use path::{QueryResult, edit, query};
-pub use validate::validate;
+pub use validate::{validate, validate_with_registry};
+pub(crate) use validate::{
+    validate_camera_binding, validate_directional_light_binding, validate_material_binding,
+    validate_mesh_binding, validate_transform_binding, validate_velocity_binding,
+};
 
 pub(crate) const QUATERNION_TOLERANCE: f32 = 1e-5;
 
@@ -161,6 +165,22 @@ impl Value {
         match &self.kind {
             ValueKind::Null => serde_json::Value::Null,
             ValueKind::Bool(value) => serde_json::Value::Bool(*value),
+            ValueKind::Number(number)
+                if number.value.is_finite()
+                    && number.value.fract() == 0.0
+                    && number.value >= 0.0
+                    && number.value < 18_446_744_073_709_551_616.0 =>
+            {
+                serde_json::Value::Number(serde_json::Number::from(number.value as u64))
+            }
+            ValueKind::Number(number)
+                if number.value.is_finite()
+                    && number.value.fract() == 0.0
+                    && number.value >= i64::MIN as f64
+                    && number.value < 0.0 =>
+            {
+                serde_json::Value::Number(serde_json::Number::from(number.value as i64))
+            }
             ValueKind::Number(number) => serde_json::Number::from_f64(number.value)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
