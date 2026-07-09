@@ -745,6 +745,13 @@ impl DeterministicRng {
         Self::new(splitmix64(seed ^ frame.wrapping_mul(0x9e37_79b9_7f4a_7c15)))
     }
 
+    fn for_system(seed: u64, frame: u64, system_index: u64) -> Self {
+        Self::new(splitmix64(
+            seed ^ frame.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ system_index.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+        ))
+    }
+
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
@@ -791,11 +798,13 @@ impl Schedule {
     pub fn run_fixed_step(&mut self, world: &mut World, ctx: FixedStepContext) -> Result<()> {
         world.frame = ctx.frame;
         world.seed = ctx.seed;
-        for (name, system) in &self.systems {
+        for (system_index, (name, system)) in self.systems.iter().enumerate() {
             let mut commands = CommandBuffer::new();
+            let mut system_ctx = ctx;
+            system_ctx.rng = DeterministicRng::for_system(ctx.seed, ctx.frame, system_index as u64);
             let result = {
                 let mut system_world = SystemWorld { world };
-                system(&mut system_world, &mut commands, ctx)
+                system(&mut system_world, &mut commands, system_ctx)
             };
             if let Err(error) = result {
                 let message = error.to_string();
@@ -969,6 +978,30 @@ mod tests {
         _ctx: FixedStepContext,
     ) -> Result<()> {
         commands.despawn(EntityId::from_raw(999));
+        Ok(())
+    }
+
+    fn write_random_x(
+        world: &mut SystemWorld<'_>,
+        _commands: &mut CommandBuffer,
+        ctx: FixedStepContext,
+    ) -> Result<()> {
+        let mut rng = ctx.rng;
+        for (_, transform) in world.query_mut::<&mut Transform>() {
+            transform.translation.x = rng.next_f32();
+        }
+        Ok(())
+    }
+
+    fn write_random_y(
+        world: &mut SystemWorld<'_>,
+        _commands: &mut CommandBuffer,
+        ctx: FixedStepContext,
+    ) -> Result<()> {
+        let mut rng = ctx.rng;
+        for (_, transform) in world.query_mut::<&mut Transform>() {
+            transform.translation.y = rng.next_f32();
+        }
         Ok(())
     }
 
@@ -1151,6 +1184,23 @@ mod tests {
                 message: "entity 999 does not exist".to_string()
             }
         );
+    }
+
+    #[test]
+    fn schedule_gives_systems_distinct_rng_streams_per_frame() {
+        let mut world = World::new(registry());
+        let entity = world.spawn();
+        world.insert(entity, Transform::default()).unwrap();
+
+        let mut schedule = Schedule::new();
+        schedule.add_system("write_random_x", write_random_x);
+        schedule.add_system("write_random_y", write_random_y);
+        schedule
+            .run_fixed_step(&mut world, FixedStepContext::new(0.25, 1, 99))
+            .unwrap();
+
+        let translation = world.get::<Transform>(entity).unwrap().unwrap().translation;
+        assert_ne!(translation.x, translation.y);
     }
 
     #[test]
