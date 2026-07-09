@@ -20,7 +20,7 @@ pub enum Error {
     EntityNotFound(EntityId),
     ComponentAlreadyRegistered(&'static str),
     ComponentNameConflict(&'static str),
-    ComponentNotRegistered(&'static str),
+    ComponentNotRegistered(String),
     ComponentTypeConflict(&'static str),
     ComponentStoreMissing(&'static str),
     ComponentSerialize { name: &'static str, message: String },
@@ -177,20 +177,20 @@ impl ComponentRegistry {
         self.meta_by_type(TypeId::of::<T>(), T::NAME)
     }
 
-    pub fn meta_by_name(&self, name: &'static str) -> Result<&ComponentMeta> {
+    pub fn meta_by_name(&self, name: &str) -> Result<&ComponentMeta> {
         self.by_name
             .get(name)
-            .ok_or(Error::ComponentNotRegistered(name))
+            .ok_or_else(|| Error::ComponentNotRegistered(name.to_string()))
     }
 
     fn meta_by_type(&self, type_id: TypeId, name: &'static str) -> Result<&ComponentMeta> {
         let registered_name = self
             .by_type
             .get(&type_id)
-            .ok_or(Error::ComponentNotRegistered(name))?;
+            .ok_or_else(|| Error::ComponentNotRegistered(name.to_string()))?;
         self.by_name
             .get(registered_name)
-            .ok_or(Error::ComponentNotRegistered(name))
+            .ok_or_else(|| Error::ComponentNotRegistered(name.to_string()))
     }
 }
 
@@ -1085,6 +1085,16 @@ mod tests {
 
         assert_eq!(first_frame.next_u64(), same_frame.next_u64());
         assert_ne!(first_frame.next_u64(), next_frame.next_u64());
+    }
+
+    #[test]
+    fn registry_lookup_accepts_runtime_component_names() {
+        let registry = registry();
+        let name = String::from(Transform::NAME);
+
+        let meta = registry.meta_by_name(&name).unwrap();
+
+        assert_eq!(meta.name(), Transform::NAME);
     }
 
     #[test]
