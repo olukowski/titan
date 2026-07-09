@@ -725,7 +725,7 @@ impl FixedStepContext {
             fixed_dt,
             frame,
             seed,
-            rng: DeterministicRng::new(seed),
+            rng: DeterministicRng::for_frame(seed, frame),
         }
     }
 }
@@ -739,6 +739,10 @@ pub struct DeterministicRng {
 impl DeterministicRng {
     pub fn new(seed: u64) -> Self {
         Self { state: seed.max(1) }
+    }
+
+    fn for_frame(seed: u64, frame: u64) -> Self {
+        Self::new(splitmix64(seed ^ frame.wrapping_mul(0x9e37_79b9_7f4a_7c15)))
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -758,6 +762,13 @@ impl DeterministicRng {
     pub fn seed(&self) -> u64 {
         self.state
     }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 pub type SystemFn = fn(&mut SystemWorld<'_>, &mut CommandBuffer, FixedStepContext) -> Result<()>;
@@ -788,16 +799,22 @@ impl Schedule {
             };
             if let Err(error) = result {
                 let message = error.to_string();
-                world.event_log.push(EventKind::SystemError {
-                    system: name.to_string(),
-                    message: message.clone(),
-                });
-                return Err(Error::System { name, message });
+                return Err(log_system_error(world, name, message));
             }
-            commands.apply(world)?;
+            if let Err(error) = commands.apply(world) {
+                return Err(log_system_error(world, name, error.to_string()));
+            }
         }
         Ok(())
     }
+}
+
+fn log_system_error(world: &mut World, name: &'static str, message: String) -> Error {
+    world.event_log.push(EventKind::SystemError {
+        system: name.to_string(),
+        message: message.clone(),
+    });
+    Error::System { name, message }
 }
 
 /// Restricted system view of the world.
@@ -946,6 +963,15 @@ mod tests {
         Ok(())
     }
 
+    fn invalid_command(
+        _world: &mut SystemWorld<'_>,
+        commands: &mut CommandBuffer,
+        _ctx: FixedStepContext,
+    ) -> Result<()> {
+        commands.despawn(EntityId::from_raw(999));
+        Ok(())
+    }
+
     #[test]
     fn entity_id_round_trips_raw_value() {
         assert_eq!(EntityId::from_raw(42).raw(), 42);
@@ -954,6 +980,16 @@ mod tests {
     #[test]
     fn default_transform_starts_at_origin() {
         assert_eq!(Transform::default().translation, Vec3::ZERO);
+    }
+
+    #[test]
+    fn fixed_step_rng_is_repeatable_but_frame_distinct() {
+        let mut first_frame = FixedStepContext::new(0.5, 1, 1234).rng;
+        let mut same_frame = FixedStepContext::new(0.5, 1, 1234).rng;
+        let mut next_frame = FixedStepContext::new(0.5, 2, 1234).rng;
+
+        assert_eq!(first_frame.next_u64(), same_frame.next_u64());
+        assert_ne!(first_frame.next_u64(), next_frame.next_u64());
     }
 
     #[test]
@@ -1087,6 +1123,33 @@ mod tests {
                 "component_removed",
                 "entity_despawned"
             ]
+        );
+    }
+
+    #[test]
+    fn schedule_logs_command_buffer_failures_as_system_errors() {
+        let mut world = World::new(registry());
+        let mut schedule = Schedule::new();
+        schedule.add_system("invalid_command", invalid_command);
+
+        let error = schedule
+            .run_fixed_step(&mut world, FixedStepContext::new(0.25, 1, 99))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            Error::System {
+                name: "invalid_command",
+                message: "entity 999 does not exist".to_string()
+            }
+        );
+        assert_eq!(world.event_log().records().len(), 1);
+        assert_eq!(
+            world.event_log().records()[0].kind,
+            EventKind::SystemError {
+                system: "invalid_command".to_string(),
+                message: "entity 999 does not exist".to_string()
+            }
         );
     }
 
