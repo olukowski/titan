@@ -317,6 +317,12 @@ impl Validator<'_> {
             match component.key.as_str() {
                 "transform" => self.validate_transform(&component.value, &component_path),
                 "velocity" => self.validate_velocity(&component.value, &component_path),
+                "camera" => self.validate_camera(&component.value, &component_path),
+                "directional_light" => {
+                    self.validate_directional_light(&component.value, &component_path)
+                }
+                "mesh" => self.validate_mesh(&component.value, &component_path),
+                "material" => self.validate_material(&component.value, &component_path),
                 _ => self.push(
                     "TSF_UNKNOWN_COMPONENT",
                     format!("unknown component '{}'", component.key),
@@ -344,6 +350,392 @@ impl Validator<'_> {
 
     fn validate_velocity(&mut self, value: &Value, path: &str) {
         self.validate_payload_vectors(value, path, &[("linear", 3)], &[], "velocity");
+    }
+
+    fn validate_camera(&mut self, value: &Value, path: &str) {
+        let Some(members) = object_members(value) else {
+            self.push(
+                "TSF_SCHEMA",
+                "camera payload must be an object",
+                path,
+                value.span,
+            );
+            return;
+        };
+        let Some(projection) = member(members, "projection") else {
+            self.push(
+                "TSF_MISSING_KEY",
+                "camera missing 'projection'",
+                path,
+                value.span,
+            );
+            return;
+        };
+        let Some(kind) = string_value(&projection.value) else {
+            self.push(
+                "TSF_SCHEMA",
+                "camera.projection must be a string",
+                json_pointer_join(path, "projection"),
+                projection.value.span,
+            );
+            return;
+        };
+        let required = match kind {
+            "perspective" => &["vertical_fov_degrees", "near", "far"][..],
+            "orthographic" => &["height", "near", "far"][..],
+            _ => {
+                self.push(
+                    "TSF_SCHEMA",
+                    "camera.projection must be perspective or orthographic",
+                    json_pointer_join(path, "projection"),
+                    projection.value.span,
+                );
+                return;
+            }
+        };
+        for field in required {
+            self.validate_scalar(members, field, path, "camera");
+        }
+        for field in required
+            .iter()
+            .filter(|field| **field != "near" && **field != "far")
+        {
+            self.validate_positive_scalar(members, field, path, "camera");
+        }
+        if let (Some(near), Some(far)) = (
+            number_member(members, "near"),
+            number_member(members, "far"),
+        ) && far <= near
+        {
+            self.push(
+                "TSF_SCHEMA",
+                "camera.far must be greater than camera.near",
+                json_pointer_join(path, "far"),
+                member(members, "far")
+                    .expect("number member exists")
+                    .value
+                    .span,
+            );
+        }
+        self.validate_optional_viewport(members, path);
+        self.reject_unknown(
+            members,
+            &[
+                "projection",
+                "vertical_fov_degrees",
+                "height",
+                "near",
+                "far",
+                "viewport",
+            ],
+            path,
+            "camera",
+        );
+    }
+
+    fn validate_directional_light(&mut self, value: &Value, path: &str) {
+        self.validate_payload_vectors(
+            value,
+            path,
+            &[("color", 3)],
+            &["illuminance", "ambient"],
+            "directional_light",
+        );
+        if let Some(members) = object_members(value) {
+            self.validate_scalar(members, "illuminance", path, "directional_light");
+            self.validate_scalar(members, "ambient", path, "directional_light");
+            self.validate_nonnegative_scalar(members, "illuminance", path, "directional_light");
+            self.validate_nonnegative_scalar(members, "ambient", path, "directional_light");
+            self.validate_range_array_member(members, "color", path, "directional_light.color");
+            self.reject_unknown(
+                members,
+                &["color", "illuminance", "ambient"],
+                path,
+                "directional_light",
+            );
+        }
+    }
+
+    fn validate_mesh(&mut self, value: &Value, path: &str) {
+        let Some(members) = object_members(value) else {
+            self.push(
+                "TSF_SCHEMA",
+                "mesh payload must be an object",
+                path,
+                value.span,
+            );
+            return;
+        };
+        let Some(geometry) = member(members, "geometry") else {
+            self.push(
+                "TSF_MISSING_KEY",
+                "mesh missing 'geometry'",
+                path,
+                value.span,
+            );
+            return;
+        };
+        if object_members(&geometry.value).is_none() {
+            self.push(
+                "TSF_SCHEMA",
+                "mesh.geometry must be a reference object",
+                json_pointer_join(path, "geometry"),
+                geometry.value.span,
+            );
+        }
+        if let Some(submeshes) = member(members, "submeshes") {
+            self.validate_integer_array(&submeshes.value, &json_pointer_join(path, "submeshes"));
+        }
+        self.reject_unknown(members, &["geometry", "submeshes"], path, "mesh");
+    }
+
+    fn validate_material(&mut self, value: &Value, path: &str) {
+        let Some(members) = object_members(value) else {
+            self.push(
+                "TSF_SCHEMA",
+                "material payload must be an object",
+                path,
+                value.span,
+            );
+            return;
+        };
+        let Some(model_entry) = member(members, "model") else {
+            self.push(
+                "TSF_MISSING_KEY",
+                "material missing 'model'",
+                path,
+                value.span,
+            );
+            return;
+        };
+        let Some(model) = string_value(&model_entry.value) else {
+            self.push(
+                "TSF_SCHEMA",
+                "material.model must be a string",
+                json_pointer_join(path, "model"),
+                model_entry.value.span,
+            );
+            return;
+        };
+        if !matches!(model, "unlit" | "pbr") {
+            self.push(
+                "TSF_SCHEMA",
+                "material.model must be unlit or pbr",
+                json_pointer_join(path, "model"),
+                model_entry.value.span,
+            );
+        }
+        self.validate_number_array_member(members, "base_color", path, 4, "material.base_color");
+        self.validate_range_array_member(members, "base_color", path, "material.base_color");
+        if model == "pbr" {
+            self.validate_scalar(members, "metallic", path, "material");
+            self.validate_scalar(members, "roughness", path, "material");
+        }
+        self.reject_unknown(
+            members,
+            &["model", "base_color", "metallic", "roughness"],
+            path,
+            "material",
+        );
+        for field in ["metallic", "roughness"] {
+            if let Some(entry) = member(members, field)
+                && let Some(number) = number_value(&entry.value)
+                && !(0.0..=1.0).contains(&number)
+            {
+                self.push(
+                    "TSF_SCHEMA",
+                    format!("material.{field} must be between 0 and 1"),
+                    json_pointer_join(path, field),
+                    entry.value.span,
+                );
+            }
+        }
+    }
+
+    fn validate_scalar(&mut self, members: &[Member], field: &str, path: &str, label: &str) {
+        let Some(entry) = member(members, field) else {
+            self.push(
+                "TSF_MISSING_KEY",
+                format!("{label} missing '{field}'"),
+                path,
+                Span::default(),
+            );
+            return;
+        };
+        match &entry.value.kind {
+            ValueKind::Number(number) if fits_f32_without_underflow(number.value) => {}
+            ValueKind::Number(_) => self.push(
+                "TSF_INVALID_NUMBER",
+                format!("{label}.{field} must be finite and fit in f32"),
+                json_pointer_join(path, field),
+                entry.value.span,
+            ),
+            _ => self.push(
+                "TSF_SCHEMA",
+                format!("{label}.{field} must be a number"),
+                json_pointer_join(path, field),
+                entry.value.span,
+            ),
+        }
+    }
+
+    fn validate_positive_scalar(
+        &mut self,
+        members: &[Member],
+        field: &str,
+        path: &str,
+        label: &str,
+    ) {
+        if let Some(entry) = member(members, field)
+            && let Some(value) = number_value(&entry.value)
+            && value <= 0.0
+        {
+            self.push(
+                "TSF_SCHEMA",
+                format!("{label}.{field} must be positive"),
+                json_pointer_join(path, field),
+                entry.value.span,
+            );
+        }
+    }
+
+    fn validate_nonnegative_scalar(
+        &mut self,
+        members: &[Member],
+        field: &str,
+        path: &str,
+        label: &str,
+    ) {
+        if let Some(entry) = member(members, field)
+            && let Some(value) = number_value(&entry.value)
+            && value < 0.0
+        {
+            self.push(
+                "TSF_SCHEMA",
+                format!("{label}.{field} must be non-negative"),
+                json_pointer_join(path, field),
+                entry.value.span,
+            );
+        }
+    }
+
+    fn validate_range_array_member(
+        &mut self,
+        members: &[Member],
+        field: &str,
+        path: &str,
+        label: &str,
+    ) {
+        if let Some(entry) = member(members, field)
+            && let ValueKind::Array(values) = &entry.value.kind
+        {
+            for (index, value) in values.iter().enumerate() {
+                if let Some(number) = number_value(value)
+                    && !(0.0..=1.0).contains(&number)
+                {
+                    self.push(
+                        "TSF_SCHEMA",
+                        format!("{label}[{index}] must be between 0 and 1"),
+                        format!("{path}/{field}/{index}"),
+                        value.span,
+                    );
+                }
+            }
+        }
+    }
+
+    fn validate_optional_viewport(&mut self, members: &[Member], path: &str) {
+        if let Some(viewport) = member(members, "viewport") {
+            let Some(fields) = object_members(&viewport.value) else {
+                self.push(
+                    "TSF_SCHEMA",
+                    "camera.viewport must be an object",
+                    json_pointer_join(path, "viewport"),
+                    viewport.value.span,
+                );
+                return;
+            };
+            for field in ["width", "height"] {
+                self.validate_scalar(
+                    fields,
+                    field,
+                    &json_pointer_join(path, "viewport"),
+                    "camera.viewport",
+                );
+            }
+            self.reject_unknown(
+                fields,
+                &["width", "height"],
+                &json_pointer_join(path, "viewport"),
+                "camera.viewport",
+            );
+        }
+    }
+
+    fn reject_unknown(
+        &mut self,
+        members: &[Member],
+        allowed: &[&str],
+        path: &str,
+        component: &str,
+    ) {
+        for entry in members {
+            if !allowed.contains(&entry.key.as_str()) {
+                self.push(
+                    "TSF_SCHEMA",
+                    format!("{component} field '{}' is not supported", entry.key),
+                    json_pointer_join(path, &entry.key),
+                    entry.key_span,
+                );
+            }
+        }
+    }
+
+    fn validate_number_array_member(
+        &mut self,
+        members: &[Member],
+        field: &str,
+        path: &str,
+        len: usize,
+        label: &str,
+    ) {
+        match member(members, field) {
+            Some(entry) => self.validate_number_array(
+                &entry.value,
+                &json_pointer_join(path, field),
+                len,
+                label,
+            ),
+            None => self.push(
+                "TSF_MISSING_KEY",
+                format!("{label} is required"),
+                path,
+                Span::default(),
+            ),
+        }
+    }
+
+    fn validate_integer_array(&mut self, value: &Value, path: &str) {
+        let ValueKind::Array(values) = &value.kind else {
+            self.push(
+                "TSF_SCHEMA",
+                "mesh.submeshes must be an array",
+                path,
+                value.span,
+            );
+            return;
+        };
+        for value in values {
+            if !matches!(&value.kind, ValueKind::Number(number) if number.value.is_finite() && number.value.fract() == 0.0 && number.value >= 0.0)
+            {
+                self.push(
+                    "TSF_SCHEMA",
+                    "mesh.submeshes must contain non-negative integers",
+                    path,
+                    value.span,
+                );
+            }
+        }
     }
 
     fn validate_quaternion(&mut self, value: &Value, path: &str) {
@@ -605,6 +997,17 @@ fn string_value(value: &Value) -> Option<&str> {
         ValueKind::String(value) => Some(value),
         _ => None,
     }
+}
+
+fn number_value(value: &Value) -> Option<f64> {
+    match &value.kind {
+        ValueKind::Number(number) => Some(number.value),
+        _ => None,
+    }
+}
+
+fn number_member(members: &[Member], key: &str) -> Option<f64> {
+    member(members, key).and_then(|entry| number_value(&entry.value))
 }
 
 fn valid_entity_id(value: &str) -> bool {

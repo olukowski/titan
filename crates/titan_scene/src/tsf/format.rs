@@ -168,15 +168,45 @@ fn rank(context: Context<'_>, key: &str) -> usize {
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Components => ["transform", "velocity"]
-            .iter()
-            .position(|candidate| *candidate == key)
-            .unwrap_or(1000),
+        Context::Components => [
+            "transform",
+            "velocity",
+            "camera",
+            "directional_light",
+            "mesh",
+            "material",
+        ]
+        .iter()
+        .position(|candidate| *candidate == key)
+        .unwrap_or(1000),
         Context::Component("transform") => ["translation", "rotation"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
         Context::Component("velocity") => ["linear"]
+            .iter()
+            .position(|candidate| *candidate == key)
+            .unwrap_or(1000),
+        Context::Component("camera") => [
+            "projection",
+            "vertical_fov_degrees",
+            "height",
+            "near",
+            "far",
+            "viewport",
+        ]
+        .iter()
+        .position(|candidate| *candidate == key)
+        .unwrap_or(1000),
+        Context::Component("directional_light") => ["color", "illuminance", "ambient"]
+            .iter()
+            .position(|candidate| *candidate == key)
+            .unwrap_or(1000),
+        Context::Component("mesh") => ["geometry", "submeshes"]
+            .iter()
+            .position(|candidate| *candidate == key)
+            .unwrap_or(1000),
+        Context::Component("material") => ["model", "base_color", "metallic", "roughness"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),

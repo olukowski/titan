@@ -1,5 +1,8 @@
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use titan_core::{Component, Transform, phase1_component_registry};
+use titan_core::{
+    Camera, Component, DirectionalLight, Material, Mesh, Transform, Velocity,
+    phase1_component_registry, phase2_component_registry,
+};
 use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
@@ -15,6 +18,39 @@ fn moving_entity_round_trips_and_format_is_idempotent() {
     let reparsed = parse(Some("moving_entity.tsf"), &formatted).expect("parse formatted fixture");
     let reformatted = fmt(&reparsed);
     assert_eq!(reformatted, formatted);
+}
+
+#[test]
+fn phase2_components_validate_format_and_insert_as_typed_values() {
+    let source = r#"{
+  tsf: 1,
+  scene: { id: "scene:red_cube" },
+  assets: { cube_mesh: { path: "cube.mesh", kind: "geometry" } },
+  entities: [{
+    id: "entity:cube",
+    components: {
+      material: { model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] },
+      mesh: { geometry: { ref: "asset:cube_mesh" } },
+      directional_light: { color: [1.0, 1.0, 1.0], illuminance: 1.0, ambient: 0.05 },
+      camera: { projection: "perspective", vertical_fov_degrees: 60.0, near: 0.1, far: 100.0 },
+      velocity: { linear: [0.0, 0.0, 0.0] },
+      transform: { translation: [0.0, 0.0, 0.0] },
+    },
+  }],
+}
+"#;
+    let document = parse(Some("phase2.tsf"), source).expect("parse");
+    validate(&document).expect("validate");
+    let formatted = fmt(&document);
+    assert_eq!(fmt(&parse(None, &formatted).expect("reparse")), formatted);
+    let world = load_world(&document, phase2_component_registry().unwrap()).expect("load");
+    let entity = titan_core::EntityId::from_raw(1);
+    assert!(world.get::<Camera>(entity).unwrap().is_some());
+    assert!(world.get::<DirectionalLight>(entity).unwrap().is_some());
+    assert!(world.get::<Mesh>(entity).unwrap().is_some());
+    assert!(world.get::<Material>(entity).unwrap().is_some());
+    assert!(world.get::<Transform>(entity).unwrap().is_some());
+    assert!(world.get::<Velocity>(entity).unwrap().is_some());
 }
 
 #[test]
@@ -282,7 +318,7 @@ fn invalid_entity_parent_is_diagnostic() {
 
 #[test]
 fn unsupported_runtime_components_are_diagnostic() {
-    for component in ["mesh", "camera", "light"] {
+    for component in ["light", "unknown"] {
         let source = MOVING_ENTITY.replace(
             "        velocity: {",
             &format!("        {component}: {{}},\n        velocity: {{"),

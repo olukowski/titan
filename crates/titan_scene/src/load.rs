@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
-use titan_core::{Component, ComponentRegistry, EntityId, Transform, Velocity, World};
+use titan_core::{ComponentRegistry, EntityId, World};
 
+use crate::registry::registry_for_core;
 use crate::tsf::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind,
     fits_f32_without_underflow, json_pointer_join, normalized_quaternion, validate,
@@ -11,7 +12,8 @@ use crate::tsf::{
 pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult<World> {
     validate(document)?;
 
-    let mut world = World::new(registry);
+    let tsf_registry = registry_for_core(registry);
+    let mut world = World::new(tsf_registry.component_registry().clone());
     let entities = required_array(document, &document.root, "entities", "/entities")?;
     let entity_ids = scene_entity_ids(document, entities)?;
 
@@ -70,6 +72,7 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
                 entity_id,
                 &components.value,
                 &format!("{path}/components"),
+                &tsf_registry,
             )?;
         }
     }
@@ -109,6 +112,7 @@ fn load_components(
     entity_id: EntityId,
     value: &Value,
     path: &str,
+    tsf_registry: &crate::registry::TsfComponentRegistry,
 ) -> TsfResult<()> {
     let members = object_members(value).ok_or_else(|| {
         one(
@@ -122,34 +126,51 @@ fn load_components(
     let mut loaded = Vec::new();
     for component in members {
         let component_path = json_pointer_join(path, &component.key);
-        let (registered_name, payload) = match component.key.as_str() {
-            "transform" => (
-                Transform::NAME,
-                transform_payload(document, &component.value, &component_path)?,
-            ),
-            "velocity" => (
-                Velocity::NAME,
-                velocity_payload(document, &component.value, &component_path)?,
-            ),
-            _ => {
-                return Err(one(
-                    document,
-                    "TSF_UNKNOWN_COMPONENT",
-                    format!("unknown component '{}'", component.key),
-                    component_path,
-                    component.key_span,
-                ));
-            }
+        let Some(binding) = tsf_registry.binding(&component.key) else {
+            return Err(one(
+                document,
+                "TSF_UNKNOWN_COMPONENT",
+                format!("unknown component '{}'", component.key),
+                component_path,
+                component.key_span,
+            ));
+        };
+        if tsf_registry
+            .component_registry()
+            .meta_by_name(binding.registered_name)
+            .is_err()
+        {
+            return Err(one(
+                document,
+                "TSF_COMPONENT_NOT_REGISTERED",
+                format!(
+                    "component alias '{}' maps to unregistered type '{}'",
+                    component.key, binding.registered_name
+                ),
+                component_path,
+                component.key_span,
+            ));
+        }
+        let payload = match component.key.as_str() {
+            "transform" => transform_payload(document, &component.value, &component_path)?,
+            "velocity" => velocity_payload(document, &component.value, &component_path)?,
+            _ => component.value.to_json(),
         };
         loaded.push((
-            registered_name,
+            binding.registered_name,
             payload,
             component_path,
             component.value.span,
         ));
     }
 
-    loaded.sort_by_key(|(registered_name, _, _, _)| *registered_name);
+    loaded.sort_by_key(|(_, _, path, _)| {
+        let alias = path.rsplit('/').next().unwrap_or_default();
+        crate::registry::BUILTIN_COMPONENT_ORDER
+            .iter()
+            .position(|item| *item == alias)
+            .unwrap_or(usize::MAX)
+    });
     for (registered_name, payload, component_path, value_span) in loaded {
         world
             .insert_serialized(entity_id, registered_name, payload)
