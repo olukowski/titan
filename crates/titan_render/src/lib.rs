@@ -1,13 +1,17 @@
 //! Renderer-owned, headless rendering contracts.
 //!
-//! This crate intentionally has no graphics backend yet. It owns the API and
-//! the deterministic CPU render plan that later GPU implementations consume.
+//! This crate owns the renderer API, the deterministic CPU render plan, and
+//! the headless GPU context used by GPU-backed services.
 
 use std::{collections::BTreeMap, fmt};
 
 use serde::Serialize;
 use titan_core::{Component, EntityId, Transform, Velocity, World};
 use titan_math::Vec3;
+
+mod gpu;
+
+pub use gpu::{AdapterBackend, AdapterInfo, AdapterSelection};
 
 /// Stable codes used by structured renderer diagnostics.
 pub mod error {
@@ -74,6 +78,27 @@ impl OutputSize {
     pub const fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
+}
+
+pub(crate) fn validate_output_size(
+    output_size: OutputSize,
+    max_texture_dimension_2d: Option<u32>,
+) -> ServiceResult<()> {
+    if output_size.width == 0 || output_size.height == 0 {
+        return Err(RenderError::new(
+            error::INVALID_OUTPUT_SIZE,
+            "render output dimensions must be greater than zero",
+        ));
+    }
+    if let Some(max_dimension) = max_texture_dimension_2d
+        && (output_size.width > max_dimension || output_size.height > max_dimension)
+    {
+        return Err(RenderError::new(
+            error::INVALID_OUTPUT_SIZE,
+            format!("render output dimensions must not exceed the device limit of {max_dimension}"),
+        ));
+    }
+    Ok(())
 }
 
 impl Default for OutputSize {
@@ -216,35 +241,44 @@ pub fn extract_scene(world: &World) -> RenderScene {
     }
 }
 
-/// Headless render service boundary. Backend ownership arrives in a later PR.
-#[derive(Clone, Debug)]
+/// Headless render service boundary. CPU-only services are available for
+/// extraction and stats tests; GPU-backed services own their device context.
 pub struct RenderService {
     pub components: RenderComponentRegistry,
+    gpu: Option<gpu::GpuContext>,
 }
 
 impl RenderService {
-    /// Creates the stateless phase-1 CPU renderer.
-    ///
-    /// Step 2 will add a fallible, device-backed constructor (for adapter and
-    /// device acquisition) and interior-mutable resource caches. Keeping the
-    /// render operation shared-reference based now leaves that cache boundary
-    /// explicit without making phase-1 construction pretend to acquire a GPU.
-    pub fn new() -> Self {
+    /// Creates a GPU-backed service, reporting `RENDER_NO_ADAPTER` when no
+    /// suitable headless device is available.
+    pub fn new() -> ServiceResult<Self> {
+        Ok(Self {
+            components: RenderComponentRegistry::phase1(),
+            gpu: Some(gpu::GpuContext::new()?),
+        })
+    }
+
+    /// Creates the CPU-only service used by stats and extraction tests.
+    pub fn cpu_only() -> Self {
         Self {
             components: RenderComponentRegistry::phase1(),
+            gpu: None,
         }
     }
 
-    /// Renders from the phase-1 stateless CPU plan. The `&self` boundary is
-    /// intentional: step 2's caches will use interior mutability while its
-    /// fallible device-backed constructor reports `RENDER_NO_ADAPTER`.
+    /// Returns adapter metadata for a GPU-backed service.
+    pub fn adapter_info(&self) -> Option<&AdapterInfo> {
+        self.gpu.as_ref().map(gpu::GpuContext::adapter_info)
+    }
+
+    /// Renders the CPU-side phase-1 plan. GPU-backed services share this plan
+    /// until the draw pipeline is added.
     pub fn render(&self, world: &World, request: RenderRequest) -> ServiceResult<RenderResult> {
-        if request.output_size.width == 0 || request.output_size.height == 0 {
-            return Err(RenderError::new(
-                error::INVALID_OUTPUT_SIZE,
-                "render output dimensions must be greater than zero",
-            ));
-        }
+        let max_texture_dimension = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.device_limits().max_texture_dimension_2d);
+        validate_output_size(request.output_size, max_texture_dimension)?;
         if !matches!(request.camera, CameraSelection::Default) {
             return Err(RenderError::new(
                 error::CAMERA_UNAVAILABLE,
@@ -271,12 +305,6 @@ impl RenderService {
             scene,
             rgba8: None,
         })
-    }
-}
-
-impl Default for RenderService {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -309,7 +337,7 @@ mod tests {
 
     #[test]
     fn stats_reflect_the_current_empty_draw_plan() {
-        let output = RenderService::new()
+        let output = RenderService::cpu_only()
             .render(&world_with_components(), RenderRequest::default())
             .unwrap();
         assert_eq!(output.stats.draw_calls, 0);
@@ -321,7 +349,7 @@ mod tests {
     #[test]
     fn invalid_requests_use_stable_codes() {
         let world = world_with_components();
-        let error = RenderService::new()
+        let error = RenderService::cpu_only()
             .render(
                 &world,
                 RenderRequest {
@@ -332,7 +360,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error::INVALID_OUTPUT_SIZE);
 
-        let error = RenderService::new()
+        let error = RenderService::cpu_only()
             .render(
                 &world,
                 RenderRequest {
@@ -343,7 +371,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error::INVALID_OUTPUT_SIZE);
 
-        let error = RenderService::new()
+        let error = RenderService::cpu_only()
             .render(
                 &world,
                 RenderRequest {
@@ -354,7 +382,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error::CAMERA_UNAVAILABLE);
 
-        let error = RenderService::new()
+        let error = RenderService::cpu_only()
             .render(
                 &world,
                 RenderRequest {
@@ -369,16 +397,16 @@ mod tests {
     #[test]
     fn default_service_registers_phase1_components() {
         assert_eq!(
-            RenderService::default().components,
-            RenderService::new().components
+            RenderService::cpu_only().components,
+            RenderService::cpu_only().components
         );
-        assert_eq!(RenderService::default().components.components().len(), 2);
+        assert_eq!(RenderService::cpu_only().components.components().len(), 2);
         assert_eq!(
-            RenderService::default().components.components()[0].registered_name,
+            RenderService::cpu_only().components.components()[0].registered_name,
             Transform::NAME
         );
         assert_eq!(
-            RenderService::default().components.components()[1].registered_name,
+            RenderService::cpu_only().components.components()[1].registered_name,
             Velocity::NAME
         );
     }
