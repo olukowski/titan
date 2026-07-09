@@ -15,6 +15,7 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
     let entities = required_array(document, &document.root, "entities", "/entities")?;
     let entity_ids = scene_entity_ids(document, entities)?;
 
+    let mut ordered_entities = Vec::new();
     for (index, entity) in entities.iter().enumerate() {
         let path = format!("/entities/{index}");
         let members = object_members(entity).ok_or_else(|| {
@@ -36,24 +37,29 @@ pub fn load_world(document: &Document, registry: ComponentRegistry) -> TsfResult
                 entity.span,
             )
         })?;
+        ordered_entities.push((scene_id.to_owned(), entity_id, path, members, entity.span));
+    }
+
+    ordered_entities.sort_by(|left, right| left.0.cmp(&right.0));
+    for (scene_id, entity_id, path, members, entity_span) in ordered_entities {
         world.spawn_with_id(entity_id).map_err(|error| {
             one(
                 document,
                 "TSF_LOAD_WORLD",
                 error.to_string(),
                 &path,
-                entity.span,
+                entity_span,
             )
         })?;
         world
-            .bind_scene_entity_id(scene_id.to_owned(), entity_id)
+            .bind_scene_entity_id(scene_id, entity_id)
             .map_err(|error| {
                 one(
                     document,
                     "TSF_LOAD_WORLD",
                     error.to_string(),
                     format!("{path}/id"),
-                    entity.span,
+                    entity_span,
                 )
             })?;
 
