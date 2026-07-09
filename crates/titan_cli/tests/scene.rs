@@ -177,6 +177,28 @@ fn edit_can_repair_parseable_invalid_scene() {
         .success();
 }
 
+#[test]
+fn edit_accepts_negative_replacement_value() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = write_scene(&dir, "negative.tsf", MOVING_ENTITY);
+    let path_str = path_string(&path);
+
+    titan()
+        .args([
+            "scene",
+            "edit",
+            path_str.as_str(),
+            "/entities/entity:mover/components/velocity/linear/0",
+            "-0.2",
+        ])
+        .assert()
+        .success()
+        .stderr("");
+
+    let source = fs::read_to_string(&path).expect("read edited scene");
+    assert!(source.contains("linear: [-0.2, 0.0, 0.0],"));
+}
+
 #[cfg(unix)]
 #[test]
 fn fmt_preserves_file_permissions() {

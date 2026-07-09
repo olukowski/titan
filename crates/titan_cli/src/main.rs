@@ -60,6 +60,7 @@ enum SceneCommand {
         /// JSON Pointer path. Entity arrays also accept entity:<slug> ids.
         pointer: String,
         /// Replacement value parsed as TSF/JSON5.
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
     /// Rewrite a TSF scene in canonical form.
