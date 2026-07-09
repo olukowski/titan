@@ -226,9 +226,39 @@ impl Validator<'_> {
             let Some(members) = object_members(entity) else {
                 continue;
             };
+            if let Some(parent) = member(members, "parent") {
+                self.validate_parent(&parent.value, &format!("{entity_path}/parent"));
+            }
             if let Some(components) = member(members, "components") {
                 self.validate_components(&components.value, &format!("{entity_path}/components"));
             }
+        }
+    }
+
+    fn validate_parent(&mut self, value: &Value, path: &str) {
+        let Some(parent) = string_value(value) else {
+            self.push(
+                "TSF_SCHEMA",
+                "entity.parent must be a string",
+                path,
+                value.span,
+            );
+            return;
+        };
+        if !valid_entity_id(parent) {
+            self.push(
+                "TSF_INVALID_ID",
+                "entity.parent must be an entity:<slug> id string",
+                path,
+                value.span,
+            );
+        } else if !self.entity_ids.contains(parent) {
+            self.push(
+                "TSF_BROKEN_REF",
+                format!("entity parent '{parent}' does not point at an entity in this file"),
+                path,
+                value.span,
+            );
         }
     }
 
@@ -391,9 +421,7 @@ impl Validator<'_> {
                     span,
                 );
             }
-        } else if (target.starts_with("scene:") && target.contains("#entity:"))
-            || target.starts_with("file:")
-        {
+        } else if valid_external_ref(target) {
         } else if target.starts_with("entity:") {
             if !self.entity_ids.contains(target) {
                 self.push(
@@ -447,10 +475,27 @@ fn valid_entity_id(value: &str) -> bool {
     let Some(slug) = value.strip_prefix("entity:") else {
         return false;
     };
+    valid_entity_slug(slug)
+}
+
+fn valid_entity_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn valid_external_ref(value: &str) -> bool {
+    if let Some(path) = value.strip_prefix("file:") {
+        return !path.is_empty();
+    }
+    let Some(target) = value.strip_prefix("scene:") else {
+        return false;
+    };
+    let Some((path, slug)) = target.split_once("#entity:") else {
+        return false;
+    };
+    !path.is_empty() && valid_entity_slug(slug)
 }
 
 fn entity_path(entity: &Value, index: usize) -> String {

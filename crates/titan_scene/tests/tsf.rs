@@ -83,6 +83,48 @@ fn malformed_reference_objects_are_diagnostic() {
 }
 
 #[test]
+fn malformed_external_references_are_diagnostic() {
+    let source = MOVING_ENTITY.replace(
+        "assets: {},",
+        "assets: {},\n  bad_file: { ref: \"file:\" },\n  bad_scene: { ref: \"scene:#entity:\" },",
+    );
+    let document = parse(Some("bad-external-ref.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("malformed external references should fail");
+
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/bad_file/ref"
+    }));
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/bad_scene/ref"
+    }));
+}
+
+#[test]
+fn invalid_entity_parent_is_diagnostic() {
+    let source = MOVING_ENTITY.replace(
+        "      id: \"entity:mover\",\n",
+        "      id: \"entity:mover\",\n      parent: \"entity:missing\",\n",
+    );
+    let document = parse(Some("bad-parent.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("missing parent should fail");
+
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/entities/entity:mover/parent"
+    }));
+
+    let source = MOVING_ENTITY.replace(
+        "      id: \"entity:mover\",\n",
+        "      id: \"entity:mover\",\n      parent: 7,\n",
+    );
+    let document = parse(Some("bad-parent.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("non-string parent should fail");
+
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/entities/entity:mover/parent"
+    }));
+}
+
+#[test]
 fn forbidden_number_values_fail() {
     for (source, message) in [
         ("{ value: Infinity }", "Infinity"),
