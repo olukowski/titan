@@ -461,13 +461,6 @@ impl Validator<'_> {
             self.validate_scalar(members, "ambient", path, "directional_light");
             self.validate_nonnegative_scalar(members, "illuminance", path, "directional_light");
             self.validate_nonnegative_scalar(members, "ambient", path, "directional_light");
-            self.validate_range_array_member(members, "color", path, "directional_light.color");
-            self.reject_unknown(
-                members,
-                &["color", "illuminance", "ambient"],
-                path,
-                "directional_light",
-            );
         }
     }
 

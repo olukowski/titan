@@ -50,6 +50,22 @@ fn registry_builders_and_binding_accessors_are_complete() {
 }
 
 #[test]
+fn load_world_rejects_unsupported_core_registry_without_panicking() {
+    let document = parse(
+        Some("unsupported-registry.tsf"),
+        &phase2_source("transform: { translation: [0, 0, 0] }"),
+    )
+    .expect("parse");
+    let error = match load_world(&document, titan_core::ComponentRegistry::new()) {
+        Ok(_) => panic!("unsupported registry should return a diagnostic"),
+        Err(error) => error,
+    };
+    assert_eq!(error.errors.len(), 1);
+    assert_eq!(error.errors[0].code, "TSF_REGISTRY");
+    assert!(error.errors[0].message.contains("not a supported"));
+}
+
+#[test]
 fn registry_rejects_duplicates_schema_mismatch_and_missing_types() {
     let core = phase2_component_registry().unwrap();
     let binding = TsfComponentBinding {
@@ -260,7 +276,7 @@ fn phase2_components_validate_format_and_insert_as_typed_values() {
     components: {
       material: { model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] },
       mesh: { geometry: { ref: "asset:cube_mesh" }, submeshes: [0, 3] },
-      directional_light: { color: [1.0, 1.0, 1.0], illuminance: 1.0, ambient: 0.05 },
+      directional_light: { color: [4.0, -2.0, 100.0], illuminance: 1.0, ambient: 0.05 },
       camera: { projection: "perspective", vertical_fov_degrees: 60.0, near: 0.1, far: 100.0, viewport: { width: 640, height: 480 } },
       velocity: { linear: [0.0, 0.0, 0.0] },
       transform: { translation: [0.0, 0.0, 0.0] },
@@ -296,6 +312,33 @@ fn phase2_components_validate_format_and_insert_as_typed_values() {
             }),
         }
     );
+}
+
+#[test]
+fn directional_light_unknown_field_has_one_diagnostic_and_hdr_color_is_allowed() {
+    let source = phase2_source(
+        "directional_light: { color: [4.0, -2.0, 100.0], illuminance: 1.0, ambient: 0.05, stray: true }",
+    );
+    let document = parse(Some("directional-light.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("unknown field should fail");
+    let diagnostics: Vec<_> = error
+        .errors
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.path == "/entities/entity:test/components/directional_light/stray"
+        })
+        .collect();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "TSF_UNKNOWN_COMPONENT_FIELD");
+
+    let valid = parse(
+        Some("hdr-directional-light.tsf"),
+        &phase2_source(
+            "directional_light: { color: [4.0, -2.0, 100.0], illuminance: 1.0, ambient: 0.05 }",
+        ),
+    )
+    .expect("parse");
+    validate(&valid).expect("HDR light color should be allowed");
 }
 
 #[test]

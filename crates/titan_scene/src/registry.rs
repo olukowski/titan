@@ -21,6 +21,7 @@ pub struct TsfComponentBinding {
 pub enum TsfComponentRegistryError {
     DuplicateAlias(&'static str),
     DuplicateRegisteredName(&'static str),
+    UnsupportedCoreRegistry,
     ComponentNotRegistered(String),
     SchemaVersionMismatch {
         name: &'static str,
@@ -35,6 +36,12 @@ impl fmt::Display for TsfComponentRegistryError {
             Self::DuplicateAlias(alias) => write!(f, "TSF component alias '{alias}' is duplicated"),
             Self::DuplicateRegisteredName(name) => {
                 write!(f, "registered component '{name}' is duplicated")
+            }
+            Self::UnsupportedCoreRegistry => {
+                write!(
+                    f,
+                    "core component registry is not a supported Titan scene registry"
+                )
             }
             Self::ComponentNotRegistered(name) => write!(f, "component {name} is not registered"),
             Self::SchemaVersionMismatch {
@@ -62,17 +69,22 @@ pub struct TsfComponentRegistry {
 }
 
 pub trait IntoTsfComponentRegistry {
-    fn into_tsf_component_registry(self) -> TsfComponentRegistry;
+    fn into_tsf_component_registry(self)
+    -> Result<TsfComponentRegistry, TsfComponentRegistryError>;
 }
 
 impl IntoTsfComponentRegistry for TsfComponentRegistry {
-    fn into_tsf_component_registry(self) -> TsfComponentRegistry {
-        self
+    fn into_tsf_component_registry(
+        self,
+    ) -> Result<TsfComponentRegistry, TsfComponentRegistryError> {
+        Ok(self)
     }
 }
 
 impl IntoTsfComponentRegistry for ComponentRegistry {
-    fn into_tsf_component_registry(self) -> TsfComponentRegistry {
+    fn into_tsf_component_registry(
+        self,
+    ) -> Result<TsfComponentRegistry, TsfComponentRegistryError> {
         registry_for_core(self)
     }
 }
@@ -197,7 +209,9 @@ pub fn phase2_component_registry() -> Result<TsfComponentRegistry, TsfComponentR
     )
 }
 
-pub(crate) fn registry_for_core(registry: ComponentRegistry) -> TsfComponentRegistry {
+pub(crate) fn registry_for_core(
+    registry: ComponentRegistry,
+) -> Result<TsfComponentRegistry, TsfComponentRegistryError> {
     let bindings = if PHASE2_BINDINGS
         .iter()
         .all(|binding| registry.meta_by_name(binding.registered_name).is_ok())
@@ -209,9 +223,7 @@ pub(crate) fn registry_for_core(registry: ComponentRegistry) -> TsfComponentRegi
     {
         PHASE1_BINDINGS.to_vec()
     } else {
-        panic!("core component registry is not a supported Titan scene registry")
+        return Err(TsfComponentRegistryError::UnsupportedCoreRegistry);
     };
-    TsfComponentRegistry::new(registry, bindings).unwrap_or_else(|error| {
-        panic!("built-in component registry must match TSF bindings: {error}")
-    })
+    TsfComponentRegistry::new(registry, bindings)
 }

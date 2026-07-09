@@ -13,7 +13,15 @@ pub fn load_world<R: IntoTsfComponentRegistry>(
     document: &Document,
     registry: R,
 ) -> TsfResult<World> {
-    let tsf_registry = registry.into_tsf_component_registry();
+    let tsf_registry = registry.into_tsf_component_registry().map_err(|error| {
+        TsfError::one(
+            document.file.as_deref(),
+            "TSF_REGISTRY",
+            error.to_string(),
+            "",
+            Span::default(),
+        )
+    })?;
     load_world_with_registry(document, &tsf_registry)
 }
 
