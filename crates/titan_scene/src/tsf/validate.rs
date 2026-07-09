@@ -347,11 +347,26 @@ impl Validator<'_> {
     fn validate_refs(&mut self, value: &Value, path: &str) {
         match &value.kind {
             ValueKind::Object(members) => {
-                if members.len() == 1
-                    && members[0].key == "ref"
-                    && let Some(target) = string_value(&members[0].value)
-                {
-                    self.validate_ref(target, path, members[0].value.span);
+                if let Some(ref_member) = member(members, "ref") {
+                    if let Some(target) = string_value(&ref_member.value) {
+                        self.validate_ref(target, path, ref_member.value.span);
+                    } else {
+                        self.push(
+                            "TSF_SCHEMA",
+                            "ref must be a string",
+                            json_pointer_join(path, "ref"),
+                            ref_member.value.span,
+                        );
+                    }
+                    if members.len() != 1 {
+                        self.push(
+                            "TSF_SCHEMA",
+                            "ref object may not contain other keys",
+                            path,
+                            value.span,
+                        );
+                    }
+                    return;
                 }
                 for member in members {
                     self.validate_refs(&member.value, &json_pointer_join(path, &member.key));

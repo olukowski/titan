@@ -221,7 +221,7 @@ fn format_number(number: &Number) -> String {
 fn is_simple_key(key: &str) -> bool {
     let mut chars = key.chars();
     matches!(chars.next(), Some(ch) if ch == '_' || ch == '$' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch == '$' || ch == '-' || ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
 fn push_indent(out: &mut String, indent: usize) {

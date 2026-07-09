@@ -241,12 +241,22 @@ impl<'a> Parser<'a> {
                     'n' => out.push('\n'),
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
+                    'v' => out.push('\u{000b}'),
+                    '0' if !matches!(self.peek_char(), Some('0'..='9')) => out.push('\0'),
+                    'x' => out.push(self.parse_hex_escape()?),
                     'u' => out.push(self.parse_unicode_escape()?),
                     '\n' => {}
                     '\r' => {
                         self.consume_char('\n');
                     }
-                    other => out.push(other),
+                    _ => {
+                        return Err(self.error(
+                            "TSF_PARSE_ERROR",
+                            "invalid string escape",
+                            "",
+                            self.empty_span(),
+                        ));
+                    }
                 }
             } else {
                 if ch == '\n' || ch == '\r' {
@@ -266,6 +276,37 @@ impl<'a> Parser<'a> {
             "",
             self.empty_span(),
         ))
+    }
+
+    fn parse_hex_escape(&mut self) -> TsfResult<char> {
+        let mut value = 0_u32;
+        for _ in 0..2 {
+            let ch = self.bump_char().ok_or_else(|| {
+                self.error(
+                    "TSF_PARSE_ERROR",
+                    "unterminated hex escape",
+                    "",
+                    self.empty_span(),
+                )
+            })?;
+            value = value * 16
+                + ch.to_digit(16).ok_or_else(|| {
+                    self.error(
+                        "TSF_PARSE_ERROR",
+                        "invalid hex escape",
+                        "",
+                        self.empty_span(),
+                    )
+                })?;
+        }
+        char::from_u32(value).ok_or_else(|| {
+            self.error(
+                "TSF_PARSE_ERROR",
+                "invalid hex scalar",
+                "",
+                self.empty_span(),
+            )
+        })
     }
 
     fn parse_unicode_escape(&mut self) -> TsfResult<char> {

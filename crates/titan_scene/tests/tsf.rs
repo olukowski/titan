@@ -60,6 +60,29 @@ fn broken_asset_reference_is_diagnostic() {
 }
 
 #[test]
+fn malformed_reference_objects_are_diagnostic() {
+    let source = MOVING_ENTITY.replace(
+        "assets: {},",
+        "assets: {},\n  bad: { ref: 123, note: \"extra\" },",
+    );
+    let document = parse(Some("bad-ref.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("malformed reference should fail");
+
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/bad/ref" })
+    );
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/bad" })
+    );
+}
+
+#[test]
 fn forbidden_number_values_fail() {
     for (source, message) in [
         ("{ value: Infinity }", "Infinity"),
@@ -75,6 +98,27 @@ fn forbidden_number_values_fail() {
             error.errors[0].message
         );
     }
+}
+
+#[test]
+fn string_escapes_follow_json5() {
+    let document = parse(None, r#"{ value: "\x41\v\0", escaped: "\z" }"#).expect_err("bad escape");
+    assert_eq!(document.errors[0].code, "TSF_PARSE_ERROR");
+
+    let document = parse(None, r#"{ value: "\x41\v\0" }"#).expect("parse JSON5 escapes");
+    assert_eq!(
+        query(&document, "/value").expect("query value").value,
+        "A\u{b}\0"
+    );
+}
+
+#[test]
+fn formatter_quotes_hyphenated_keys() {
+    let document = parse(None, "{ asset-name: { nested_key: true } }").expect("parse");
+    let formatted = fmt(&document);
+
+    assert!(formatted.contains("\"asset-name\": {"));
+    assert!(formatted.contains("nested_key: true"));
 }
 
 #[test]
