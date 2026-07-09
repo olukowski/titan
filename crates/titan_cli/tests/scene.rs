@@ -225,6 +225,39 @@ fn fmt_preserves_file_permissions() {
     assert_eq!(mode & 0o777, 0o640);
 }
 
+#[cfg(unix)]
+#[test]
+fn fmt_rewrites_symlink_target_without_replacing_link() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("tempdir");
+    let target = write_scene(
+        &dir,
+        "target.tsf",
+        "{ entities: [], assets: {}, scene: { name: 'Demo', id: 'scene:demo' }, tsf: 1 }\n",
+    );
+    let link = dir.path().join("linked.tsf");
+    symlink(&target, &link).expect("create symlink fixture");
+    let link_str = path_string(&link);
+    let target_str = path_string(&target);
+
+    titan()
+        .args(["scene", "fmt", link_str.as_str()])
+        .assert()
+        .success();
+
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("read link metadata")
+            .file_type()
+            .is_symlink()
+    );
+    titan()
+        .args(["scene", "fmt", target_str.as_str(), "--check"])
+        .assert()
+        .success();
+}
+
 #[test]
 fn fmt_check_reports_canonical_and_noncanonical_files() {
     let dir = TempDir::new().expect("tempdir");

@@ -438,8 +438,14 @@ fn load_valid_scene(path: &Path) -> Result<Document, SceneLoadError> {
 }
 
 fn write_scene_atomic(path: &Path, source: &str) -> Result<(), TitanError> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let permissions = fs::metadata(path)
+    let target = fs::canonicalize(path).map_err(|source| {
+        TitanError::new(
+            "TITAN_IO_WRITE",
+            format!("failed to resolve {}: {source}", path.display()),
+        )
+    })?;
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let permissions = fs::metadata(&target)
         .map_err(|source| {
             TitanError::new(
                 "TITAN_IO_WRITE",
@@ -482,7 +488,7 @@ fn write_scene_atomic(path: &Path, source: &str) -> Result<(), TitanError> {
             format!("failed to sync {}: {source}", path.display()),
         )
     })?;
-    file.persist(path).map_err(|error| {
+    file.persist(&target).map_err(|error| {
         TitanError::new(
             "TITAN_IO_WRITE",
             format!("failed to replace {}: {}", path.display(), error.error),
