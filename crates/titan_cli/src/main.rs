@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -315,7 +316,7 @@ fn run_scene(command: SceneCommand, json: bool) -> Result<ExitCode, TitanError> 
             pointer,
             value,
         } => {
-            let document = match load_valid_scene(&path) {
+            let document = match read_scene(&path) {
                 Ok(document) => document,
                 Err(SceneLoadError::Tsf(error)) => {
                     report_scene_error(&error, json);
@@ -331,12 +332,7 @@ fn run_scene(command: SceneCommand, json: bool) -> Result<ExitCode, TitanError> 
             })?;
             match titan_scene::edit(&document, &pointer, &value) {
                 Ok(new_source) => {
-                    fs::write(&path, &new_source).map_err(|source| {
-                        TitanError::new(
-                            "TITAN_IO_WRITE",
-                            format!("failed to write {}: {source}", path.display()),
-                        )
-                    })?;
+                    write_scene_atomic(&path, &new_source)?;
                     let diff = line_diff(&old_source, &new_source);
                     if json {
                         print_json(&SceneEditOutput {
@@ -404,12 +400,7 @@ fn run_scene(command: SceneCommand, json: bool) -> Result<ExitCode, TitanError> 
                 }
             } else {
                 if !canonical {
-                    fs::write(&path, &new_source).map_err(|source| {
-                        TitanError::new(
-                            "TITAN_IO_WRITE",
-                            format!("failed to write {}: {source}", path.display()),
-                        )
-                    })?;
+                    write_scene_atomic(&path, &new_source)?;
                 }
                 if json {
                     print_json(&SceneFmtOutput {
@@ -443,6 +434,44 @@ fn load_valid_scene(path: &Path) -> Result<Document, SceneLoadError> {
     let document = read_scene(path)?;
     titan_scene::validate(&document).map_err(SceneLoadError::Tsf)?;
     Ok(document)
+}
+
+fn write_scene_atomic(path: &Path, source: &str) -> Result<(), TitanError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|source| {
+        TitanError::new(
+            "TITAN_IO_WRITE",
+            format!(
+                "failed to create temporary file for {}: {source}",
+                path.display()
+            ),
+        )
+    })?;
+    file.write_all(source.as_bytes()).map_err(|source| {
+        TitanError::new(
+            "TITAN_IO_WRITE",
+            format!("failed to write {}: {source}", path.display()),
+        )
+    })?;
+    file.flush().map_err(|source| {
+        TitanError::new(
+            "TITAN_IO_WRITE",
+            format!("failed to flush {}: {source}", path.display()),
+        )
+    })?;
+    file.as_file().sync_all().map_err(|source| {
+        TitanError::new(
+            "TITAN_IO_WRITE",
+            format!("failed to sync {}: {source}", path.display()),
+        )
+    })?;
+    file.persist(path).map_err(|error| {
+        TitanError::new(
+            "TITAN_IO_WRITE",
+            format!("failed to replace {}: {}", path.display(), error.error),
+        )
+    })?;
+    Ok(())
 }
 
 fn report_scene_error(error: &TsfError, json: bool) {

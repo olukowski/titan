@@ -147,6 +147,37 @@ fn edit_updates_one_line_and_leaves_file_canonical() {
 }
 
 #[test]
+fn edit_can_repair_parseable_invalid_scene() {
+    let dir = TempDir::new().expect("tempdir");
+    let invalid = MOVING_ENTITY.replace("linear: [0.1, 0.0, 0.0]", "linear: [0.1, 'bad', 0.0]");
+    let path = write_scene(&dir, "repairable.tsf", &invalid);
+    let path_str = path_string(&path);
+
+    titan()
+        .args(["scene", "validate", path_str.as_str()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TSF_SCHEMA"));
+
+    titan()
+        .args([
+            "scene",
+            "edit",
+            path_str.as_str(),
+            "/entities/entity:mover/components/velocity/linear/1",
+            "0.0",
+        ])
+        .assert()
+        .success()
+        .stderr("");
+
+    titan()
+        .args(["scene", "validate", path_str.as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
 fn fmt_check_reports_canonical_and_noncanonical_files() {
     let dir = TempDir::new().expect("tempdir");
     let canonical = write_scene(&dir, "canonical.tsf", MOVING_ENTITY);
