@@ -30,6 +30,8 @@ struct Validator<'a> {
 
 impl Validator<'_> {
     fn validate_document(&mut self, document: &Document) {
+        self.validate_unique_keys(&document.root, "");
+
         let root = match object_members(&document.root) {
             Some(members) => members,
             None => {
@@ -84,6 +86,31 @@ impl Validator<'_> {
         }
         self.validate_numbers(&document.root, "");
         self.validate_refs(&document.root, "");
+    }
+
+    fn validate_unique_keys(&mut self, value: &Value, path: &str) {
+        match &value.kind {
+            ValueKind::Object(members) => {
+                let mut keys = HashSet::new();
+                for member in members {
+                    if !keys.insert(member.key.as_str()) {
+                        self.push(
+                            "TSF_DUPLICATE_KEY",
+                            format!("duplicate object key '{}'", member.key),
+                            path,
+                            member.key_span,
+                        );
+                    }
+                    self.validate_unique_keys(&member.value, &json_pointer_join(path, &member.key));
+                }
+            }
+            ValueKind::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    self.validate_unique_keys(value, &format!("{path}/{index}"));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn validate_scene(&mut self, value: &Value) {
@@ -541,7 +568,7 @@ fn valid_relative_path(path: &str) -> bool {
         && !path.contains(':')
         && Path::new(path)
             .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+            .all(|component| matches!(component, Component::Normal(_) | Component::ParentDir))
 }
 
 fn entity_path(entity: &Value, index: usize) -> String {

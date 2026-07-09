@@ -46,6 +46,25 @@ fn duplicate_key_fails_before_validation() {
 }
 
 #[test]
+fn direct_duplicate_keys_fail_validation() {
+    let mut document = parse(Some("duplicate-public.tsf"), MOVING_ENTITY).expect("parse");
+    let ValueKind::Object(root) = &mut document.root.kind else {
+        unreachable!("fixture root is an object");
+    };
+    let duplicate = root
+        .iter()
+        .find(|member| member.key == "scene")
+        .expect("scene")
+        .clone();
+    root.push(duplicate);
+
+    let error = validate(&document).expect_err("duplicate public keys should fail");
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_DUPLICATE_KEY" && diagnostic.path.is_empty()
+    }));
+}
+
+#[test]
 fn broken_asset_reference_is_diagnostic() {
     let source = MOVING_ENTITY.replace(
         "assets: {},",
@@ -103,7 +122,7 @@ fn malformed_external_references_are_diagnostic() {
 fn non_relative_external_references_are_diagnostic() {
     let source = MOVING_ENTITY.replace(
         "assets: {},",
-        "assets: {},\n  absolute_file: { ref: \"file:/tmp/mesh.tgeo\" },\n  parent_scene: { ref: \"scene:../scene.tsf#entity:mover\" },",
+        "assets: {},\n  absolute_file: { ref: \"file:/tmp/mesh.tgeo\" },\n  current_scene: { ref: \"scene:./scene.tsf#entity:mover\" },",
     );
     let document = parse(Some("bad-external-ref.tsf"), &source).expect("parse");
     let error = validate(&document).expect_err("non-relative external references should fail");
@@ -112,8 +131,19 @@ fn non_relative_external_references_are_diagnostic() {
         diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/absolute_file/ref"
     }));
     assert!(error.errors.iter().any(|diagnostic| {
-        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/parent_scene/ref"
+        diagnostic.code == "TSF_BROKEN_REF" && diagnostic.path == "/current_scene/ref"
     }));
+}
+
+#[test]
+fn parent_relative_paths_are_valid() {
+    let source = MOVING_ENTITY.replace(
+        "assets: {},",
+        "assets: { mesh: { path: \"../assets/cube.tgeo\", kind: \"geometry\" } },\n  external_mesh: { ref: \"file:../assets/cube.tgeo\" },\n  external_scene: { ref: \"scene:../scenes/other.tsf#entity:mover\" },",
+    );
+    let document = parse(Some("parent-relative.tsf"), &source).expect("parse");
+
+    validate(&document).expect("parent-relative paths should validate");
 }
 
 #[test]
