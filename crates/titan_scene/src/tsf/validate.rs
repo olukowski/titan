@@ -5,7 +5,7 @@ use super::{
     Diagnostic, Document, Member, Span, TsfError, TsfResult, Value, ValueKind, diagnostic,
     fits_f32_without_underflow, json_pointer_join, normalized_quaternion,
 };
-use crate::registry::TsfComponentRegistry;
+use crate::registry::{Diagnostics, TsfComponentRegistry};
 
 pub fn validate(document: &Document) -> TsfResult<()> {
     let uses_phase2 = document_contains_phase2_component(document);
@@ -44,7 +44,7 @@ pub fn validate_with_registry(
         errors: Vec::new(),
         asset_aliases: HashSet::new(),
         entity_ids: HashSet::new(),
-        registry,
+        registry: Some(registry),
     };
     validator.validate_document(document);
     if validator.errors.is_empty() {
@@ -59,7 +59,7 @@ struct Validator<'a> {
     errors: Vec<Diagnostic>,
     asset_aliases: HashSet<String>,
     entity_ids: HashSet<String>,
-    registry: &'a TsfComponentRegistry,
+    registry: Option<&'a TsfComponentRegistry>,
 }
 
 impl Validator<'_> {
@@ -348,7 +348,11 @@ impl Validator<'_> {
         };
         for component in members {
             let component_path = json_pointer_join(path, &component.key);
-            let Some(binding) = self.registry.binding(&component.key) else {
+            let Some(binding) = self
+                .registry
+                .expect("document validator has a registry")
+                .binding(&component.key)
+            else {
                 self.push(
                     "TSF_UNKNOWN_COMPONENT",
                     format!("unknown component '{}'", component.key),
@@ -358,17 +362,6 @@ impl Validator<'_> {
                 continue;
             };
             (binding.validate)(&component.value, &component_path, &mut self.errors);
-            match component.key.as_str() {
-                "transform" => self.validate_transform(&component.value, &component_path),
-                "velocity" => self.validate_velocity(&component.value, &component_path),
-                "camera" => self.validate_camera(&component.value, &component_path),
-                "directional_light" => {
-                    self.validate_directional_light(&component.value, &component_path)
-                }
-                "mesh" => self.validate_mesh(&component.value, &component_path),
-                "material" => self.validate_material(&component.value, &component_path),
-                _ => {}
-            }
         }
     }
 
@@ -1050,6 +1043,61 @@ impl Validator<'_> {
         self.errors
             .push(diagnostic(self.file, code, message, path, span));
     }
+}
+
+fn run_component_validator(
+    diagnostics: &mut Diagnostics,
+    validate: impl FnOnce(&mut Validator<'_>),
+) {
+    let mut validator = Validator {
+        file: None,
+        errors: Vec::new(),
+        asset_aliases: HashSet::new(),
+        entity_ids: HashSet::new(),
+        registry: None,
+    };
+    validate(&mut validator);
+    diagnostics.extend(validator.errors);
+}
+
+pub(crate) fn validate_transform_binding(value: &Value, path: &str, diagnostics: &mut Diagnostics) {
+    run_component_validator(diagnostics, |validator| {
+        validator.validate_transform(value, path)
+    });
+}
+
+pub(crate) fn validate_velocity_binding(value: &Value, path: &str, diagnostics: &mut Diagnostics) {
+    run_component_validator(diagnostics, |validator| {
+        validator.validate_velocity(value, path)
+    });
+}
+
+pub(crate) fn validate_camera_binding(value: &Value, path: &str, diagnostics: &mut Diagnostics) {
+    run_component_validator(diagnostics, |validator| {
+        validator.validate_camera(value, path)
+    });
+}
+
+pub(crate) fn validate_directional_light_binding(
+    value: &Value,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) {
+    run_component_validator(diagnostics, |validator| {
+        validator.validate_directional_light(value, path)
+    });
+}
+
+pub(crate) fn validate_mesh_binding(value: &Value, path: &str, diagnostics: &mut Diagnostics) {
+    run_component_validator(diagnostics, |validator| {
+        validator.validate_mesh(value, path)
+    });
+}
+
+pub(crate) fn validate_material_binding(value: &Value, path: &str, diagnostics: &mut Diagnostics) {
+    run_component_validator(diagnostics, |validator| {
+        validator.validate_material(value, path)
+    });
 }
 
 fn object_members(value: &Value) -> Option<&[Member]> {

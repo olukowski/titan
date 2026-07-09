@@ -7,8 +7,6 @@ use crate::tsf::{Diagnostic, Value};
 pub type Diagnostics = Vec<Diagnostic>;
 pub type TsfComponentValidator = fn(&Value, &str, &mut Diagnostics);
 
-fn no_op_validator(_: &Value, _: &str, _: &mut Diagnostics) {}
-
 /// A stable lowercase TSF alias for a registered component.
 #[derive(Clone, Copy, Debug)]
 pub struct TsfComponentBinding {
@@ -139,27 +137,18 @@ impl TsfComponentRegistry {
     }
 }
 
-pub const BUILTIN_COMPONENT_ORDER: [&str; 6] = [
-    "transform",
-    "velocity",
-    "camera",
-    "directional_light",
-    "mesh",
-    "material",
-];
-
 pub const PHASE1_BINDINGS: [TsfComponentBinding; 2] = [
     TsfComponentBinding {
         alias: "transform",
         registered_name: "titan.core.Transform",
         schema_version: 2,
-        validate: no_op_validator,
+        validate: crate::tsf::validate_transform_binding,
     },
     TsfComponentBinding {
         alias: "velocity",
         registered_name: "titan.core.Velocity",
         schema_version: 1,
-        validate: no_op_validator,
+        validate: crate::tsf::validate_velocity_binding,
     },
 ];
 
@@ -170,25 +159,25 @@ pub const PHASE2_BINDINGS: [TsfComponentBinding; 6] = [
         alias: "camera",
         registered_name: "titan.core.Camera",
         schema_version: 1,
-        validate: no_op_validator,
+        validate: crate::tsf::validate_camera_binding,
     },
     TsfComponentBinding {
         alias: "directional_light",
         registered_name: "titan.core.DirectionalLight",
         schema_version: 1,
-        validate: no_op_validator,
+        validate: crate::tsf::validate_directional_light_binding,
     },
     TsfComponentBinding {
         alias: "mesh",
         registered_name: "titan.core.Mesh",
         schema_version: 1,
-        validate: no_op_validator,
+        validate: crate::tsf::validate_mesh_binding,
     },
     TsfComponentBinding {
         alias: "material",
         registered_name: "titan.core.Material",
         schema_version: 1,
-        validate: no_op_validator,
+        validate: crate::tsf::validate_material_binding,
     },
 ];
 

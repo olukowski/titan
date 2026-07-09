@@ -186,14 +186,15 @@ fn load_components(
                 component.key_span,
             ));
         }
-        let payload = match component.key.as_str() {
-            "transform" => transform_payload(document, &component.value, &component_path)?,
-            "velocity" => velocity_payload(document, &component.value, &component_path)?,
-            "camera" => camera_or_mesh_payload(&component.value, true),
-            "mesh" => camera_or_mesh_payload(&component.value, false),
+        let payload = match binding.registered_name {
+            "titan.core.Transform" => {
+                transform_payload(document, &component.value, &component_path)?
+            }
+            "titan.core.Velocity" => velocity_payload(document, &component.value, &component_path)?,
             _ => component.value.to_json(),
         };
         loaded.push((
+            component.key.clone(),
             binding.registered_name,
             payload,
             component_path,
@@ -201,14 +202,21 @@ fn load_components(
         ));
     }
 
-    loaded.sort_by_key(|(_, _, path, _)| {
-        let alias = path.rsplit('/').next().unwrap_or_default();
-        crate::registry::BUILTIN_COMPONENT_ORDER
+    loaded.sort_by(|left, right| {
+        let left_rank = tsf_registry
+            .component_order()
             .iter()
-            .position(|item| *item == alias)
+            .position(|alias| *alias == left.0);
+        let right_rank = tsf_registry
+            .component_order()
+            .iter()
+            .position(|alias| *alias == right.0);
+        left_rank
             .unwrap_or(usize::MAX)
+            .cmp(&right_rank.unwrap_or(usize::MAX))
+            .then_with(|| left.0.cmp(&right.0))
     });
-    for (registered_name, payload, component_path, value_span) in loaded {
+    for (_, registered_name, payload, component_path, value_span) in loaded {
         world
             .insert_serialized(entity_id, registered_name, payload)
             .map_err(|error| {
@@ -222,39 +230,6 @@ fn load_components(
             })?;
     }
     Ok(())
-}
-
-fn camera_or_mesh_payload(value: &Value, camera: bool) -> serde_json::Value {
-    let mut payload = value.to_json();
-    if camera {
-        if let Some(viewport) = payload
-            .get_mut("viewport")
-            .and_then(|value| value.as_object_mut())
-        {
-            for field in ["width", "height"] {
-                if let Some(value) = viewport.get_mut(field)
-                    && let Some(integer) = value.as_f64().and_then(|value| {
-                        (value.is_finite() && value.fract() == 0.0 && value >= 0.0)
-                            .then_some(value as u64)
-                    })
-                {
-                    *value = serde_json::Value::Number(serde_json::Number::from(integer));
-                }
-            }
-        }
-    } else if let Some(submeshes) = payload
-        .get_mut("submeshes")
-        .and_then(|value| value.as_array_mut())
-    {
-        for value in submeshes {
-            if let Some(integer) = value.as_f64().and_then(|value| {
-                (value.is_finite() && value.fract() == 0.0 && value >= 0.0).then_some(value as u64)
-            }) {
-                *value = serde_json::Value::Number(serde_json::Number::from(integer));
-            }
-        }
-    }
-    payload
 }
 
 fn transform_payload(

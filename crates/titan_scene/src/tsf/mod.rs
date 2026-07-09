@@ -9,6 +9,10 @@ pub use format::{fmt, fmt_with_registry};
 pub use parse::parse;
 pub use path::{QueryResult, edit, query};
 pub use validate::{validate, validate_with_registry};
+pub(crate) use validate::{
+    validate_camera_binding, validate_directional_light_binding, validate_material_binding,
+    validate_mesh_binding, validate_transform_binding, validate_velocity_binding,
+};
 
 pub(crate) const QUATERNION_TOLERANCE: f32 = 1e-5;
 
@@ -161,6 +165,14 @@ impl Value {
         match &self.kind {
             ValueKind::Null => serde_json::Value::Null,
             ValueKind::Bool(value) => serde_json::Value::Bool(*value),
+            ValueKind::Number(number) if !number.had_fraction => {
+                let number = if number.value >= 0.0 {
+                    serde_json::Number::from(number.value as u64)
+                } else {
+                    serde_json::Number::from(number.value as i64)
+                };
+                serde_json::Value::Number(number)
+            }
             ValueKind::Number(number) => serde_json::Number::from_f64(number.value)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),

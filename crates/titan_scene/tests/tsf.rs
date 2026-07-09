@@ -1,7 +1,7 @@
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use titan_core::{
-    Camera, CameraProjection, Component, DirectionalLight, Material, Mesh, Transform, Velocity,
-    phase1_component_registry, phase2_component_registry,
+    Camera, CameraProjection, Component, DirectionalLight, EventKind, Material, Mesh, Transform,
+    Velocity, phase1_component_registry, phase2_component_registry,
 };
 use titan_scene::{
     Diagnostic, DiagnosticSpan, TsfComponentBinding, TsfComponentRegistry,
@@ -149,6 +149,43 @@ fn custom_registry_drives_validation_and_missing_runtime_type_diagnostic() {
 }
 
 #[test]
+fn custom_camera_alias_preserves_integer_json_values() {
+    let registry = TsfComponentRegistry::new(
+        titan_core::phase2_component_registry().unwrap(),
+        [TsfComponentBinding {
+            alias: "lens",
+            registered_name: "titan.core.Camera",
+            schema_version: 1,
+            validate: |_value, _path, _diagnostics| {},
+        }],
+    )
+    .unwrap();
+    let document = parse(
+        Some("custom-camera.tsf"),
+        &phase2_source(
+            "lens: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, viewport: { width: 640, height: 480 } }",
+        ),
+    )
+    .unwrap();
+
+    let world = load_world(&document, registry).expect("custom camera alias should load");
+    let camera = world
+        .get::<Camera>(titan_core::EntityId::from_raw(1))
+        .unwrap()
+        .expect("camera should be inserted");
+    match camera.projection {
+        CameraProjection::Perspective {
+            viewport: Some(viewport),
+            ..
+        } => {
+            assert_eq!(viewport.width, 640);
+            assert_eq!(viewport.height, 480);
+        }
+        projection => panic!("unexpected projection: {projection:?}"),
+    }
+}
+
+#[test]
 fn projection_material_mesh_viewport_and_submesh_schema_rules_are_enforced() {
     assert_schema(
         "camera: { projection: \"perspective\", vertical_fov_degrees: 60, near: 0.1, far: 10, height: 2 }",
@@ -261,11 +298,22 @@ fn formatter_uses_supplied_registry_component_order() {
     .unwrap();
     let document = parse(
         None,
-        "{ tsf: 1, scene: { id: \"scene:test\" }, assets: {}, entities: [{ id: \"entity:test\", components: { transform: {}, mesh: {} } }] }",
+        "{ tsf: 1, scene: { id: \"scene:test\" }, assets: { cube: { path: \"cube.mesh\", kind: \"geometry\" } }, entities: [{ id: \"entity:test\", components: { transform: { translation: [0, 0, 0] }, mesh: { geometry: { ref: \"asset:cube\" } } } }] }",
     )
     .unwrap();
     let formatted = fmt_with_registry(&document, &registry);
-    assert!(formatted.find("mesh: {}").unwrap() < formatted.find("transform: {}").unwrap());
+    assert!(formatted.find("mesh:").unwrap() < formatted.find("transform:").unwrap());
+    let world = load_world(&document, registry).expect("custom registry should load");
+    let inserted: Vec<_> = world
+        .event_log()
+        .records()
+        .iter()
+        .filter_map(|record| match &record.kind {
+            EventKind::ComponentInserted { component, .. } => Some(component.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inserted, ["titan.core.Mesh", "titan.core.Transform"]);
 }
 
 #[test]
