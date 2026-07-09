@@ -114,11 +114,13 @@ Component mapping to ECS:
 
 IDs are stable across formatting and editing; runtime entity handles are never
 serialized. References are objects with one `ref` string, not bare strings, so
-they can grow later without changing the data model. Reference prefixes are
-`entity:<id>` for same-scene entities, `asset:<alias>` for top-level assets,
-`scene:<path>#entity:<id>` for another scene file, and `file:<relative-path>`
-for direct file references. Relative paths resolve from the containing `.tsf`
-file's directory and are normalized to forward slashes by `titan scene fmt`.
+they can grow later without changing the data model. Entity references use the
+full serialized entity ID, such as `entity:box`, for same-scene entities.
+Reference prefixes are `asset:<alias>` for top-level assets,
+`scene:<path>#entity:<slug>` for another scene file, and
+`file:<relative-path>` for direct file references. Relative paths resolve from
+the containing `.tsf` file's directory and are normalized to forward slashes by
+`titan scene fmt`.
 
 Canonical ordering and formatting:
 
