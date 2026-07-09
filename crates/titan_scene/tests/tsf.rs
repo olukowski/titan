@@ -1,4 +1,4 @@
-use titan_scene::{edit, fmt, parse, query, validate};
+use titan_scene::{Number, ValueKind, edit, fmt, parse, query, validate};
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
 
@@ -128,6 +128,20 @@ fn asset_alias_named_ref_is_not_a_reference_object() {
 }
 
 #[test]
+fn absolute_asset_paths_are_diagnostic() {
+    let source = MOVING_ENTITY.replace(
+        "assets: {},",
+        "assets: { mesh: { path: \"/tmp/mesh.tgeo\", kind: \"geometry\" } },",
+    );
+    let document = parse(Some("absolute-asset-path.tsf"), &source).expect("parse");
+    let error = validate(&document).expect_err("absolute asset path should fail");
+
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/assets/mesh/path"
+    }));
+}
+
+#[test]
 fn invalid_entity_parent_is_diagnostic() {
     let source = MOVING_ENTITY.replace(
         "      id: \"entity:mover\",\n",
@@ -149,6 +163,58 @@ fn invalid_entity_parent_is_diagnostic() {
 
     assert!(error.errors.iter().any(|diagnostic| {
         diagnostic.code == "TSF_SCHEMA" && diagnostic.path == "/entities/entity:mover/parent"
+    }));
+}
+
+#[test]
+fn direct_non_finite_numbers_are_diagnostic() {
+    let mut document = parse(Some("nonfinite.tsf"), MOVING_ENTITY).expect("parse");
+    let ValueKind::Object(root) = &mut document.root.kind else {
+        unreachable!("fixture root is an object");
+    };
+    let entities = root
+        .iter_mut()
+        .find(|member| member.key == "entities")
+        .expect("entities");
+    let ValueKind::Array(entities) = &mut entities.value.kind else {
+        unreachable!("entities is an array");
+    };
+    let ValueKind::Object(entity) = &mut entities[0].kind else {
+        unreachable!("entity is an object");
+    };
+    let components = entity
+        .iter_mut()
+        .find(|member| member.key == "components")
+        .expect("components");
+    let ValueKind::Object(components) = &mut components.value.kind else {
+        unreachable!("components is an object");
+    };
+    let velocity = components
+        .iter_mut()
+        .find(|member| member.key == "velocity")
+        .expect("velocity");
+    let ValueKind::Object(velocity) = &mut velocity.value.kind else {
+        unreachable!("velocity is an object");
+    };
+    let linear = velocity
+        .iter_mut()
+        .find(|member| member.key == "linear")
+        .expect("linear");
+    let ValueKind::Array(linear) = &mut linear.value.kind else {
+        unreachable!("linear is an array");
+    };
+    let ValueKind::Number(number) = &mut linear[0].kind else {
+        unreachable!("linear[0] is a number");
+    };
+    *number = Number {
+        value: f64::NAN,
+        had_fraction: true,
+    };
+
+    let error = validate(&document).expect_err("non-finite number should fail");
+    assert!(error.errors.iter().any(|diagnostic| {
+        diagnostic.code == "TSF_INVALID_NUMBER"
+            && diagnostic.path == "/entities/0/components/velocity/linear/0"
     }));
 }
 

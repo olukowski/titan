@@ -82,6 +82,7 @@ impl Validator<'_> {
         if let Some(entities) = member(root, "entities") {
             self.validate_entities(&entities.value);
         }
+        self.validate_numbers(&document.root, "");
         self.validate_refs(&document.root, "");
     }
 
@@ -158,6 +159,17 @@ impl Validator<'_> {
                         asset.value.span,
                     ),
                 }
+            }
+            if let Some(entry) = member(asset_members, "path")
+                && let Some(path_value) = string_value(&entry.value)
+                && !valid_relative_path(path_value)
+            {
+                self.push(
+                    "TSF_SCHEMA",
+                    "asset.path must be a relative normalized path",
+                    json_pointer_join(&path, "path"),
+                    entry.value.span,
+                );
             }
         }
     }
@@ -441,6 +453,28 @@ impl Validator<'_> {
                 format!("{path}/ref"),
                 span,
             );
+        }
+    }
+
+    fn validate_numbers(&mut self, value: &Value, path: &str) {
+        match &value.kind {
+            ValueKind::Number(number) if !number.value.is_finite() => self.push(
+                "TSF_INVALID_NUMBER",
+                "number must be finite",
+                path,
+                value.span,
+            ),
+            ValueKind::Object(members) => {
+                for member in members {
+                    self.validate_numbers(&member.value, &json_pointer_join(path, &member.key));
+                }
+            }
+            ValueKind::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    self.validate_numbers(value, &format!("{path}/{index}"));
+                }
+            }
+            _ => {}
         }
     }
 
