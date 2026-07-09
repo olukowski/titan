@@ -189,6 +189,8 @@ fn load_components(
         let payload = match component.key.as_str() {
             "transform" => transform_payload(document, &component.value, &component_path)?,
             "velocity" => velocity_payload(document, &component.value, &component_path)?,
+            "camera" => camera_or_mesh_payload(&component.value, true),
+            "mesh" => camera_or_mesh_payload(&component.value, false),
             _ => component.value.to_json(),
         };
         loaded.push((
@@ -220,6 +222,39 @@ fn load_components(
             })?;
     }
     Ok(())
+}
+
+fn camera_or_mesh_payload(value: &Value, camera: bool) -> serde_json::Value {
+    let mut payload = value.to_json();
+    if camera {
+        if let Some(viewport) = payload
+            .get_mut("viewport")
+            .and_then(|value| value.as_object_mut())
+        {
+            for field in ["width", "height"] {
+                if let Some(value) = viewport.get_mut(field)
+                    && let Some(integer) = value.as_f64().and_then(|value| {
+                        (value.is_finite() && value.fract() == 0.0 && value >= 0.0)
+                            .then_some(value as u64)
+                    })
+                {
+                    *value = serde_json::Value::Number(serde_json::Number::from(integer));
+                }
+            }
+        }
+    } else if let Some(submeshes) = payload
+        .get_mut("submeshes")
+        .and_then(|value| value.as_array_mut())
+    {
+        for value in submeshes {
+            if let Some(integer) = value.as_f64().and_then(|value| {
+                (value.is_finite() && value.fract() == 0.0 && value >= 0.0).then_some(value as u64)
+            }) {
+                *value = serde_json::Value::Number(serde_json::Number::from(integer));
+            }
+        }
+    }
+    payload
 }
 
 fn transform_payload(

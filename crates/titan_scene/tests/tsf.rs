@@ -1,6 +1,6 @@
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use titan_core::{
-    Camera, Component, DirectionalLight, Material, Mesh, Transform, Velocity,
+    Camera, CameraProjection, Component, DirectionalLight, Material, Mesh, Transform, Velocity,
     phase1_component_registry, phase2_component_registry,
 };
 use titan_scene::{
@@ -8,8 +8,8 @@ use titan_scene::{
     TsfComponentRegistryError, validate_with_registry,
 };
 use titan_scene::{
-    Number, ValueKind, edit, fmt, load_world, load_world_with_runtime_registry, parse, query,
-    validate,
+    Number, ValueKind, edit, fmt, fmt_with_registry, load_world, load_world_with_runtime_registry,
+    parse, query, validate,
 };
 
 const MOVING_ENTITY: &str = include_str!("fixtures/moving_entity.tsf");
@@ -199,9 +199,9 @@ fn phase2_components_validate_format_and_insert_as_typed_values() {
     id: "entity:cube",
     components: {
       material: { model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] },
-      mesh: { geometry: { ref: "asset:cube_mesh" } },
+      mesh: { geometry: { ref: "asset:cube_mesh" }, submeshes: [0, 3] },
       directional_light: { color: [1.0, 1.0, 1.0], illuminance: 1.0, ambient: 0.05 },
-      camera: { projection: "perspective", vertical_fov_degrees: 60.0, near: 0.1, far: 100.0 },
+      camera: { projection: "perspective", vertical_fov_degrees: 60.0, near: 0.1, far: 100.0, viewport: { width: 640, height: 480 } },
       velocity: { linear: [0.0, 0.0, 0.0] },
       transform: { translation: [0.0, 0.0, 0.0] },
     },
@@ -220,6 +220,52 @@ fn phase2_components_validate_format_and_insert_as_typed_values() {
     assert!(world.get::<Material>(entity).unwrap().is_some());
     assert!(world.get::<Transform>(entity).unwrap().is_some());
     assert!(world.get::<Velocity>(entity).unwrap().is_some());
+    assert_eq!(
+        world.get::<Mesh>(entity).unwrap().unwrap().submeshes,
+        Some(vec![0, 3])
+    );
+    assert_eq!(
+        world.get::<Camera>(entity).unwrap().unwrap().projection,
+        CameraProjection::Perspective {
+            vertical_fov_degrees: 60.0,
+            near: 0.1,
+            far: 100.0,
+            viewport: Some(titan_core::Viewport {
+                width: 640,
+                height: 480
+            }),
+        }
+    );
+}
+
+#[test]
+fn formatter_uses_supplied_registry_component_order() {
+    let core = titan_core::phase2_component_registry().unwrap();
+    let registry = TsfComponentRegistry::new(
+        core,
+        [
+            titan_scene::TsfComponentBinding {
+                alias: "mesh",
+                registered_name: "titan.core.Mesh",
+                schema_version: 1,
+                validate: |_value, _path, _diagnostics| {},
+            },
+            titan_scene::TsfComponentBinding {
+                alias: "transform",
+                registered_name: "titan.core.Transform",
+                schema_version: 2,
+                validate: |_value, _path, _diagnostics| {},
+            },
+        ],
+    )
+    .unwrap();
+    let document = parse(
+        None,
+        "{ tsf: 1, scene: { id: \"scene:test\" }, assets: {}, entities: [{ id: \"entity:test\", components: { transform: {}, mesh: {} } }] }",
+    )
+    .unwrap();
+    let formatted = fmt_with_registry(&document, &registry);
+    assert!(formatted.find("mesh: {}").unwrap() < formatted.find("transform: {}").unwrap());
 }
 
 #[test]

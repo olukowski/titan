@@ -60,6 +60,7 @@ impl std::error::Error for TsfComponentRegistryError {}
 pub struct TsfComponentRegistry {
     component_registry: ComponentRegistry,
     by_alias: BTreeMap<&'static str, TsfComponentBinding>,
+    component_order: Vec<&'static str>,
 }
 
 pub trait IntoTsfComponentRegistry {
@@ -84,6 +85,7 @@ impl TsfComponentRegistry {
         bindings: impl IntoIterator<Item = TsfComponentBinding>,
     ) -> Result<Self, TsfComponentRegistryError> {
         let mut by_alias = BTreeMap::new();
+        let mut component_order = Vec::new();
         let mut names = BTreeMap::new();
         for binding in bindings {
             if by_alias.insert(binding.alias, binding).is_some() {
@@ -94,6 +96,7 @@ impl TsfComponentRegistry {
                     binding.registered_name,
                 ));
             }
+            component_order.push(binding.alias);
             let meta = component_registry
                 .meta_by_name(binding.registered_name)
                 .map_err(|_| {
@@ -112,6 +115,7 @@ impl TsfComponentRegistry {
         Ok(Self {
             component_registry,
             by_alias,
+            component_order,
         })
     }
 
@@ -126,6 +130,9 @@ impl TsfComponentRegistry {
     }
     pub fn bindings(&self) -> impl Iterator<Item = &TsfComponentBinding> {
         self.by_alias.values()
+    }
+    pub(crate) fn component_order(&self) -> &[&'static str] {
+        &self.component_order
     }
     pub fn into_component_registry(self) -> ComponentRegistry {
         self.component_registry
