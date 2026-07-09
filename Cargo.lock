@@ -374,6 +374,8 @@ version = "0.1.0"
 name = "titan_scene"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "titan_core",
 ]
 

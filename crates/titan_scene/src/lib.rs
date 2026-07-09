@@ -1,5 +1,12 @@
 //! Scene graph types for Titan's text-first authoring pipeline.
 
+pub mod tsf;
+
+pub use tsf::{
+    Diagnostic, DiagnosticSpan, Document, Position, QueryResult, Span, TsfError, TsfResult, Value,
+    edit, fmt, parse, query, validate,
+};
+
 use titan_core::{EntityId, Transform};
 
 /// A named scene containing entities.
