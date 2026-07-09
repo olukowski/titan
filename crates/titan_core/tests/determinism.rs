@@ -14,7 +14,7 @@ fn seeded_motion_system(
         transform.translation.y += rng.next_f32() * velocity.linear.x;
     }
     if ctx.frame == 1 {
-        let spawned = EntityId::from_raw(1000);
+        let spawned = EntityId::from_raw(1000 + rng.next_u64() % 1000);
         commands.spawn_with_id(spawned);
         commands.insert(
             spawned,
@@ -65,9 +65,10 @@ fn same_seed_produces_byte_identical_state_and_structural_event_dumps() {
 }
 
 #[test]
-fn different_seeds_produce_different_state_dumps_in_test_local_seeded_system() {
+fn different_seeds_produce_different_state_and_event_dumps_in_test_local_seeded_system() {
     let first = run(1);
     let second = run(2);
 
     assert_ne!(first.0, second.0);
+    assert_ne!(first.1, second.1);
 }
