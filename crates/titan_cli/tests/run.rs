@@ -277,6 +277,69 @@ fn event_log_jsonl_records_loading_events_in_stable_order() {
     assert_eq!(lines[2]["component"], "titan.core.Velocity");
 }
 
+#[test]
+fn event_log_is_stable_across_scene_component_order() {
+    let dir = temp_dir("event_log_component_order");
+    let first_scene = dir.join("first.tsf");
+    let second_scene = dir.join("second.tsf");
+    let first_log = dir.join("first.jsonl");
+    let second_log = dir.join("second.jsonl");
+
+    fs::write(
+        &first_scene,
+        r#"{
+  tsf: 1,
+  scene: { id: "scene:tests/component_order" },
+  assets: {},
+  entities: [
+    {
+      id: "entity:mover",
+      components: {
+        transform: { translation: [0.0, 0.0, 0.0] },
+        velocity: { linear: [0.1, 0.0, 0.0] },
+      },
+    },
+  ],
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &second_scene,
+        r#"{
+  tsf: 1,
+  scene: { id: "scene:tests/component_order" },
+  assets: {},
+  entities: [
+    {
+      id: "entity:mover",
+      components: {
+        velocity: { linear: [0.1, 0.0, 0.0] },
+        transform: { translation: [0.0, 0.0, 0.0] },
+      },
+    },
+  ],
+}
+"#,
+    )
+    .unwrap();
+
+    for (scene, log) in [(&first_scene, &first_log), (&second_scene, &second_log)] {
+        titan()
+            .args(["run"])
+            .arg(scene)
+            .args(["--headless", "--frames", "0", "--event-log"])
+            .arg(log)
+            .assert()
+            .success();
+    }
+
+    assert_eq!(
+        fs::read(&first_log).unwrap(),
+        fs::read(&second_log).unwrap()
+    );
+}
+
 fn run_to_dump(path: &Path, seed: &str) {
     titan()
         .args([

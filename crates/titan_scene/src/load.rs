@@ -113,6 +113,7 @@ fn load_components(
             value.span,
         )
     })?;
+    let mut loaded = Vec::new();
     for component in members {
         let component_path = json_pointer_join(path, &component.key);
         let (registered_name, payload) = match component.key.as_str() {
@@ -134,6 +135,16 @@ fn load_components(
                 ));
             }
         };
+        loaded.push((
+            registered_name,
+            payload,
+            component_path,
+            component.value.span,
+        ));
+    }
+
+    loaded.sort_by_key(|(registered_name, _, _, _)| *registered_name);
+    for (registered_name, payload, component_path, value_span) in loaded {
         world
             .insert_serialized(entity_id, registered_name, payload)
             .map_err(|error| {
@@ -142,7 +153,7 @@ fn load_components(
                     "TSF_COMPONENT_DESERIALIZE",
                     error.to_string(),
                     component_path,
-                    component.value.span,
+                    value_span,
                 )
             })?;
     }
