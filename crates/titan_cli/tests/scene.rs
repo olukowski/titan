@@ -177,6 +177,32 @@ fn edit_can_repair_parseable_invalid_scene() {
         .success();
 }
 
+#[cfg(unix)]
+#[test]
+fn fmt_preserves_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = write_scene(
+        &dir,
+        "permissions.tsf",
+        "{ entities: [], assets: {}, scene: { name: 'Demo', id: 'scene:demo' }, tsf: 1 }\n",
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("set fixture mode");
+    let path_str = path_string(&path);
+
+    titan()
+        .args(["scene", "fmt", path_str.as_str()])
+        .assert()
+        .success();
+
+    let mode = fs::metadata(&path)
+        .expect("read formatted scene metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o640);
+}
+
 #[test]
 fn fmt_check_reports_canonical_and_noncanonical_files() {
     let dir = TempDir::new().expect("tempdir");

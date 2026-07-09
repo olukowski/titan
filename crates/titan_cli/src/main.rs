@@ -438,6 +438,14 @@ fn load_valid_scene(path: &Path) -> Result<Document, SceneLoadError> {
 
 fn write_scene_atomic(path: &Path, source: &str) -> Result<(), TitanError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let permissions = fs::metadata(path)
+        .map_err(|source| {
+            TitanError::new(
+                "TITAN_IO_WRITE",
+                format!("failed to read metadata for {}: {source}", path.display()),
+            )
+        })?
+        .permissions();
     let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|source| {
         TitanError::new(
             "TITAN_IO_WRITE",
@@ -459,6 +467,14 @@ fn write_scene_atomic(path: &Path, source: &str) -> Result<(), TitanError> {
             format!("failed to flush {}: {source}", path.display()),
         )
     })?;
+    file.as_file()
+        .set_permissions(permissions)
+        .map_err(|source| {
+            TitanError::new(
+                "TITAN_IO_WRITE",
+                format!("failed to set permissions for {}: {source}", path.display()),
+            )
+        })?;
     file.as_file().sync_all().map_err(|source| {
         TitanError::new(
             "TITAN_IO_WRITE",
