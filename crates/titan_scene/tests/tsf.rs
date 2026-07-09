@@ -1,3 +1,4 @@
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use titan_core::{Component, Transform, phase1_component_registry};
 use titan_scene::{Number, ValueKind, edit, fmt, load_world, parse, query, validate};
 
@@ -469,7 +470,7 @@ fn formatter_orders_and_canonicalizes_transform_rotation() {
     validate(&document).expect("validate");
     let formatted = fmt(&document);
     assert!(formatted.find("translation:").unwrap() < formatted.find("rotation:").unwrap());
-    assert!(formatted.contains("rotation: [0.0, 0.0, 0.7071067690849304, 0.7071067690849304]"));
+    assert!(formatted.contains("rotation: [0.0, 0.0, 0.707111, 0.707111]"));
 }
 
 #[test]
@@ -488,6 +489,47 @@ fn formatter_is_idempotent_for_near_unit_rotations() {
         let reparsed = parse(None, &first).expect("parse formatted scene");
         let second = fmt(&reparsed);
         assert_eq!(second, first, "formatter was not idempotent for {rotation}");
+    }
+}
+
+#[test]
+fn formatter_is_idempotent_for_seeded_random_near_unit_rotations() {
+    let mut rng = StdRng::seed_from_u64(0x5eed_cafe);
+
+    for case in 0..2_000 {
+        let mut components = [
+            rng.random_range(-1.0_f64..=1.0),
+            rng.random_range(-1.0_f64..=1.0),
+            rng.random_range(-1.0_f64..=1.0),
+            rng.random_range(-1.0_f64..=1.0),
+        ];
+        let norm = components
+            .iter()
+            .map(|component| component * component)
+            .sum::<f64>()
+            .sqrt();
+        if norm == 0.0 {
+            components[3] = 1.0;
+        } else {
+            for component in &mut components {
+                *component /= norm;
+            }
+        }
+        let rotation = format!(
+            "[{:.8}, {:.8}, {:.8}, {:.8}]",
+            components[0], components[1], components[2], components[3]
+        );
+        let document = parse(None, &transform_scene(&rotation)).expect("parse generated scene");
+        validate(&document).unwrap_or_else(|error| panic!("validate case {case}: {error:?}"));
+        let first = fmt(&document);
+        let reparsed = parse(None, &first).expect("parse formatted generated scene");
+        validate(&reparsed)
+            .unwrap_or_else(|error| panic!("validate formatted case {case}: {error:?}"));
+        let second = fmt(&reparsed);
+        assert_eq!(
+            second, first,
+            "formatter was not idempotent for case {case}: {rotation}"
+        );
     }
 }
 

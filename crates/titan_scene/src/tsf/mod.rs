@@ -28,8 +28,7 @@ pub(crate) fn normalized_quaternion(rotation: [f32; 4]) -> Option<[f32; 4]> {
         return None;
     }
 
-    // Normalize in f64, then round once to f32. This makes formatting a fixpoint:
-    // parsing the emitted f32 values and formatting them again produces the same bytes.
+    // Normalize in f64, then round once to f32 for the loader's runtime value.
     let norm = rotation
         .iter()
         .map(|component| f64::from(*component) * f64::from(*component))

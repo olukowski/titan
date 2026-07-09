@@ -77,7 +77,7 @@ fn write_object(out: &mut String, members: &[Member], indent: usize, context: Co
         write_key(out, &member.key);
         out.push_str(": ");
         if context == Context::Component("transform") && member.key == "rotation" {
-            write_normalized_rotation(out, &member.value, indent + 2);
+            write_value(out, &member.value, indent + 2, Context::Other);
         } else {
             write_value(
                 out,
@@ -152,24 +152,6 @@ fn normalized_rotation(value: &Value) -> Option<[f32; 4]> {
         }
     }
     normalized_quaternion(rotation)
-}
-
-fn write_normalized_rotation(out: &mut String, value: &Value, indent: usize) {
-    let Some(rotation) = normalized_rotation(value) else {
-        write_value(out, value, indent, Context::Other);
-        return;
-    };
-    out.push('[');
-    for (index, component) in rotation.iter().enumerate() {
-        if index > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&format_number(&Number {
-            value: f64::from(*component),
-            had_fraction: true,
-        }));
-    }
-    out.push(']');
 }
 
 fn rank(context: Context<'_>, key: &str) -> usize {

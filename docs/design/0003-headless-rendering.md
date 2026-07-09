@@ -113,7 +113,7 @@ only `translation` and loads as identity rotation; a v2 payload may omit
 `rotation` and has the same identity default, or may provide the four-number
 quaternion. A canonical TSF formatter orders `translation` before `rotation`
 and omits identity rotation (the default is therefore not emitted); it emits a
-non-identity rotation in deterministically normalized `[x, y, z, w]` order.
+non-identity rotation in `[x, y, z, w]` order using the parsed values verbatim.
 Typed v2 state dumps
 always report `schema_version: 2` and include the normalized `rotation` in
 `value`, including identity, so a dump is self-describing. The loader accepts
