@@ -5,12 +5,14 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use titan_core::{Component, EntityId, Transform, Velocity, World};
 use titan_math::Vec3;
 
 /// Stable codes used by structured renderer diagnostics.
 pub mod error {
+    // These phase-1 codes are transitional; reconcile them with the design
+    // document's final error taxonomy when the backend lands in step 2.
     pub const CAMERA_UNAVAILABLE: &str = "RENDER_CAMERA_UNAVAILABLE";
     pub const CAPTURE_UNAVAILABLE: &str = "RENDER_CAPTURE_UNAVAILABLE";
     pub const INVALID_OUTPUT_SIZE: &str = "RENDER_INVALID_OUTPUT_SIZE";
@@ -62,7 +64,7 @@ pub enum CameraSelection {
 }
 
 /// Requested output dimensions.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct OutputSize {
     pub width: u32,
     pub height: u32,
@@ -155,12 +157,11 @@ pub struct RenderResult {
     pub rgba8: Option<Vec<u8>>,
 }
 
-/// Metadata for components understood by extraction. `tsf_alias` is an
-/// explicit extension point for the alias registry owned by `titan_scene`.
+/// Metadata for components understood by extraction. TSF aliases remain owned
+/// exclusively by the alias registry in `titan_scene`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderComponentMetadata {
     pub registered_name: &'static str,
-    pub tsf_alias: Option<&'static str>,
     pub schema_version: u32,
 }
 
@@ -176,12 +177,10 @@ impl RenderComponentRegistry {
             components: vec![
                 RenderComponentMetadata {
                     registered_name: Transform::NAME,
-                    tsf_alias: None,
                     schema_version: Transform::SCHEMA_VERSION,
                 },
                 RenderComponentMetadata {
                     registered_name: Velocity::NAME,
-                    tsf_alias: None,
                     schema_version: Velocity::SCHEMA_VERSION,
                 },
             ],
@@ -200,11 +199,14 @@ pub fn extract_scene(world: &World) -> RenderScene {
         .map(|(entity, transform)| ExtractedEntity {
             entity,
             transform: *transform,
-            velocity: world
-                .get::<Velocity>(entity)
-                .ok()
-                .flatten()
-                .map(|velocity| velocity.linear),
+            velocity: match world.get::<Velocity>(entity) {
+                Ok(Some(velocity)) => Some(velocity.linear),
+                Ok(None) => None,
+                Err(error) => {
+                    debug_assert!(false, "velocity lookup failed: {error}");
+                    None
+                }
+            },
         })
         .collect();
 
@@ -215,18 +217,27 @@ pub fn extract_scene(world: &World) -> RenderScene {
 }
 
 /// Headless render service boundary. Backend ownership arrives in a later PR.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RenderService {
     pub components: RenderComponentRegistry,
 }
 
 impl RenderService {
+    /// Creates the stateless phase-1 CPU renderer.
+    ///
+    /// Step 2 will add a fallible, device-backed constructor (for adapter and
+    /// device acquisition) and interior-mutable resource caches. Keeping the
+    /// render operation shared-reference based now leaves that cache boundary
+    /// explicit without making phase-1 construction pretend to acquire a GPU.
     pub fn new() -> Self {
         Self {
             components: RenderComponentRegistry::phase1(),
         }
     }
 
+    /// Renders from the phase-1 stateless CPU plan. The `&self` boundary is
+    /// intentional: step 2's caches will use interior mutability while its
+    /// fallible device-backed constructor reports `RENDER_NO_ADAPTER`.
     pub fn render(&self, world: &World, request: RenderRequest) -> ServiceResult<RenderResult> {
         if request.output_size.width == 0 || request.output_size.height == 0 {
             return Err(RenderError::new(
@@ -260,6 +271,12 @@ impl RenderService {
             scene,
             rgba8: None,
         })
+    }
+}
+
+impl Default for RenderService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -314,5 +331,55 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, error::INVALID_OUTPUT_SIZE);
+
+        let error = RenderService::new()
+            .render(
+                &world,
+                RenderRequest {
+                    output_size: OutputSize::new(10, 0),
+                    ..RenderRequest::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, error::INVALID_OUTPUT_SIZE);
+
+        let error = RenderService::new()
+            .render(
+                &world,
+                RenderRequest {
+                    camera: CameraSelection::Entity(EntityId::from_raw(7)),
+                    ..RenderRequest::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, error::CAMERA_UNAVAILABLE);
+
+        let error = RenderService::new()
+            .render(
+                &world,
+                RenderRequest {
+                    capture: CaptureMode::Image,
+                    ..RenderRequest::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, error::CAPTURE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn default_service_registers_phase1_components() {
+        assert_eq!(
+            RenderService::default().components,
+            RenderService::new().components
+        );
+        assert_eq!(RenderService::default().components.components().len(), 2);
+        assert_eq!(
+            RenderService::default().components.components()[0].registered_name,
+            Transform::NAME
+        );
+        assert_eq!(
+            RenderService::default().components.components()[1].registered_name,
+            Velocity::NAME
+        );
     }
 }
