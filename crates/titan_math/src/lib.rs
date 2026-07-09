@@ -2,8 +2,10 @@
 
 use std::ops::{Add, Sub};
 
+use serde::{Deserialize, Serialize};
+
 /// A three-dimensional vector using `f32` components.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Vec3 {
     /// X axis component.
     pub x: f32,

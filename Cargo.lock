@@ -363,12 +363,17 @@ dependencies = [
 name = "titan_core"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "titan_math",
 ]
 
 [[package]]
 name = "titan_math"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "titan_scene"
