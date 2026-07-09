@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/titan_cli",
+    "crates/titan_core",
+    "crates/titan_math",
+    "crates/titan_scene",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/titan-engine/titan"
+
+[workspace.dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+titan_core = { path = "crates/titan_core" }
+titan_math = { path = "crates/titan_math" }
+titan_scene = { path = "crates/titan_scene" }
