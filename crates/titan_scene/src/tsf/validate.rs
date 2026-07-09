@@ -8,31 +8,9 @@ use super::{
 use crate::registry::{Diagnostics, TsfComponentRegistry};
 
 pub fn validate(document: &Document) -> TsfResult<()> {
-    let uses_phase2 = document_contains_phase2_component(document);
-    let registry = if uses_phase2 {
-        crate::registry::phase2_component_registry()
-            .expect("built-in TSF registry must be constructible")
-    } else {
-        crate::registry::phase1_component_registry()
-            .expect("built-in TSF registry must be constructible")
-    };
+    let registry = crate::registry::phase2_component_registry()
+        .expect("built-in TSF registry must be constructible");
     validate_with_registry(document, &registry)
-}
-
-fn document_contains_phase2_component(document: &Document) -> bool {
-    fn visit(value: &Value) -> bool {
-        match &value.kind {
-            ValueKind::Object(members) => members.iter().any(|member| {
-                matches!(
-                    member.key.as_str(),
-                    "camera" | "directional_light" | "mesh" | "material"
-                ) || visit(&member.value)
-            }),
-            ValueKind::Array(values) => values.iter().any(visit),
-            _ => false,
-        }
-    }
-    visit(&document.root)
 }
 
 pub fn validate_with_registry(

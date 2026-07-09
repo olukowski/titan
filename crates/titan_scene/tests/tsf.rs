@@ -317,6 +317,43 @@ fn formatter_uses_supplied_registry_component_order() {
 }
 
 #[test]
+fn formatter_uses_registered_component_identity_for_custom_aliases() {
+    let registry = TsfComponentRegistry::new(
+        titan_core::phase2_component_registry().unwrap(),
+        [
+            titan_scene::TsfComponentBinding {
+                alias: "lens",
+                registered_name: "titan.core.Camera",
+                schema_version: 1,
+                validate: |_value, _path, _diagnostics| {},
+            },
+            titan_scene::TsfComponentBinding {
+                alias: "pose",
+                registered_name: "titan.core.Transform",
+                schema_version: 2,
+                validate: |_value, _path, _diagnostics| {},
+            },
+        ],
+    )
+    .unwrap();
+    let document = parse(
+        None,
+        "{ tsf: 1, scene: { id: \"scene:test\" }, assets: {}, entities: [{ id: \"entity:test\", components: { lens: { viewport: { height: 480, width: 640 }, far: 10, near: 0.1, vertical_fov_degrees: 60, projection: \"perspective\" }, pose: { rotation: [0, 0, 0, 1], translation: [0, 0, 0] } } }] }",
+    )
+    .unwrap();
+
+    let formatted = fmt_with_registry(&document, &registry);
+    let lens = formatted.find("lens:").unwrap();
+    assert!(
+        formatted[lens..].find("projection:").unwrap()
+            < formatted[lens..].find("viewport:").unwrap()
+    );
+    let pose = formatted.find("pose:").unwrap();
+    assert!(formatted[pose..].find("translation:").is_some());
+    assert!(!formatted.contains("rotation:"));
+}
+
+#[test]
 fn load_world_assigns_scene_entity_ids_independent_of_array_order() {
     let first = parse(
         Some("ordered.tsf"),
@@ -898,6 +935,57 @@ fn formatter_preserves_nonzero_exponent_numbers() {
     let formatted = fmt(&document);
 
     assert!(formatted.contains("value: 1e-100"));
+}
+
+#[test]
+fn json_conversion_uses_mathematical_integrality() {
+    let document = parse(
+        None,
+        "{ decimal: 1e-1, exponent_integer: 1e2, trailing_fraction: 100.0 }",
+    )
+    .expect("parse numbers");
+
+    assert_eq!(
+        query(&document, "/decimal").unwrap().value,
+        serde_json::json!(0.1)
+    );
+    assert_eq!(
+        query(&document, "/exponent_integer").unwrap().value,
+        serde_json::json!(100)
+    );
+    assert_eq!(
+        query(&document, "/trailing_fraction").unwrap().value,
+        serde_json::json!(100)
+    );
+}
+
+#[test]
+fn exponent_and_trailing_fraction_spellings_load_typed_camera_and_mesh_values() {
+    let document = parse(
+        None,
+        &phase2_source(
+            "camera: { projection: \"perspective\", vertical_fov_degrees: 6e1, near: 1e-1, far: 1e2, viewport: { width: 6.4e2, height: 4.8e2 } }, mesh: { geometry: { ref: \"asset:cube\" }, submeshes: [0e0, 3.0] }",
+        ),
+    )
+    .unwrap();
+    let world = load_world(&document, phase2_component_registry().unwrap()).expect("load");
+    let entity = titan_core::EntityId::from_raw(1);
+    assert_eq!(
+        world.get::<Camera>(entity).unwrap().unwrap().projection,
+        CameraProjection::Perspective {
+            vertical_fov_degrees: 60.0,
+            near: 0.1,
+            far: 100.0,
+            viewport: Some(titan_core::Viewport {
+                width: 640,
+                height: 480,
+            }),
+        }
+    );
+    assert_eq!(
+        world.get::<Mesh>(entity).unwrap().unwrap().submeshes,
+        Some(vec![0, 3])
+    );
 }
 
 #[test]

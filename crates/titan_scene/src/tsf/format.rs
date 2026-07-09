@@ -17,7 +17,7 @@ pub fn fmt_with_registry(document: &Document, registry: &TsfComponentRegistry) -
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Context<'a> {
+enum Context {
     Top,
     Scene,
     Assets,
@@ -25,7 +25,7 @@ enum Context<'a> {
     Entities,
     Entity,
     Components,
-    Component(&'a str),
+    Component(&'static str),
     Other,
 }
 
@@ -33,7 +33,7 @@ fn write_value(
     out: &mut String,
     value: &Value,
     indent: usize,
-    context: Context<'_>,
+    context: Context,
     registry: &TsfComponentRegistry,
 ) {
     write_comments(out, &value.comments, indent);
@@ -51,7 +51,7 @@ fn write_array(
     out: &mut String,
     values: &[Value],
     indent: usize,
-    context: Context<'_>,
+    context: Context,
     registry: &TsfComponentRegistry,
 ) {
     if values.is_empty() {
@@ -88,7 +88,7 @@ fn write_object(
     out: &mut String,
     members: &[Member],
     indent: usize,
-    context: Context<'_>,
+    context: Context,
     registry: &TsfComponentRegistry,
 ) {
     if members.is_empty() {
@@ -101,7 +101,7 @@ fn write_object(
         push_indent(out, indent + 2);
         write_key(out, &member.key);
         out.push_str(": ");
-        if context == Context::Component("transform") && member.key == "rotation" {
+        if context == Context::Component("titan.core.Transform") && member.key == "rotation" {
             write_value(out, &member.value, indent + 2, Context::Other, registry);
         } else {
             write_value(
@@ -118,11 +118,7 @@ fn write_object(
     out.push('}');
 }
 
-fn child_context<'a>(
-    context: Context<'a>,
-    key: &'a str,
-    registry: &TsfComponentRegistry,
-) -> Context<'a> {
+fn child_context(context: Context, key: &str, registry: &TsfComponentRegistry) -> Context {
     match context {
         Context::Top => match key {
             "scene" => Context::Scene,
@@ -132,20 +128,22 @@ fn child_context<'a>(
         },
         Context::Assets => Context::Asset,
         Context::Entity if key == "components" => Context::Components,
-        Context::Components if registry.binding(key).is_some() => Context::Component(key),
+        Context::Components => registry.binding(key).map_or(Context::Other, |binding| {
+            Context::Component(binding.registered_name)
+        }),
         _ => Context::Other,
     }
 }
 
 fn ordered_members<'a>(
     members: &'a [Member],
-    context: Context<'_>,
+    context: Context,
     registry: &TsfComponentRegistry,
 ) -> Vec<&'a Member> {
     let mut ordered: Vec<_> = members
         .iter()
         .filter(|member| {
-            !(context == Context::Component("transform")
+            !(context == Context::Component("titan.core.Transform")
                 && member.key == "rotation"
                 && rotation_is_identity(&member.value))
         })
@@ -188,7 +186,7 @@ fn normalized_rotation(value: &Value) -> Option<[f32; 4]> {
     normalized_quaternion(rotation)
 }
 
-fn rank(context: Context<'_>, key: &str, registry: &TsfComponentRegistry) -> usize {
+fn rank(context: Context, key: &str, registry: &TsfComponentRegistry) -> usize {
     match context {
         Context::Top => ["tsf", "scene", "assets", "entities"]
             .iter()
@@ -207,15 +205,15 @@ fn rank(context: Context<'_>, key: &str, registry: &TsfComponentRegistry) -> usi
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("transform") => ["translation", "rotation"]
+        Context::Component("titan.core.Transform") => ["translation", "rotation"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("velocity") => ["linear"]
+        Context::Component("titan.core.Velocity") => ["linear"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("camera") => [
+        Context::Component("titan.core.Camera") => [
             "projection",
             "vertical_fov_degrees",
             "height",
@@ -226,18 +224,20 @@ fn rank(context: Context<'_>, key: &str, registry: &TsfComponentRegistry) -> usi
         .iter()
         .position(|candidate| *candidate == key)
         .unwrap_or(1000),
-        Context::Component("directional_light") => ["color", "illuminance", "ambient"]
+        Context::Component("titan.core.DirectionalLight") => ["color", "illuminance", "ambient"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("mesh") => ["geometry", "submeshes"]
+        Context::Component("titan.core.Mesh") => ["geometry", "submeshes"]
             .iter()
             .position(|candidate| *candidate == key)
             .unwrap_or(1000),
-        Context::Component("material") => ["model", "base_color", "metallic", "roughness"]
-            .iter()
-            .position(|candidate| *candidate == key)
-            .unwrap_or(1000),
+        Context::Component("titan.core.Material") => {
+            ["model", "base_color", "metallic", "roughness"]
+                .iter()
+                .position(|candidate| *candidate == key)
+                .unwrap_or(1000)
+        }
         _ => 1000,
     }
 }

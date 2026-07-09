@@ -165,13 +165,21 @@ impl Value {
         match &self.kind {
             ValueKind::Null => serde_json::Value::Null,
             ValueKind::Bool(value) => serde_json::Value::Bool(*value),
-            ValueKind::Number(number) if !number.had_fraction => {
-                let number = if number.value >= 0.0 {
-                    serde_json::Number::from(number.value as u64)
-                } else {
-                    serde_json::Number::from(number.value as i64)
-                };
-                serde_json::Value::Number(number)
+            ValueKind::Number(number)
+                if number.value.is_finite()
+                    && number.value.fract() == 0.0
+                    && number.value >= 0.0
+                    && number.value < 18_446_744_073_709_551_616.0 =>
+            {
+                serde_json::Value::Number(serde_json::Number::from(number.value as u64))
+            }
+            ValueKind::Number(number)
+                if number.value.is_finite()
+                    && number.value.fract() == 0.0
+                    && number.value >= i64::MIN as f64
+                    && number.value < 0.0 =>
+            {
+                serde_json::Value::Number(serde_json::Number::from(number.value as i64))
             }
             ValueKind::Number(number) => serde_json::Number::from_f64(number.value)
                 .map(serde_json::Value::Number)
