@@ -263,6 +263,14 @@ pub struct World {
     seed: u64,
     scene_entity_ids: BTreeMap<String, u64>,
     scene_entity_names: BTreeMap<String, Vec<EntityId>>,
+    scene_assets: BTreeMap<String, AssetEntry>,
+}
+
+/// A scene asset declaration retained for renderer and other asset consumers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AssetEntry {
+    pub path: String,
+    pub kind: String,
 }
 
 impl World {
@@ -279,6 +287,7 @@ impl World {
             seed: 0,
             scene_entity_ids: BTreeMap::new(),
             scene_entity_names: BTreeMap::new(),
+            scene_assets: BTreeMap::new(),
         }
     }
 
@@ -510,6 +519,14 @@ impl World {
         entities.sort_unstable();
         entities.retain(|entity| self.entities.contains(entity));
         entities
+    }
+
+    pub fn set_scene_asset(&mut self, alias: impl Into<String>, asset: AssetEntry) {
+        self.scene_assets.insert(alias.into(), asset);
+    }
+
+    pub fn scene_asset(&self, alias: &str) -> Option<&AssetEntry> {
+        self.scene_assets.get(alias)
     }
 
     fn require_entity(&self, id: EntityId) -> Result<()> {

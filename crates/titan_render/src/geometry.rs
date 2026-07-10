@@ -115,7 +115,7 @@ pub fn cube_v1() -> MeshAsset {
                     uv,
                 }),
         );
-        indices.extend([start, start + 1, start + 2, start, start + 2, start + 3]);
+        indices.extend([start, start + 2, start + 1, start, start + 3, start + 2]);
     }
     MeshAsset {
         vertices,
@@ -220,6 +220,32 @@ mod tests {
                 face.iter().map(|vertex| vertex.uv).collect::<Vec<_>>(),
                 [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
             );
+        }
+        for triangle in first.indices.chunks_exact(3) {
+            assert!(
+                triangle
+                    .iter()
+                    .all(|&index| (index as usize) < first.vertices.len())
+            );
+            let a = first.vertices[triangle[0] as usize].position;
+            let b = first.vertices[triangle[1] as usize].position;
+            let c = first.vertices[triangle[2] as usize].position;
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let geometric_normal = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let stored_normal = first.vertices[triangle[0] as usize].normal;
+            let agreement = geometric_normal[0] * stored_normal[0]
+                + geometric_normal[1] * stored_normal[1]
+                + geometric_normal[2] * stored_normal[2];
+            let outward = geometric_normal[0] * a[0]
+                + geometric_normal[1] * a[1]
+                + geometric_normal[2] * a[2];
+            assert!(agreement > 0.0);
+            assert!(outward > 0.0);
         }
         assert!(
             first
