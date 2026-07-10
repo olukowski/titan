@@ -179,7 +179,7 @@ impl GpuContext {
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("titan unlit and basic pbr shaders"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                "struct Uniforms { mvp: mat4x4<f32>, model: mat4x4<f32>, normal_matrix: mat4x4<f32>, camera_position: vec4<f32>, base_color: vec4<f32>, light_color: vec4<f32>, light_direction: vec4<f32>, params: vec4<f32> };\n@group(0) @binding(0) var<uniform> uniforms: Uniforms;\nstruct VertexIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };\nstruct VertexOut { @builtin(position) position: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) world_position: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> VertexOut { var out: VertexOut; let world = uniforms.model * vec4<f32>(vertex.position, 1.0); out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); out.normal = normalize((uniforms.normal_matrix * vec4<f32>(vertex.normal, 0.0)).xyz); out.world_position = world.xyz; return out; }\n@fragment fn fs(in: VertexOut) -> @location(0) vec4<f32> { let base = uniforms.base_color.rgb; if (uniforms.params.x < 0.5) { return vec4<f32>(base, uniforms.base_color.a); } let n = normalize(in.normal); let l = normalize(-uniforms.light_direction.xyz); let v = normalize(uniforms.camera_position.xyz - in.world_position); let diffuse = max(dot(n, l), 0.0); let metallic = uniforms.params.y; let roughness = max(uniforms.params.z, 0.04); let ambient = uniforms.params.w; let light = uniforms.light_color.rgb * uniforms.light_color.a * diffuse; let f0 = mix(vec3<f32>(0.04), base, metallic); let specular = f0 * pow(max(dot(reflect(-l, n), v), 0.0), 2.0 / (roughness * roughness)); return vec4<f32>(base * (ambient + light * (1.0 - metallic)) + specular * light, uniforms.base_color.a); }\n",
+                "struct Uniforms { mvp: mat4x4<f32>, model: mat4x4<f32>, normal_matrix: mat4x4<f32>, camera_position: vec4<f32>, base_color: vec4<f32>, light_color: vec4<f32>, light_direction: vec4<f32>, params: vec4<f32> };\n@group(0) @binding(0) var<uniform> uniforms: Uniforms;\nstruct UnlitIn { @location(0) position: vec3<f32>, @location(1) uv: vec2<f32> };\nstruct PbrIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };\nstruct UnlitOut { @builtin(position) position: vec4<f32> };\nstruct PbrOut { @builtin(position) position: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) world_position: vec3<f32> };\n@vertex fn vs_unlit(vertex: UnlitIn) -> UnlitOut { var out: UnlitOut; out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); return out; }\n@vertex fn vs_pbr(vertex: PbrIn) -> PbrOut { var out: PbrOut; let world = uniforms.model * vec4<f32>(vertex.position, 1.0); out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); out.normal = normalize((uniforms.normal_matrix * vec4<f32>(vertex.normal, 0.0)).xyz); out.world_position = world.xyz; return out; }\n@fragment fn fs_unlit() -> @location(0) vec4<f32> { return uniforms.base_color; }\n@fragment fn fs(in: PbrOut) -> @location(0) vec4<f32> { let base = uniforms.base_color.rgb; let n = normalize(in.normal); let l = normalize(-uniforms.light_direction.xyz); let v = normalize(uniforms.camera_position.xyz - in.world_position); let diffuse = max(dot(n, l), 0.0); let metallic = uniforms.params.y; let roughness = max(uniforms.params.z, 0.04); let ambient = uniforms.params.w; let light = uniforms.light_color.rgb * uniforms.light_color.a * diffuse; let f0 = mix(vec3<f32>(0.04), base, metallic); let specular = f0 * pow(max(dot(reflect(-l, n), v), 0.0), 2.0 / (roughness * roughness)); return vec4<f32>(base * (ambient + light * (1.0 - metallic)) + specular * light, uniforms.base_color.a); }\n",
             )),
         });
         let bind_layout = self
@@ -283,12 +283,27 @@ impl GpuContext {
                     .geometry
                     .vertices
                     .iter()
-                    .flat_map(|vertex| {
-                        vertex
+                    .enumerate()
+                    .flat_map(|(index, vertex)| {
+                        let mut values = vertex
                             .position
                             .into_iter()
-                            .chain(vertex.normal)
                             .chain(vertex.uv)
+                            .collect::<Vec<_>>();
+                        if matches!(item.material.model, MaterialModel::Pbr) {
+                            values = vertex
+                                .position
+                                .into_iter()
+                                .chain(
+                                    item.geometry
+                                        .normals
+                                        .as_ref()
+                                        .expect("validated PBR normals")[index],
+                                )
+                                .chain(vertex.uv)
+                                .collect();
+                        }
+                        values
                     })
                     .flat_map(f32::to_ne_bytes)
                     .collect::<Vec<_>>();
@@ -315,7 +330,7 @@ impl GpuContext {
                 (vertex_buffer, index_buffer)
             })
             .collect::<Vec<_>>();
-        let pipeline = self
+        let pbr_pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("titan first draw pipeline"),
@@ -328,7 +343,7 @@ impl GpuContext {
                 )),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs"),
+                    entry_point: Some("vs_pbr"),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: 32,
                         step_mode: wgpu::VertexStepMode::Vertex,
@@ -355,6 +370,65 @@ impl GpuContext {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
+                    front_face: wgpu::FrontFace::Cw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let unlit_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("titan unlit draw layout"),
+                bind_group_layouts: &[Some(&bind_layout)],
+                immediate_size: 0,
+            });
+        let unlit_pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("titan unlit pipeline"),
+                layout: Some(&unlit_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_unlit"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 20,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_unlit"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8UnormSrgb,
                         blend: None,
@@ -423,12 +497,15 @@ impl GpuContext {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&pipeline);
             for ((item, (vertex_buffer, index_buffer)), (_, bind_group)) in draw_list
                 .iter()
                 .zip(mesh_buffers.iter())
                 .zip(bind_groups.iter())
             {
+                pass.set_pipeline(match item.material.model {
+                    MaterialModel::Unlit => &unlit_pipeline,
+                    MaterialModel::Pbr => &pbr_pipeline,
+                });
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);

@@ -816,16 +816,18 @@ fn stats_for_scene(
 }
 
 fn validate_normals(mesh: &MeshAsset) -> ServiceResult<()> {
-    if mesh.vertices.is_empty() {
+    let Some(normals) = mesh.normals.as_ref() else {
         return Err(RenderError::new(
             error::MISSING_NORMALS,
             "pbr mesh has no normals",
         ));
-    }
-    if mesh.vertices.iter().any(|vertex| {
-        vertex.normal.iter().any(|value| !value.is_finite())
-            || (vertex.normal.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() > 1e-4
-    }) {
+    };
+    if normals.len() != mesh.vertices.len()
+        || normals.iter().any(|normal| {
+            normal.iter().any(|value| !value.is_finite())
+                || (normal.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() > 1e-4
+        })
+    {
         return Err(RenderError::new(
             error::INVALID_NORMALS,
             "pbr mesh normals must be finite unit vectors",
@@ -887,6 +889,80 @@ mod tests {
             metallic: None,
             roughness: None,
         }
+    }
+
+    fn render_with_geometry(geometry: MeshAsset, material: Material) -> ServiceResult<RenderScene> {
+        let mut world = world_with_camera();
+        world.set_scene_asset(
+            "test",
+            titan_core::AssetEntry {
+                path: "test.mesh".into(),
+                kind: "geometry".into(),
+            },
+        );
+        let entity = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.insert(entity, Transform::default()).unwrap();
+        world
+            .insert(
+                entity,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:test"),
+                    submeshes: None,
+                },
+            )
+            .unwrap();
+        world.insert(entity, material).unwrap();
+        let scene = extract_scene_with_resolver(&world, |_| Ok(geometry.clone()))?;
+        validate_material(&scene.draw_list[0].material)?;
+        Ok(scene)
+    }
+
+    #[test]
+    fn unlit_mesh_without_normals_is_renderable() {
+        let mut geometry = cube_v1();
+        geometry.normals = None;
+        let scene = render_with_geometry(geometry, default_test_material()).unwrap();
+        assert_eq!(
+            stats_for_scene(&scene, EntityId::from_raw(1), 0).visible_meshes,
+            1
+        );
+    }
+
+    #[test]
+    fn pbr_mesh_without_normals_reports_missing_normals() {
+        let mut geometry = cube_v1();
+        geometry.normals = None;
+        let scene = render_with_geometry(
+            geometry,
+            Material {
+                model: MaterialModel::Pbr,
+                base_color: [1.0, 0.0, 0.0, 1.0],
+                metallic: Some(0.0),
+                roughness: Some(1.0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            validate_normals(&scene.draw_list[0].geometry)
+                .unwrap_err()
+                .code,
+            error::MISSING_NORMALS
+        );
+    }
+
+    #[test]
+    fn pbr_mesh_with_invalid_normals_reports_invalid_normals() {
+        let mut geometry = cube_v1();
+        geometry.normals = Some(vec![[f32::NAN, 0.0, 0.0]; geometry.vertices.len()]);
+        assert_eq!(
+            validate_normals(&geometry).unwrap_err().code,
+            error::INVALID_NORMALS
+        );
+        geometry.normals = Some(vec![[2.0, 0.0, 0.0]; geometry.vertices.len()]);
+        assert_eq!(
+            validate_normals(&geometry).unwrap_err().code,
+            error::INVALID_NORMALS
+        );
     }
 
     #[test]
@@ -1298,11 +1374,11 @@ mod tests {
             vertices: vec![
                 MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 };
                 6
             ],
+            normals: None,
             indices: vec![0; 9],
             submeshes: vec![
                 Submesh {
@@ -1359,9 +1435,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: u32::MAX,
@@ -1371,9 +1447,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: 1,
@@ -1383,9 +1459,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: 0,
@@ -1395,9 +1471,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![1, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: 0,
@@ -1406,15 +1482,16 @@ mod tests {
             },
             MeshAsset {
                 vertices: Vec::new(),
+                normals: None,
                 indices: Vec::new(),
                 submeshes: Vec::new(),
             },
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: Vec::new(),
             },
