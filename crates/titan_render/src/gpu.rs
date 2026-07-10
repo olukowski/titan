@@ -4,7 +4,17 @@ use std::env;
 
 use serde::Serialize;
 
-use crate::{DrawItem, Mat4, OutputSize, RenderError, ServiceResult, error, validate_output_size};
+use crate::{
+    DirectionalLightData, DrawItem, Mat4, MaterialModel, OutputSize, RenderError, ServiceResult,
+    error, validate_output_size,
+};
+
+const UNIFORM_SIZE: usize = 272;
+const MVP_OFFSET: usize = 0;
+const MODEL_OFFSET: usize = 64;
+const NORMAL_MATRIX_OFFSET: usize = 128;
+const CAMERA_POSITION_OFFSET: usize = 192;
+const BASE_COLOR_OFFSET: usize = 208;
 
 /// The graphics backend selected for a Titan GPU context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -162,12 +172,14 @@ impl GpuContext {
         clear: [f32; 4],
         view_projection: [[f32; 4]; 4],
         draw_list: &[DrawItem],
+        light: Option<DirectionalLightData>,
+        camera_position: [f32; 3],
     ) -> ServiceResult<Vec<u8>> {
         let targets = self.create_render_targets(size)?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("titan first draw shader"),
+            label: Some("titan unlit and basic pbr shaders"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                "@group(0) @binding(0) var<uniform> camera: mat4x4<f32>;\nstruct VertexIn { @location(0) position: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> @builtin(position) vec4<f32> { return camera * vec4<f32>(vertex.position, 1.0); }\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.95, 0.2, 0.08, 1.0); }\n",
+                "struct Uniforms { mvp: mat4x4<f32>, model: mat4x4<f32>, normal_matrix: mat4x4<f32>, camera_position: vec4<f32>, base_color: vec4<f32>, light_color: vec4<f32>, light_direction: vec4<f32>, params: vec4<f32> };\n@group(0) @binding(0) var<uniform> uniforms: Uniforms;\nstruct UnlitIn { @location(0) position: vec3<f32>, @location(1) uv: vec2<f32> };\nstruct PbrIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };\nstruct UnlitOut { @builtin(position) position: vec4<f32> };\nstruct PbrOut { @builtin(position) position: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) world_position: vec3<f32> };\n@vertex fn vs_unlit(vertex: UnlitIn) -> UnlitOut { var out: UnlitOut; out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); return out; }\n@vertex fn vs_pbr(vertex: PbrIn) -> PbrOut { var out: PbrOut; let world = uniforms.model * vec4<f32>(vertex.position, 1.0); out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); out.normal = normalize((uniforms.normal_matrix * vec4<f32>(vertex.normal, 0.0)).xyz); out.world_position = world.xyz; return out; }\n@fragment fn fs_unlit() -> @location(0) vec4<f32> { return uniforms.base_color; }\n@fragment fn fs(in: PbrOut) -> @location(0) vec4<f32> { let base = uniforms.base_color.rgb; let n = normalize(in.normal); let l = normalize(-uniforms.light_direction.xyz); let v = normalize(uniforms.camera_position.xyz - in.world_position); let diffuse = max(dot(n, l), 0.0); let metallic = uniforms.params.y; let roughness = max(uniforms.params.z, 0.04); let ambient = uniforms.params.w; let light = uniforms.light_color.rgb * uniforms.light_color.a * diffuse; let f0 = mix(vec3<f32>(0.04), base, metallic); let specular = f0 * pow(max(dot(reflect(-l, n), v), 0.0), 2.0 / (roughness * roughness)); return vec4<f32>(base * (ambient + light * (1.0 - metallic)) + specular * light, uniforms.base_color.a); }\n",
             )),
         });
         let bind_layout = self
@@ -176,11 +188,11 @@ impl GpuContext {
                 label: Some("titan camera layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        min_binding_size: std::num::NonZeroU64::new(UNIFORM_SIZE as u64),
                     },
                     count: None,
                 }],
@@ -191,14 +203,67 @@ impl GpuContext {
                 let matrix = (Mat4(view_projection) * item.model).transpose().0;
                 let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("titan draw transform uniform"),
-                    size: 64,
+                    size: UNIFORM_SIZE as u64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let mut bytes = [0u8; 64];
-                for (index, value) in matrix.iter().flatten().enumerate() {
-                    bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
-                }
+                let material = item.material;
+                let model = match material.model {
+                    MaterialModel::Unlit => 0.0,
+                    MaterialModel::Pbr => 1.0,
+                };
+                let metallic = material.metallic.unwrap_or(0.0);
+                let roughness = material.roughness.unwrap_or(1.0);
+                let selected = light.unwrap_or(DirectionalLightData {
+                    entity: titan_core::EntityId::from_raw(0),
+                    direction: [0.0, 0.0, 1.0],
+                    color: [0.0, 0.0, 0.0],
+                    illuminance: 0.0,
+                    ambient: 0.08,
+                });
+                let values = [
+                    [
+                        material.base_color[0],
+                        material.base_color[1],
+                        material.base_color[2],
+                        material.base_color[3],
+                    ],
+                    [
+                        selected.color[0],
+                        selected.color[1],
+                        selected.color[2],
+                        selected.illuminance,
+                    ],
+                    [
+                        selected.direction[0],
+                        selected.direction[1],
+                        selected.direction[2],
+                        0.0,
+                    ],
+                    [
+                        model,
+                        metallic,
+                        roughness,
+                        if light.is_some() {
+                            selected.ambient
+                        } else {
+                            0.08
+                        },
+                    ],
+                ];
+                let camera = [
+                    camera_position[0],
+                    camera_position[1],
+                    camera_position[2],
+                    0.0,
+                ];
+                let bytes = pack_uniform_bytes(
+                    matrix,
+                    item.model,
+                    Mat4::normal_from_model(item.model),
+                    camera,
+                    values,
+                );
                 self.queue.write_buffer(&uniform, 0, &bytes);
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("titan draw transform bind group"),
@@ -218,7 +283,28 @@ impl GpuContext {
                     .geometry
                     .vertices
                     .iter()
-                    .flat_map(|vertex| vertex.position)
+                    .enumerate()
+                    .flat_map(|(index, vertex)| {
+                        let mut values = vertex
+                            .position
+                            .into_iter()
+                            .chain(vertex.uv)
+                            .collect::<Vec<_>>();
+                        if matches!(item.material.model, MaterialModel::Pbr) {
+                            values = vertex
+                                .position
+                                .into_iter()
+                                .chain(
+                                    item.geometry
+                                        .normals
+                                        .as_ref()
+                                        .expect("validated PBR normals")[index],
+                                )
+                                .chain(vertex.uv)
+                                .collect();
+                        }
+                        values
+                    })
                     .flat_map(f32::to_ne_bytes)
                     .collect::<Vec<_>>();
                 let index_bytes = item
@@ -244,7 +330,7 @@ impl GpuContext {
                 (vertex_buffer, index_buffer)
             })
             .collect::<Vec<_>>();
-        let pipeline = self
+        let pbr_pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("titan first draw pipeline"),
@@ -257,21 +343,92 @@ impl GpuContext {
                 )),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs"),
+                    entry_point: Some("vs_pbr"),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: 12,
+                        array_stride: 32,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        }],
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 24,
+                                shader_location: 2,
+                            },
+                        ],
                     })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
+                    front_face: wgpu::FrontFace::Cw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let unlit_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("titan unlit draw layout"),
+                bind_group_layouts: &[Some(&bind_layout)],
+                immediate_size: 0,
+            });
+        let unlit_pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("titan unlit pipeline"),
+                layout: Some(&unlit_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_unlit"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 20,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_unlit"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8UnormSrgb,
                         blend: None,
@@ -340,12 +497,15 @@ impl GpuContext {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&pipeline);
             for ((item, (vertex_buffer, index_buffer)), (_, bind_group)) in draw_list
                 .iter()
                 .zip(mesh_buffers.iter())
                 .zip(bind_groups.iter())
             {
+                pass.set_pipeline(match item.material.model {
+                    MaterialModel::Unlit => &unlit_pipeline,
+                    MaterialModel::Pbr => &pbr_pipeline,
+                });
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -410,7 +570,6 @@ impl GpuContext {
     }
 
     /// Creates an sRGB color target and a depth target for an offscreen pass.
-    #[allow(dead_code, reason = "consumed by the later render-pass implementation")]
     pub(crate) fn create_render_targets(
         &self,
         size: OutputSize,
@@ -445,6 +604,41 @@ impl GpuContext {
     }
 }
 
+fn pack_uniform_bytes(
+    mvp: [[f32; 4]; 4],
+    model: Mat4,
+    normal_matrix: Mat4,
+    camera_position: [f32; 4],
+    values: [[f32; 4]; 4],
+) -> [u8; UNIFORM_SIZE] {
+    let mut bytes = [0u8; UNIFORM_SIZE];
+    for (offset, matrix) in [
+        (MVP_OFFSET, mvp),
+        (MODEL_OFFSET, model.transpose().0),
+        (NORMAL_MATRIX_OFFSET, normal_matrix.transpose().0),
+    ] {
+        for (index, value) in matrix.iter().flatten().enumerate() {
+            let byte_index = offset + index * 4;
+            bytes[byte_index..byte_index + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+    for (offset, vector) in [(CAMERA_POSITION_OFFSET, camera_position)]
+        .into_iter()
+        .chain(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, vector)| (BASE_COLOR_OFFSET + index * 16, vector)),
+        )
+    {
+        for (component, value) in vector.into_iter().enumerate() {
+            let byte_index = offset + component * 4;
+            bytes[byte_index..byte_index + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+    bytes
+}
+
 /// GPU-owned color/depth targets with no public `wgpu` types in the contract.
 pub(crate) struct OffscreenRenderTargets {
     color: wgpu::Texture,
@@ -454,6 +648,41 @@ pub(crate) struct OffscreenRenderTargets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_at(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn uniform_buffer_layout_has_expected_field_offsets() {
+        let mvp = [[1.0; 4]; 4];
+        let model = Mat4([[2.0; 4]; 4]);
+        let normal_matrix = Mat4([[3.0; 4]; 4]);
+        let camera = [4.0, 5.0, 6.0, 7.0];
+        let values = [
+            [8.0, 9.0, 10.0, 11.0],
+            [12.0, 13.0, 14.0, 15.0],
+            [16.0, 17.0, 18.0, 19.0],
+            [20.0, 21.0, 22.0, 23.0],
+        ];
+        let bytes = pack_uniform_bytes(mvp, model, normal_matrix, camera, values);
+
+        assert_eq!(bytes.len(), 272);
+        assert_eq!(f32_at(&bytes, 0), 1.0);
+        assert_eq!(f32_at(&bytes, 64), 2.0);
+        assert_eq!(f32_at(&bytes, 128), 3.0);
+        assert_eq!(
+            &bytes[192..208],
+            &camera
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(f32_at(&bytes, 208), 8.0);
+        assert_eq!(f32_at(&bytes, 224), 12.0);
+        assert_eq!(f32_at(&bytes, 240), 16.0);
+        assert_eq!(f32_at(&bytes, 256), 20.0);
+    }
 
     #[test]
     fn selection_is_case_insensitive_and_uses_name_substrings() {

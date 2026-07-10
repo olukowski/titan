@@ -6,7 +6,10 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::Serialize;
-use titan_core::{Camera, CameraProjection, Component, EntityId, Mesh, Transform, Velocity, World};
+use titan_core::{
+    Camera, CameraProjection, Component, DirectionalLight, EntityId, Material, MaterialModel, Mesh,
+    Transform, Velocity, World,
+};
 use titan_math::Vec3;
 
 mod geometry;
@@ -30,6 +33,9 @@ pub mod error {
     pub const INVALID_NORMALS: &str = "RENDER_INVALID_NORMALS";
     pub const ASSET_UNAVAILABLE: &str = "RENDER_ASSET_UNAVAILABLE";
     pub const INVALID_GEOMETRY: &str = "RENDER_INVALID_GEOMETRY";
+    pub const INVALID_MATERIAL: &str = "RENDER_INVALID_MATERIAL";
+    pub const MISSING_MATERIAL: &str = "RENDER_MISSING_MATERIAL";
+    pub const MISSING_LIGHT_TRANSFORM: &str = "RENDER_MISSING_LIGHT_TRANSFORM";
 }
 
 /// A structured renderer failure, suitable for a CLI error envelope.
@@ -165,6 +171,7 @@ pub struct DrawItem {
     pub entity: EntityId,
     pub model: Mat4,
     pub geometry: MeshAsset,
+    pub material: Material,
 }
 
 /// Deterministic CPU render plan.
@@ -172,6 +179,17 @@ pub struct DrawItem {
 pub struct RenderScene {
     pub entities: Vec<ExtractedEntity>,
     pub draw_list: Vec<DrawItem>,
+    pub directional_light: Option<DirectionalLightData>,
+}
+
+/// The selected light, including its entity transform-derived direction.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct DirectionalLightData {
+    pub entity: EntityId,
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub illuminance: f32,
+    pub ambient: f32,
 }
 
 /// Exact stats computed from a render plan, not GPU timing.
@@ -184,6 +202,52 @@ pub struct RenderStats {
     pub ignored_directional_lights: u32,
     pub material_models: BTreeMap<String, u32>,
     pub active_camera: Option<EntityId>,
+    pub shader_version: u32,
+}
+
+pub const SHADER_VERSION: u32 = 1;
+
+pub fn validate_material(material: &Material) -> ServiceResult<()> {
+    if material
+        .base_color
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(RenderError::new(
+            error::INVALID_MATERIAL,
+            "material.base_color must contain finite values in the range 0..=1",
+        ));
+    }
+    match material.model {
+        MaterialModel::Unlit => {
+            if material.metallic.is_some() || material.roughness.is_some() {
+                return Err(RenderError::new(
+                    error::INVALID_MATERIAL,
+                    "unlit materials must not specify metallic or roughness",
+                ));
+            }
+        }
+        MaterialModel::Pbr => {
+            for (name, value) in [
+                ("metallic", material.metallic),
+                ("roughness", material.roughness),
+            ] {
+                let Some(value) = value else {
+                    return Err(RenderError::new(
+                        error::INVALID_MATERIAL,
+                        format!("pbr materials require {name}"),
+                    ));
+                };
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(RenderError::new(
+                        error::INVALID_MATERIAL,
+                        format!("material.{name} must be finite and in the range 0..=1"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Result returned by the service. Pixels are deliberately unavailable until
@@ -262,6 +326,24 @@ impl Mat4 {
                 -(values[0] * model[0][3] + values[1] * model[1][3] + values[2] * model[2][3]);
         }
         Self(view)
+    }
+
+    /// The inverse-transpose of a rigid transform's upper-left 3x3 matrix.
+    /// Transforms currently contain rotation and translation only, so the
+    /// inverse-transpose is the rotation itself.
+    pub fn normal_from_transform(transform: &Transform) -> Self {
+        Self::normal_from_model(Self::from_transform(transform))
+    }
+
+    pub fn normal_from_model(model: Self) -> Self {
+        let model = model.0;
+        let mut normal = Self::IDENTITY.0;
+        for (row, values) in normal.iter_mut().take(3).enumerate() {
+            for (column, value) in values.iter_mut().take(3).enumerate() {
+                *value = model[row][column];
+            }
+        }
+        Self(normal)
     }
 
     pub fn projection(projection: &CameraProjection, aspect: f32) -> ServiceResult<Self> {
@@ -479,6 +561,31 @@ fn extract_scene_with_resolver(
         })
         .collect();
 
+    let directional_light = world
+        .query::<&'static DirectionalLight>()
+        .next()
+        .map(|(entity, light)| {
+            let transform = world
+                .get::<Transform>(entity)
+                .map_err(|error| {
+                    RenderError::new(error::MISSING_LIGHT_TRANSFORM, error.to_string())
+                })?
+                .ok_or_else(|| {
+                    RenderError::with_path(
+                        error::MISSING_LIGHT_TRANSFORM,
+                        "directional light requires a transform",
+                        format!("entity:{}/transform", entity.raw()),
+                    )
+                })?;
+            Ok(DirectionalLightData {
+                entity,
+                direction: forward_direction(transform),
+                color: light.color,
+                illuminance: light.illuminance,
+                ambient: light.ambient,
+            })
+        })
+        .transpose()?;
     let draw_list = world
         .query::<&'static Mesh>()
         .map(|(entity, mesh)| {
@@ -516,12 +623,24 @@ fn extract_scene_with_resolver(
                     .flatten()
                     .map_or(Mat4::IDENTITY, Mat4::from_transform),
                 geometry,
+                material: world
+                    .get::<Material>(entity)
+                    .map_err(|error| RenderError::new(error::MISSING_MATERIAL, error.to_string()))?
+                    .ok_or_else(|| {
+                        RenderError::with_path(
+                            error::MISSING_MATERIAL,
+                            "mesh requires a material",
+                            format!("entity:{}/material", entity.raw()),
+                        )
+                    })
+                    .copied()?,
             })
         })
         .collect::<ServiceResult<Vec<_>>>()?;
     Ok(RenderScene {
         entities,
         draw_list,
+        directional_light,
     })
 }
 
@@ -555,6 +674,15 @@ fn select_submeshes(
     geometry.submeshes = selected;
     geometry.validate(alias)?;
     Ok(geometry)
+}
+
+fn forward_direction(transform: &Transform) -> [f32; 3] {
+    let [x, y, z, w] = transform.rotation;
+    [
+        -2.0 * (x * z + y * w),
+        -2.0 * (y * z - x * w),
+        -1.0 + 2.0 * (x * x + y * y),
+    ]
 }
 
 /// Headless render service boundary. CPU-only services are available for
@@ -608,18 +736,37 @@ impl RenderService {
         };
         validate_output_size(output_size, max_texture_dimension)?;
         let scene = extract_scene(world)?;
+        for item in &scene.draw_list {
+            validate_material(&item.material)?;
+            if matches!(item.material.model, MaterialModel::Pbr) {
+                validate_normals(&item.geometry)?;
+            }
+        }
         let view_projection = Mat4::projection(
             &camera.1.projection,
             output_size.width as f32 / output_size.height as f32,
         )
         .map(|projection| projection * Mat4::view_from_transform(&camera.2))?;
-        let stats = stats_for_scene(&scene, camera.0);
+        let stats = stats_for_scene(
+            &scene,
+            camera.0,
+            world
+                .query::<&'static DirectionalLight>()
+                .count()
+                .saturating_sub(usize::from(scene.directional_light.is_some())) as u32,
+        );
         let rgba8 = match (&self.gpu, request.capture) {
             (Some(gpu), CaptureMode::Image) => Some(gpu.draw_plan(
                 output_size,
                 request.clear_color.0,
                 view_projection.0,
                 &scene.draw_list,
+                scene.directional_light,
+                [
+                    camera.2.translation.x,
+                    camera.2.translation.y,
+                    camera.2.translation.z,
+                ],
             )?),
             _ => None,
         };
@@ -633,7 +780,11 @@ impl RenderService {
     }
 }
 
-fn stats_for_scene(scene: &RenderScene, camera: EntityId) -> RenderStats {
+fn stats_for_scene(
+    scene: &RenderScene,
+    camera: EntityId,
+    ignored_directional_lights: u32,
+) -> RenderStats {
     RenderStats {
         visible_meshes: scene.draw_list.len() as u32,
         draw_calls: scene
@@ -646,9 +797,43 @@ fn stats_for_scene(scene: &RenderScene, camera: EntityId) -> RenderStats {
             .iter()
             .map(|item| item.geometry.triangle_count())
             .sum(),
+        active_directional_lights: u32::from(scene.directional_light.is_some()),
+        ignored_directional_lights,
+        shader_version: SHADER_VERSION,
+        material_models: scene
+            .draw_list
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, item| {
+                let name = match item.material.model {
+                    MaterialModel::Unlit => "unlit",
+                    MaterialModel::Pbr => "pbr",
+                };
+                *counts.entry(name.to_owned()).or_insert(0) += 1;
+                counts
+            }),
         active_camera: Some(camera),
-        ..RenderStats::default()
     }
+}
+
+fn validate_normals(mesh: &MeshAsset) -> ServiceResult<()> {
+    let Some(normals) = mesh.normals.as_ref() else {
+        return Err(RenderError::new(
+            error::MISSING_NORMALS,
+            "pbr mesh has no normals",
+        ));
+    };
+    if normals.len() != mesh.vertices.len()
+        || normals.iter().any(|normal| {
+            normal.iter().any(|value| !value.is_finite())
+                || (normal.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() > 1e-4
+        })
+    {
+        return Err(RenderError::new(
+            error::INVALID_NORMALS,
+            "pbr mesh normals must be finite unit vectors",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -695,6 +880,89 @@ mod tests {
             )
             .unwrap();
         world
+    }
+
+    fn default_test_material() -> Material {
+        Material {
+            model: MaterialModel::Unlit,
+            base_color: [1.0, 0.0, 0.0, 1.0],
+            metallic: None,
+            roughness: None,
+        }
+    }
+
+    fn render_with_geometry(geometry: MeshAsset, material: Material) -> ServiceResult<RenderScene> {
+        let mut world = world_with_camera();
+        world.set_scene_asset(
+            "test",
+            titan_core::AssetEntry {
+                path: "test.mesh".into(),
+                kind: "geometry".into(),
+            },
+        );
+        let entity = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.insert(entity, Transform::default()).unwrap();
+        world
+            .insert(
+                entity,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:test"),
+                    submeshes: None,
+                },
+            )
+            .unwrap();
+        world.insert(entity, material).unwrap();
+        let scene = extract_scene_with_resolver(&world, |_| Ok(geometry.clone()))?;
+        validate_material(&scene.draw_list[0].material)?;
+        Ok(scene)
+    }
+
+    #[test]
+    fn unlit_mesh_without_normals_is_renderable() {
+        let mut geometry = cube_v1();
+        geometry.normals = None;
+        let scene = render_with_geometry(geometry, default_test_material()).unwrap();
+        assert_eq!(
+            stats_for_scene(&scene, EntityId::from_raw(1), 0).visible_meshes,
+            1
+        );
+    }
+
+    #[test]
+    fn pbr_mesh_without_normals_reports_missing_normals() {
+        let mut geometry = cube_v1();
+        geometry.normals = None;
+        let scene = render_with_geometry(
+            geometry,
+            Material {
+                model: MaterialModel::Pbr,
+                base_color: [1.0, 0.0, 0.0, 1.0],
+                metallic: Some(0.0),
+                roughness: Some(1.0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            validate_normals(&scene.draw_list[0].geometry)
+                .unwrap_err()
+                .code,
+            error::MISSING_NORMALS
+        );
+    }
+
+    #[test]
+    fn pbr_mesh_with_invalid_normals_reports_invalid_normals() {
+        let mut geometry = cube_v1();
+        geometry.normals = Some(vec![[f32::NAN, 0.0, 0.0]; geometry.vertices.len()]);
+        assert_eq!(
+            validate_normals(&geometry).unwrap_err().code,
+            error::INVALID_NORMALS
+        );
+        geometry.normals = Some(vec![[2.0, 0.0, 0.0]; geometry.vertices.len()]);
+        assert_eq!(
+            validate_normals(&geometry).unwrap_err().code,
+            error::INVALID_NORMALS
+        );
     }
 
     #[test]
@@ -985,6 +1253,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            world.insert(entity, default_test_material()).unwrap();
         }
         let scene = extract_scene(&world).unwrap();
         assert_eq!(
@@ -1020,6 +1289,7 @@ mod tests {
     components: {{
       transform: {{ translation: [0.0, 0.0, 0.0] }},
       mesh: {{ geometry: {{ ref: "asset:mesh" }} }},
+      material: {{ model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] }},
     }},
   }}],
 }}"#
@@ -1104,11 +1374,11 @@ mod tests {
             vertices: vec![
                 MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 };
                 6
             ],
+            normals: None,
             indices: vec![0; 9],
             submeshes: vec![
                 Submesh {
@@ -1140,13 +1410,14 @@ mod tests {
                 },
             )
             .unwrap();
+        world.insert(entity, default_test_material()).unwrap();
         let scene = extract_scene_with_resolver(&world, |path| {
             assert_eq!(path, "multi.mesh");
             Ok(geometry.clone())
         })
         .unwrap();
         assert_eq!(scene.draw_list[0].geometry.submeshes.len(), 1);
-        let stats = stats_for_scene(&scene, EntityId::from_raw(9));
+        let stats = stats_for_scene(&scene, EntityId::from_raw(9), 0);
         assert_eq!(stats.draw_calls, 1);
         assert_eq!(stats.triangles, 2);
 
@@ -1164,9 +1435,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: u32::MAX,
@@ -1176,9 +1447,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: 1,
@@ -1188,9 +1459,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: 0,
@@ -1200,9 +1471,9 @@ mod tests {
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![1, 0, 0],
                 submeshes: vec![Submesh {
                     index_start: 0,
@@ -1211,15 +1482,16 @@ mod tests {
             },
             MeshAsset {
                 vertices: Vec::new(),
+                normals: None,
                 indices: Vec::new(),
                 submeshes: Vec::new(),
             },
             MeshAsset {
                 vertices: vec![MeshVertex {
                     position: [0.0; 3],
-                    normal: [0.0; 3],
                     uv: [0.0; 2],
                 }],
+                normals: None,
                 indices: vec![0, 0, 0],
                 submeshes: Vec::new(),
             },
@@ -1270,6 +1542,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            world.insert(entity, default_test_material()).unwrap();
         }
         let output = RenderService::cpu_only()
             .render(&world, RenderRequest::default())
@@ -1286,6 +1559,152 @@ mod tests {
         assert_eq!(output.stats.visible_meshes, 2);
         assert_eq!(output.stats.draw_calls, 2);
         assert_eq!(output.stats.triangles, 24);
+    }
+
+    #[test]
+    fn light_selection_and_material_validation_are_structured_and_stable() {
+        let mut world = world_with_camera();
+        for (id, ambient) in [(2, 0.1), (7, 0.2)] {
+            let entity = world.spawn_with_id(EntityId::from_raw(id)).unwrap();
+            world.insert(entity, Transform::default()).unwrap();
+            world
+                .insert(
+                    entity,
+                    DirectionalLight {
+                        color: [1.0, 1.0, 1.0],
+                        illuminance: 1.0,
+                        ambient,
+                    },
+                )
+                .unwrap();
+        }
+        let output = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap();
+        assert_eq!(output.stats.active_directional_lights, 1);
+        assert_eq!(output.stats.ignored_directional_lights, 1);
+        assert_eq!(output.scene.directional_light.unwrap().entity.raw(), 2);
+        assert_eq!(
+            output.scene.directional_light.unwrap().direction,
+            [0.0, 0.0, -1.0]
+        );
+
+        let invalid = Material {
+            model: MaterialModel::Pbr,
+            base_color: [1.0, 0.0, 0.0, 1.0],
+            metallic: Some(0.5),
+            roughness: None,
+        };
+        assert_eq!(
+            validate_material(&invalid).unwrap_err().code,
+            error::INVALID_MATERIAL
+        );
+    }
+
+    #[test]
+    fn first_directional_light_without_transform_is_not_skipped() {
+        let mut world = world_with_camera();
+        let missing_transform = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world
+            .insert(
+                missing_transform,
+                DirectionalLight {
+                    color: [1.0, 1.0, 1.0],
+                    illuminance: 1.0,
+                    ambient: 0.1,
+                },
+            )
+            .unwrap();
+        let higher = world.spawn_with_id(EntityId::from_raw(7)).unwrap();
+        world.insert(higher, Transform::default()).unwrap();
+        world
+            .insert(
+                higher,
+                DirectionalLight {
+                    color: [1.0, 1.0, 1.0],
+                    illuminance: 1.0,
+                    ambient: 0.2,
+                },
+            )
+            .unwrap();
+
+        let error = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap_err();
+        assert_eq!(error.code, error::MISSING_LIGHT_TRANSFORM);
+        assert_eq!(error.path.as_deref(), Some("entity:2/transform"));
+    }
+
+    #[test]
+    fn mesh_without_material_is_a_structured_error() {
+        let mut world = world_with_camera();
+        world.set_scene_asset(
+            "fixture",
+            titan_core::AssetEntry {
+                path: CUBE_V1_PATH.into(),
+                kind: "geometry".into(),
+            },
+        );
+        let mesh_entity = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.insert(mesh_entity, Transform::default()).unwrap();
+        world
+            .insert(
+                mesh_entity,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:fixture"),
+                    submeshes: None,
+                },
+            )
+            .unwrap();
+
+        let error = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap_err();
+        assert_eq!(error.code, error::MISSING_MATERIAL);
+        assert_eq!(error.path.as_deref(), Some("entity:2/material"));
+    }
+
+    #[test]
+    fn normal_matrix_rotates_normals_with_the_mesh() {
+        let transform = Transform {
+            translation: Vec3::new(4.0, 5.0, 6.0),
+            rotation: [0.0, 0.70710677, 0.0, 0.70710677],
+        };
+        let model = Mat4::from_transform(&transform).0;
+        let normal = Mat4::normal_from_transform(&transform).0;
+        for row in 0..3 {
+            for column in 0..3 {
+                assert!((normal[row][column] - model[row][column]).abs() < 1e-5);
+            }
+        }
+        let local_normal = [1.0, 0.0, 0.0];
+        let world_normal = [
+            model[0][0] * local_normal[0]
+                + model[0][1] * local_normal[1]
+                + model[0][2] * local_normal[2],
+            model[1][0] * local_normal[0]
+                + model[1][1] * local_normal[1]
+                + model[1][2] * local_normal[2],
+            model[2][0] * local_normal[0]
+                + model[2][1] * local_normal[1]
+                + model[2][2] * local_normal[2],
+        ];
+        let transformed_normal = [
+            normal[0][0] * local_normal[0]
+                + normal[0][1] * local_normal[1]
+                + normal[0][2] * local_normal[2],
+            normal[1][0] * local_normal[0]
+                + normal[1][1] * local_normal[1]
+                + normal[1][2] * local_normal[2],
+            normal[2][0] * local_normal[0]
+                + normal[2][1] * local_normal[1]
+                + normal[2][2] * local_normal[2],
+        ];
+        for (actual, expected) in transformed_normal.into_iter().zip(world_normal) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+        assert_eq!(normal[0][3], 0.0);
+        assert_eq!(normal[3][0], 0.0);
     }
 
     #[test]
@@ -1332,6 +1751,7 @@ mod tests {
                 },
             )
             .unwrap();
+        world.insert(mesh, default_test_material()).unwrap();
         match RenderService::new() {
             Err(error) => assert_eq!(error.code, error::NO_ADAPTER),
             Ok(service) => {

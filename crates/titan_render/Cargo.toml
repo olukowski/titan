@@ -10,8 +10,10 @@ pollster.workspace = true
 serde.workspace = true
 titan_core.workspace = true
 titan_math.workspace = true
-titan_scene.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+titan_scene.workspace = true
 
 [lib]
 path = "src/lib.rs"

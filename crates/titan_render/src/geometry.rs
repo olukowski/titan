@@ -11,7 +11,6 @@ use crate::{RenderError, ServiceResult, error};
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct MeshVertex {
     pub position: [f32; 3],
-    pub normal: [f32; 3],
     pub uv: [f32; 2],
 }
 
@@ -26,6 +25,7 @@ pub struct Submesh {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MeshAsset {
     pub vertices: Vec<MeshVertex>,
+    pub normals: Option<Vec<[f32; 3]>>,
     pub indices: Vec<u32>,
     pub submeshes: Vec<Submesh>,
 }
@@ -148,6 +148,7 @@ pub fn cube_v1() -> MeshAsset {
     ];
     let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let mut vertices = Vec::with_capacity(24);
+    let mut normals = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(36);
     for (face_index, (normal, positions)) in faces.into_iter().enumerate() {
         let start = (face_index * 4) as u32;
@@ -155,16 +156,14 @@ pub fn cube_v1() -> MeshAsset {
             positions
                 .into_iter()
                 .zip(uvs)
-                .map(|(position, uv)| MeshVertex {
-                    position,
-                    normal,
-                    uv,
-                }),
+                .map(|(position, uv)| MeshVertex { position, uv }),
         );
+        normals.extend([normal; 4]);
         indices.extend([start, start + 2, start + 1, start, start + 3, start + 2]);
     }
     MeshAsset {
         vertices,
+        normals: Some(normals),
         indices,
         submeshes: vec![Submesh {
             index_start: 0,
@@ -231,12 +230,9 @@ pub(crate) fn is_valid_virtual_relative_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains('\\')
         && !path.contains(':')
-        && Path::new(path).components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::ParentDir
-            )
-        })
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -258,15 +254,31 @@ mod tests {
             }]
         );
         assert_eq!(first.triangle_count(), 12);
-        assert!(first.vertices.iter().all(|vertex| {
-            vertex
-                .position
+        assert!(
+            first
+                .vertices
                 .iter()
-                .all(|value| (-0.5..=0.5).contains(value))
-                && (vertex.normal.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() < 1e-6
-        }));
+                .zip(first.normals.as_ref().unwrap())
+                .all(|(vertex, normal)| {
+                    vertex
+                        .position
+                        .iter()
+                        .all(|value| (-0.5..=0.5).contains(value))
+                        && (normal.iter().map(|value| value * value).sum::<f32>() - 1.0).abs()
+                            < 1e-6
+                })
+        );
         for face in first.vertices.chunks_exact(4) {
-            assert!(face.iter().all(|vertex| vertex.normal == face[0].normal));
+            let start = first
+                .vertices
+                .iter()
+                .position(|vertex| vertex == &face[0])
+                .unwrap();
+            assert!(
+                first.normals.as_ref().unwrap()[start..start + 4]
+                    .iter()
+                    .all(|normal| *normal == first.normals.as_ref().unwrap()[start])
+            );
             assert_eq!(
                 face.iter().map(|vertex| vertex.uv).collect::<Vec<_>>(),
                 [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
@@ -288,7 +300,7 @@ mod tests {
                 ab[2] * ac[0] - ab[0] * ac[2],
                 ab[0] * ac[1] - ab[1] * ac[0],
             ];
-            let stored_normal = first.vertices[triangle[0] as usize].normal;
+            let stored_normal = first.normals.as_ref().unwrap()[triangle[0] as usize];
             let agreement = geometric_normal[0] * stored_normal[0]
                 + geometric_normal[1] * stored_normal[1]
                 + geometric_normal[2] * stored_normal[2];
@@ -330,5 +342,15 @@ mod tests {
             error.path.as_deref(),
             Some("__builtin__/geometry/not-a-real-version")
         );
+    }
+
+    #[test]
+    fn parent_dir_geometry_path_is_rejected_before_filesystem_access() {
+        let resolver = GeometryResolver::new("/definitely/nonexistent/titan-base");
+        let error = resolver.resolve("../../etc/passwd").unwrap_err();
+
+        assert_eq!(error.code, error::ASSET_UNAVAILABLE);
+        assert_eq!(error.path.as_deref(), Some("../../etc/passwd"));
+        assert!(error.message.contains("not virtual-relative"));
     }
 }
