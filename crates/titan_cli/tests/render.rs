@@ -39,6 +39,19 @@ fn successful_render(dir: &TempDir, source: &str, camera: &str) -> Option<Value>
     Some(serde_json::from_slice(&output.stdout).expect("structured render output"))
 }
 
+fn render_with_stats(dir: &TempDir, source: &str, camera: &str) -> std::process::Output {
+    let path = scene(dir, source);
+    titan()
+        .args(["--json", "render"])
+        .arg(path)
+        .args(["--camera", camera, "--out"])
+        .arg(dir.path().join("frame.png"))
+        .args(["--stats-json"])
+        .arg(dir.path().join("stats.json"))
+        .output()
+        .expect("run titan render")
+}
+
 #[test]
 fn render_writes_png_and_reports_red_cube_stats() {
     let dir = TempDir::new().expect("tempdir");
@@ -50,6 +63,55 @@ fn render_writes_png_and_reports_red_cube_stats() {
     assert_eq!(result["triangles"], 12);
     assert_eq!(result["visible_meshes"], 1);
     assert_eq!(result["material_models"]["unlit"], 1);
+
+    let decoder = png::Decoder::new(fs::File::open(dir.path().join("frame.png")).expect("PNG"));
+    let mut reader = decoder.read_info().expect("PNG header");
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut pixels).expect("PNG frame");
+    assert_eq!(info.width, result["width"].as_u64().expect("width") as u32);
+    assert_eq!(
+        info.height,
+        result["height"].as_u64().expect("height") as u32
+    );
+}
+
+#[test]
+fn render_stats_file_does_not_change_json_stdout() {
+    let dir = TempDir::new().expect("tempdir");
+    let output = render_with_stats(&dir, RED_CUBE, "main");
+    if !output.status.success() {
+        let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+        if error["error"]["code"] == "RENDER_NO_ADAPTER" {
+            return;
+        }
+        panic!("render failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("structured render output");
+    let stats: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("stats.json")).expect("stats file"))
+            .expect("structured stats output");
+    assert_eq!(stdout, stats);
+    assert!(dir.path().join("frame.png").is_file());
+}
+
+#[test]
+fn render_rejects_colliding_png_and_stats_paths() {
+    let dir = TempDir::new().expect("tempdir");
+    let output_path = dir.path().join("same.output");
+    let path = scene(&dir, RED_CUBE);
+    let output = titan()
+        .args(["--json", "render"])
+        .arg(path)
+        .args(["--camera", "main", "--out"])
+        .arg(&output_path)
+        .args(["--stats-json"])
+        .arg(&output_path)
+        .output()
+        .expect("run titan render");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+    assert_eq!(error["error"]["code"], "TITAN_OUTPUT_COLLISION");
+    assert!(!output_path.exists());
 }
 
 #[test]

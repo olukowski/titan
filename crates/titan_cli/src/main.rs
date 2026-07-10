@@ -404,7 +404,18 @@ struct RenderOutput {
 }
 
 fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
-    let has_stats_file = args.stats_json.is_some();
+    if let Some(stats_path) = args.stats_json.as_ref()
+        && normalized_output_path(&args.out)? == normalized_output_path(stats_path)?
+    {
+        return Err(TitanError::new(
+            "TITAN_OUTPUT_COLLISION",
+            format!(
+                "PNG output {} and stats output {} must be different files",
+                args.out.display(),
+                stats_path.display()
+            ),
+        ));
+    }
     let document = read_scene(&args.scene).map_err(|error| match error {
         SceneLoadError::Io(error) => error,
         SceneLoadError::Tsf(error) => TitanError::from_tsf("failed to parse scene", error),
@@ -516,12 +527,35 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
             )
         })?;
     }
-    if json && !has_stats_file {
+    if json {
         print_json(&output)?;
     } else {
         println!("rendered {}", args.out.display());
     }
     Ok(())
+}
+
+fn normalized_output_path(path: &Path) -> Result<std::path::PathBuf, TitanError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!("output path {} has no file name", path.display()),
+        )
+    })?;
+    let parent = fs::canonicalize(parent).map_err(|source| {
+        TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!(
+                "failed to resolve output directory {}: {source}",
+                parent.display()
+            ),
+        )
+    })?;
+    Ok(parent.join(file_name))
 }
 
 fn write_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), TitanError> {
