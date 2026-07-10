@@ -166,12 +166,13 @@ impl GpuContext {
         view_projection: [[f32; 4]; 4],
         draw_list: &[DrawItem],
         light: Option<DirectionalLightData>,
+        camera_position: [f32; 3],
     ) -> ServiceResult<Vec<u8>> {
         let targets = self.create_render_targets(size)?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("titan unlit and basic pbr shaders"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                "struct Uniforms { mvp: mat4x4<f32>, base_color: vec4<f32>, light_color: vec4<f32>, light_direction: vec4<f32>, params: vec4<f32> };\n@group(0) @binding(0) var<uniform> uniforms: Uniforms;\nstruct VertexIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };\nstruct VertexOut { @builtin(position) position: vec4<f32>, @location(0) normal: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> VertexOut { var out: VertexOut; out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); out.normal = vertex.normal; return out; }\n@fragment fn fs(in: VertexOut) -> @location(0) vec4<f32> { let base = uniforms.base_color.rgb; if (uniforms.params.x < 0.5) { return vec4<f32>(base, uniforms.base_color.a); } let n = normalize(in.normal); let l = normalize(-uniforms.light_direction.xyz); let diffuse = max(dot(n, l), 0.0); let metallic = uniforms.params.y; let roughness = max(uniforms.params.z, 0.04); let ambient = uniforms.params.w; let light = uniforms.light_color.rgb * uniforms.light_color.a * diffuse; let f0 = mix(vec3<f32>(0.04), base, metallic); let specular = f0 * pow(max(dot(reflect(-l, n), vec3<f32>(0.0, 0.0, 1.0)), 0.0), 2.0 / (roughness * roughness)); return vec4<f32>(base * (ambient + light * (1.0 - metallic)) + specular * light, uniforms.base_color.a); }\n",
+                "struct Uniforms { mvp: mat4x4<f32>, model: mat4x4<f32>, normal_matrix: mat4x4<f32>, camera_position: vec4<f32>, base_color: vec4<f32>, light_color: vec4<f32>, light_direction: vec4<f32>, params: vec4<f32> };\n@group(0) @binding(0) var<uniform> uniforms: Uniforms;\nstruct VertexIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };\nstruct VertexOut { @builtin(position) position: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) world_position: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> VertexOut { var out: VertexOut; let world = uniforms.model * vec4<f32>(vertex.position, 1.0); out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); out.normal = normalize((uniforms.normal_matrix * vec4<f32>(vertex.normal, 0.0)).xyz); out.world_position = world.xyz; return out; }\n@fragment fn fs(in: VertexOut) -> @location(0) vec4<f32> { let base = uniforms.base_color.rgb; if (uniforms.params.x < 0.5) { return vec4<f32>(base, uniforms.base_color.a); } let n = normalize(in.normal); let l = normalize(-uniforms.light_direction.xyz); let v = normalize(uniforms.camera_position.xyz - in.world_position); let diffuse = max(dot(n, l), 0.0); let metallic = uniforms.params.y; let roughness = max(uniforms.params.z, 0.04); let ambient = uniforms.params.w; let light = uniforms.light_color.rgb * uniforms.light_color.a * diffuse; let f0 = mix(vec3<f32>(0.04), base, metallic); let specular = f0 * pow(max(dot(reflect(-l, n), v), 0.0), 2.0 / (roughness * roughness)); return vec4<f32>(base * (ambient + light * (1.0 - metallic)) + specular * light, uniforms.base_color.a); }\n",
             )),
         });
         let bind_layout = self
@@ -184,7 +185,7 @@ impl GpuContext {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(128),
+                        min_binding_size: std::num::NonZeroU64::new(272),
                     },
                     count: None,
                 }],
@@ -195,11 +196,11 @@ impl GpuContext {
                 let matrix = (Mat4(view_projection) * item.model).transpose().0;
                 let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("titan draw transform uniform"),
-                    size: 128,
+                    size: 272,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let mut bytes = [0u8; 128];
+                let mut bytes = [0u8; 272];
                 for (index, value) in matrix.iter().flatten().enumerate() {
                     bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
                 }
@@ -247,11 +248,29 @@ impl GpuContext {
                         },
                     ],
                 ];
+                let model = item.model.transpose().0;
+                let normal_matrix = Mat4::normal_from_model(item.model).transpose().0;
+                for (matrix_offset, matrix) in [(1, model), (2, normal_matrix)] {
+                    for (index, value) in matrix.iter().flatten().enumerate() {
+                        let byte_index = matrix_offset * 64 + index * 4;
+                        bytes[byte_index..byte_index + 4].copy_from_slice(&value.to_ne_bytes());
+                    }
+                }
+                let camera = [
+                    camera_position[0],
+                    camera_position[1],
+                    camera_position[2],
+                    0.0,
+                ];
                 for (vector_index, vector) in values.into_iter().enumerate() {
                     for (component, value) in vector.into_iter().enumerate() {
-                        let index = 64 + (vector_index * 4 + component) * 4;
+                        let index = 208 + (vector_index * 4 + component) * 4;
                         bytes[index..index + 4].copy_from_slice(&value.to_ne_bytes());
                     }
+                }
+                for (component, value) in camera.into_iter().enumerate() {
+                    let index = 128 + component * 4;
+                    bytes[index..index + 4].copy_from_slice(&value.to_ne_bytes());
                 }
                 self.queue.write_buffer(&uniform, 0, &bytes);
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

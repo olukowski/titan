@@ -34,6 +34,8 @@ pub mod error {
     pub const ASSET_UNAVAILABLE: &str = "RENDER_ASSET_UNAVAILABLE";
     pub const INVALID_GEOMETRY: &str = "RENDER_INVALID_GEOMETRY";
     pub const INVALID_MATERIAL: &str = "RENDER_INVALID_MATERIAL";
+    pub const MISSING_MATERIAL: &str = "RENDER_MISSING_MATERIAL";
+    pub const MISSING_LIGHT_TRANSFORM: &str = "RENDER_MISSING_LIGHT_TRANSFORM";
 }
 
 /// A structured renderer failure, suitable for a CLI error envelope.
@@ -326,6 +328,24 @@ impl Mat4 {
         Self(view)
     }
 
+    /// The inverse-transpose of a rigid transform's upper-left 3x3 matrix.
+    /// Transforms currently contain rotation and translation only, so the
+    /// inverse-transpose is the rotation transpose.
+    pub fn normal_from_transform(transform: &Transform) -> Self {
+        Self::normal_from_model(Self::from_transform(transform))
+    }
+
+    pub fn normal_from_model(model: Self) -> Self {
+        let model = model.0;
+        let mut normal = Self::IDENTITY.0;
+        for (row, values) in normal.iter_mut().take(3).enumerate() {
+            for (column, value) in values.iter_mut().take(3).enumerate() {
+                *value = model[column][row];
+            }
+        }
+        Self(normal)
+    }
+
     pub fn projection(projection: &CameraProjection, aspect: f32) -> ServiceResult<Self> {
         if !aspect.is_finite() || aspect <= 0.0 {
             return Err(RenderError::new(
@@ -542,15 +562,30 @@ fn extract_scene_with_resolver(
         .collect();
 
     let directional_light = world
-        .query::<(&'static DirectionalLight, &'static Transform)>()
+        .query::<&'static DirectionalLight>()
         .next()
-        .map(|(entity, (light, transform))| DirectionalLightData {
-            entity,
-            direction: forward_direction(transform),
-            color: light.color,
-            illuminance: light.illuminance,
-            ambient: light.ambient,
-        });
+        .map(|(entity, light)| {
+            let transform = world
+                .get::<Transform>(entity)
+                .map_err(|error| {
+                    RenderError::new(error::MISSING_LIGHT_TRANSFORM, error.to_string())
+                })?
+                .ok_or_else(|| {
+                    RenderError::with_path(
+                        error::MISSING_LIGHT_TRANSFORM,
+                        "directional light requires a transform",
+                        format!("entity:{}/transform", entity.raw()),
+                    )
+                })?;
+            Ok(DirectionalLightData {
+                entity,
+                direction: forward_direction(transform),
+                color: light.color,
+                illuminance: light.illuminance,
+                ambient: light.ambient,
+            })
+        })
+        .transpose()?;
     let draw_list = world
         .query::<&'static Mesh>()
         .map(|(entity, mesh)| {
@@ -590,15 +625,15 @@ fn extract_scene_with_resolver(
                 geometry,
                 material: world
                     .get::<Material>(entity)
-                    .ok()
-                    .flatten()
-                    .copied()
-                    .unwrap_or(Material {
-                        model: MaterialModel::Unlit,
-                        base_color: [1.0, 0.0, 0.0, 1.0],
-                        metallic: None,
-                        roughness: None,
-                    }),
+                    .map_err(|error| RenderError::new(error::MISSING_MATERIAL, error.to_string()))?
+                    .ok_or_else(|| {
+                        RenderError::with_path(
+                            error::MISSING_MATERIAL,
+                            "mesh requires a material",
+                            format!("entity:{}/material", entity.raw()),
+                        )
+                    })
+                    .copied()?,
             })
         })
         .collect::<ServiceResult<Vec<_>>>()?;
@@ -727,6 +762,11 @@ impl RenderService {
                 view_projection.0,
                 &scene.draw_list,
                 scene.directional_light,
+                [
+                    camera.2.translation.x,
+                    camera.2.translation.y,
+                    camera.2.translation.z,
+                ],
             )?),
             _ => None,
         };
@@ -838,6 +878,15 @@ mod tests {
             )
             .unwrap();
         world
+    }
+
+    fn default_test_material() -> Material {
+        Material {
+            model: MaterialModel::Unlit,
+            base_color: [1.0, 0.0, 0.0, 1.0],
+            metallic: None,
+            roughness: None,
+        }
     }
 
     #[test]
@@ -1128,6 +1177,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            world.insert(entity, default_test_material()).unwrap();
         }
         let scene = extract_scene(&world).unwrap();
         assert_eq!(
@@ -1163,6 +1213,7 @@ mod tests {
     components: {{
       transform: {{ translation: [0.0, 0.0, 0.0] }},
       mesh: {{ geometry: {{ ref: "asset:mesh" }} }},
+      material: {{ model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] }},
     }},
   }}],
 }}"#
@@ -1283,6 +1334,7 @@ mod tests {
                 },
             )
             .unwrap();
+        world.insert(entity, default_test_material()).unwrap();
         let scene = extract_scene_with_resolver(&world, |path| {
             assert_eq!(path, "multi.mesh");
             Ok(geometry.clone())
@@ -1413,6 +1465,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            world.insert(entity, default_test_material()).unwrap();
         }
         let output = RenderService::cpu_only()
             .render(&world, RenderRequest::default())
@@ -1472,6 +1525,86 @@ mod tests {
     }
 
     #[test]
+    fn first_directional_light_without_transform_is_not_skipped() {
+        let mut world = world_with_camera();
+        let missing_transform = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world
+            .insert(
+                missing_transform,
+                DirectionalLight {
+                    color: [1.0, 1.0, 1.0],
+                    illuminance: 1.0,
+                    ambient: 0.1,
+                },
+            )
+            .unwrap();
+        let higher = world.spawn_with_id(EntityId::from_raw(7)).unwrap();
+        world.insert(higher, Transform::default()).unwrap();
+        world
+            .insert(
+                higher,
+                DirectionalLight {
+                    color: [1.0, 1.0, 1.0],
+                    illuminance: 1.0,
+                    ambient: 0.2,
+                },
+            )
+            .unwrap();
+
+        let error = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap_err();
+        assert_eq!(error.code, error::MISSING_LIGHT_TRANSFORM);
+        assert_eq!(error.path.as_deref(), Some("entity:2/transform"));
+    }
+
+    #[test]
+    fn mesh_without_material_is_a_structured_error() {
+        let mut world = world_with_camera();
+        world.set_scene_asset(
+            "fixture",
+            titan_core::AssetEntry {
+                path: CUBE_V1_PATH.into(),
+                kind: "geometry".into(),
+            },
+        );
+        let mesh_entity = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.insert(mesh_entity, Transform::default()).unwrap();
+        world
+            .insert(
+                mesh_entity,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:fixture"),
+                    submeshes: None,
+                },
+            )
+            .unwrap();
+
+        let error = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap_err();
+        assert_eq!(error.code, error::MISSING_MATERIAL);
+        assert_eq!(error.path.as_deref(), Some("entity:2/material"));
+    }
+
+    #[test]
+    fn normal_matrix_is_the_inverse_transpose_for_rigid_transforms() {
+        let transform = Transform {
+            translation: Vec3::new(4.0, 5.0, 6.0),
+            rotation: [0.0, 0.70710677, 0.0, 0.70710677],
+        };
+        let model = Mat4::from_transform(&transform).0;
+        let normal = Mat4::normal_from_transform(&transform).0;
+        for row in 0..3 {
+            for column in 0..3 {
+                assert!((normal[row][column] - model[column][row]).abs() < 1e-5);
+            }
+        }
+        assert_eq!(normal[0][3], 0.0);
+        assert_eq!(normal[3][0], 0.0);
+    }
+
+    #[test]
     fn gpu_smoke_returns_pixels_or_no_adapter() {
         let mut world = World::new(titan_core::phase2_component_registry().unwrap());
         let camera = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
@@ -1515,6 +1648,7 @@ mod tests {
                 },
             )
             .unwrap();
+        world.insert(mesh, default_test_material()).unwrap();
         match RenderService::new() {
             Err(error) => assert_eq!(error.code, error::NO_ADAPTER),
             Ok(service) => {
