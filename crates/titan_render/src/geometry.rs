@@ -32,10 +32,10 @@ pub struct MeshAsset {
 
 impl MeshAsset {
     pub fn validate(&self, path: &str) -> ServiceResult<()> {
-        if self.vertices.is_empty() || self.indices.is_empty() {
+        if self.vertices.is_empty() || self.indices.is_empty() || self.submeshes.is_empty() {
             return Err(RenderError::with_path(
                 error::INVALID_GEOMETRY,
-                "geometry must contain vertices and indices",
+                "geometry must contain vertices, indices, and submeshes",
                 path,
             ));
         }

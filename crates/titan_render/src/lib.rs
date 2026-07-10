@@ -534,6 +534,13 @@ fn select_submeshes(
     let Some(selection) = selection else {
         return Ok(geometry);
     };
+    if selection.is_empty() {
+        return Err(RenderError::with_path(
+            error::INVALID_GEOMETRY,
+            "submesh selection must not be empty",
+            format!("asset:{alias}/submeshes"),
+        ));
+    }
     let mut selected = Vec::with_capacity(selection.len());
     for &index in selection {
         let submesh = geometry.submeshes.get(index as usize).ok_or_else(|| {
@@ -1145,6 +1152,10 @@ mod tests {
 
         let error = select_submeshes(cube_v1(), Some(&[1]), "cube").unwrap_err();
         assert_eq!(error.code, error::ASSET_UNAVAILABLE);
+
+        let error = select_submeshes(cube_v1(), Some(&[]), "cube").unwrap_err();
+        assert_eq!(error.code, error::INVALID_GEOMETRY);
+        assert_eq!(error.path.as_deref(), Some("asset:cube/submeshes"));
     }
 
     #[test]
@@ -1201,6 +1212,15 @@ mod tests {
             MeshAsset {
                 vertices: Vec::new(),
                 indices: Vec::new(),
+                submeshes: Vec::new(),
+            },
+            MeshAsset {
+                vertices: vec![MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                }],
+                indices: vec![0, 0, 0],
                 submeshes: Vec::new(),
             },
         ];
