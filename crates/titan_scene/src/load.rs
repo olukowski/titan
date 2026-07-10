@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
-use titan_core::{ComponentRegistry, EntityId, World};
+use titan_core::{AssetEntry, ComponentRegistry, EntityId, World};
 
 use crate::registry::{IntoTsfComponentRegistry, TsfComponentRegistry};
 use crate::tsf::{
@@ -56,6 +56,10 @@ fn load_document(
 ) -> TsfResult<World> {
     let runtime_registry = component_registry.clone();
     let mut world = World::new(component_registry);
+    if let Some(file) = document.file.as_deref() {
+        world.set_scene_base_dir(Path::new(file).parent().unwrap_or_else(|| Path::new(".")));
+    }
+    load_assets(document, &mut world)?;
     let entities = required_array(document, &document.root, "entities", "/entities")?;
     let entity_ids = scene_entity_ids(document, entities)?;
 
@@ -136,6 +140,49 @@ fn load_document(
     }
 
     Ok(world)
+}
+
+fn load_assets(document: &Document, world: &mut World) -> TsfResult<()> {
+    let Some(root_members) = object_members(&document.root) else {
+        return Ok(());
+    };
+    let Some(assets) = member(root_members, "assets") else {
+        return Ok(());
+    };
+    let Some(members) = object_members(&assets.value) else {
+        return Ok(());
+    };
+    for asset in members {
+        let asset_members = object_members(&asset.value).ok_or_else(|| {
+            one(
+                document,
+                "TSF_SCHEMA",
+                "asset entry must be an object",
+                format!("/assets/{}", asset.key),
+                asset.value.span,
+            )
+        })?;
+        let path = required_string(
+            document,
+            asset_members,
+            "path",
+            &format!("/assets/{}/path", asset.key),
+        )?;
+        let kind = required_string(
+            document,
+            asset_members,
+            "kind",
+            &format!("/assets/{}/kind", asset.key),
+        )?;
+        world.set_scene_asset(
+            asset.key.clone(),
+            AssetEntry {
+                path: path.to_owned(),
+                kind: kind.to_owned(),
+            },
+        );
+    }
+    Ok(())
 }
 
 fn scene_entity_ids(

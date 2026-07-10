@@ -9,8 +9,12 @@ use serde::Serialize;
 use titan_core::{Camera, CameraProjection, Component, EntityId, Mesh, Transform, Velocity, World};
 use titan_math::Vec3;
 
+mod geometry;
 mod gpu;
 
+pub use geometry::{
+    AssetResolver, CUBE_V1_PATH, GeometryResolver, MeshAsset, MeshVertex, Submesh, cube_v1,
+};
 pub use gpu::{AdapterBackend, AdapterInfo, AdapterSelection};
 
 /// Stable codes used by structured renderer diagnostics.
@@ -24,6 +28,8 @@ pub mod error {
     pub const UNKNOWN_BUILTIN: &str = "RENDER_UNKNOWN_BUILTIN";
     pub const MISSING_NORMALS: &str = "RENDER_MISSING_NORMALS";
     pub const INVALID_NORMALS: &str = "RENDER_INVALID_NORMALS";
+    pub const ASSET_UNAVAILABLE: &str = "RENDER_ASSET_UNAVAILABLE";
+    pub const INVALID_GEOMETRY: &str = "RENDER_INVALID_GEOMETRY";
 }
 
 /// A structured renderer failure, suitable for a CLI error envelope.
@@ -41,6 +47,14 @@ impl RenderError {
             code,
             message: message.into(),
             path: None,
+        }
+    }
+
+    fn with_path(code: &'static str, message: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            path: Some(path.into()),
         }
     }
 }
@@ -146,10 +160,11 @@ pub struct ExtractedEntity {
 }
 
 /// One planned fixture draw, including the entity's model transform.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DrawItem {
     pub entity: EntityId,
     pub model: Mat4,
+    pub geometry: MeshAsset,
 }
 
 /// Deterministic CPU render plan.
@@ -434,7 +449,19 @@ impl RenderComponentRegistry {
 }
 
 /// CPU-side scene extraction, stable by `EntityId` through the core query API.
-pub fn extract_scene(world: &World) -> RenderScene {
+pub fn extract_scene(world: &World) -> ServiceResult<RenderScene> {
+    let resolver = GeometryResolver::new(
+        world
+            .scene_base_dir()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
+    extract_scene_with_resolver(world, |path| resolver.resolve(path))
+}
+
+fn extract_scene_with_resolver(
+    world: &World,
+    resolve: impl Fn(&str) -> ServiceResult<MeshAsset>,
+) -> ServiceResult<RenderScene> {
     let entities = world
         .query::<&'static Transform>()
         .map(|(entity, transform)| ExtractedEntity {
@@ -454,19 +481,80 @@ pub fn extract_scene(world: &World) -> RenderScene {
 
     let draw_list = world
         .query::<&'static Mesh>()
-        .map(|(entity, _)| DrawItem {
-            entity,
-            model: world
-                .get::<Transform>(entity)
-                .ok()
-                .flatten()
-                .map_or(Mat4::IDENTITY, Mat4::from_transform),
+        .map(|(entity, mesh)| {
+            let alias = mesh.geometry.ref_.strip_prefix("asset:").ok_or_else(|| {
+                RenderError::with_path(
+                    error::ASSET_UNAVAILABLE,
+                    format!(
+                        "mesh geometry reference is not an asset reference: '{}'",
+                        mesh.geometry.ref_
+                    ),
+                    &mesh.geometry.ref_,
+                )
+            })?;
+            let asset = world.scene_asset(alias).ok_or_else(|| {
+                RenderError::with_path(
+                    error::ASSET_UNAVAILABLE,
+                    format!("unknown geometry asset reference '{alias}'"),
+                    format!("asset:{alias}"),
+                )
+            })?;
+            if asset.kind != "geometry" {
+                return Err(RenderError::with_path(
+                    error::ASSET_UNAVAILABLE,
+                    format!("asset '{alias}' is not a geometry asset"),
+                    format!("asset:{alias}"),
+                ));
+            }
+            let geometry =
+                select_submeshes(resolve(&asset.path)?, mesh.submeshes.as_deref(), alias)?;
+            Ok(DrawItem {
+                entity,
+                model: world
+                    .get::<Transform>(entity)
+                    .ok()
+                    .flatten()
+                    .map_or(Mat4::IDENTITY, Mat4::from_transform),
+                geometry,
+            })
         })
-        .collect();
-    RenderScene {
+        .collect::<ServiceResult<Vec<_>>>()?;
+    Ok(RenderScene {
         entities,
         draw_list,
+    })
+}
+
+fn select_submeshes(
+    mut geometry: MeshAsset,
+    selection: Option<&[u32]>,
+    alias: &str,
+) -> ServiceResult<MeshAsset> {
+    geometry.validate(alias)?;
+    let Some(selection) = selection else {
+        return Ok(geometry);
+    };
+    if selection.is_empty() {
+        return Err(RenderError::with_path(
+            error::INVALID_GEOMETRY,
+            "submesh selection must not be empty",
+            format!("asset:{alias}/submeshes"),
+        ));
     }
+    let mut selected = Vec::with_capacity(selection.len());
+    for &index in selection {
+        let submesh = geometry.submeshes.get(index as usize).ok_or_else(|| {
+            RenderError::with_path(
+                error::ASSET_UNAVAILABLE,
+                format!("submesh index {index} is out of range for asset '{alias}'"),
+                format!("asset:{alias}/submeshes"),
+            )
+        })?;
+        selected.push(*submesh);
+    }
+    geometry.submeshes = selected;
+    geometry.validate(alias)?;
+    Ok(geometry)
 }
 
 /// Headless render service boundary. CPU-only services are available for
@@ -519,19 +607,13 @@ impl RenderService {
             projection_viewport(&camera.1.projection).unwrap_or_default()
         };
         validate_output_size(output_size, max_texture_dimension)?;
-        let scene = extract_scene(world);
+        let scene = extract_scene(world)?;
         let view_projection = Mat4::projection(
             &camera.1.projection,
             output_size.width as f32 / output_size.height as f32,
         )
         .map(|projection| projection * Mat4::view_from_transform(&camera.2))?;
-        let stats = RenderStats {
-            visible_meshes: scene.draw_list.len() as u32,
-            draw_calls: scene.draw_list.len() as u32,
-            triangles: scene.draw_list.len() as u64,
-            active_camera: Some(camera.0),
-            ..RenderStats::default()
-        };
+        let stats = stats_for_scene(&scene, camera.0);
         let rgba8 = match (&self.gpu, request.capture) {
             (Some(gpu), CaptureMode::Image) => Some(gpu.draw_plan(
                 output_size,
@@ -548,6 +630,24 @@ impl RenderService {
             scene,
             rgba8,
         })
+    }
+}
+
+fn stats_for_scene(scene: &RenderScene, camera: EntityId) -> RenderStats {
+    RenderStats {
+        visible_meshes: scene.draw_list.len() as u32,
+        draw_calls: scene
+            .draw_list
+            .iter()
+            .map(|item| item.geometry.submeshes.len() as u32)
+            .sum(),
+        triangles: scene
+            .draw_list
+            .iter()
+            .map(|item| item.geometry.triangle_count())
+            .sum(),
+        active_camera: Some(camera),
+        ..RenderStats::default()
     }
 }
 
@@ -599,7 +699,7 @@ mod tests {
 
     #[test]
     fn extraction_is_stable_and_keeps_cpu_components() {
-        let scene = extract_scene(&world_with_components());
+        let scene = extract_scene(&world_with_components()).unwrap();
         assert_eq!(scene.entities[0].entity, EntityId::from_raw(2));
         assert_eq!(scene.entities[1].entity, EntityId::from_raw(7));
         assert_eq!(scene.entities[1].velocity, Some(Vec3::new(4.0, 5.0, 6.0)));
@@ -808,6 +908,13 @@ mod tests {
     #[test]
     fn named_camera_resolves_and_ambiguous_names_fail() {
         let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        world.set_scene_asset(
+            "fixture",
+            titan_core::AssetEntry {
+                path: CUBE_V1_PATH.into(),
+                kind: "geometry".into(),
+            },
+        );
         let first = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
         let second = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
         let camera = Camera {
@@ -854,6 +961,13 @@ mod tests {
     #[test]
     fn extraction_contains_models_and_meshes_in_entity_order() {
         let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        world.set_scene_asset(
+            "fixture",
+            titan_core::AssetEntry {
+                path: CUBE_V1_PATH.into(),
+                kind: "geometry".into(),
+            },
+        );
         for id in [7, 2] {
             let entity = world.spawn_with_id(EntityId::from_raw(id)).unwrap();
             world
@@ -872,7 +986,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let scene = extract_scene(&world);
+        let scene = extract_scene(&world).unwrap();
         assert_eq!(
             scene
                 .draw_list
@@ -890,11 +1004,260 @@ mod tests {
             vec![2, 7]
         );
         assert!((scene.entities[0].model.0[0][3] - 2.0).abs() < 1e-6);
+        assert_eq!(scene.draw_list[0].geometry, cube_v1());
+    }
+
+    #[test]
+    fn tsf_load_bridge_extracts_builtin_cube_and_rejects_unknown_builtin() {
+        let source = |path: &str| {
+            format!(
+                r#"{{
+  tsf: 1,
+  scene: {{ id: "scene:test" }},
+  assets: {{ mesh: {{ path: "{path}", kind: "geometry" }} }},
+  entities: [{{
+    id: "entity:cube",
+    components: {{
+      transform: {{ translation: [0.0, 0.0, 0.0] }},
+      mesh: {{ geometry: {{ ref: "asset:mesh" }} }},
+    }},
+  }}],
+}}"#
+            )
+        };
+        let registry = titan_scene::phase2_component_registry().unwrap();
+
+        let document = titan_scene::parse(Some("/tmp/scene.tsf"), &source(CUBE_V1_PATH)).unwrap();
+        let world = titan_scene::load_world(&document, registry.clone()).unwrap();
+        assert_eq!(
+            extract_scene(&world).unwrap().draw_list[0].geometry,
+            cube_v1()
+        );
+
+        let document = titan_scene::parse(
+            Some("/tmp/scene.tsf"),
+            &source("__builtin__/geometry/not-a-real-version"),
+        )
+        .unwrap();
+        let world = titan_scene::load_world(&document, registry).unwrap();
+        let error = extract_scene(&world).unwrap_err();
+        assert_eq!(error.code, error::UNKNOWN_BUILTIN);
+    }
+
+    #[test]
+    fn extraction_resolves_relative_assets_from_the_tsf_directory() {
+        let base = std::env::temp_dir().join(format!("titan-render-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let asset = base.join("mesh.mesh");
+        std::fs::write(&asset, b"placeholder").unwrap();
+        let file = base.join("scene.tsf");
+        let source = r#"{
+  tsf: 1,
+  scene: { id: "scene:test" },
+  assets: { mesh: { path: "mesh.mesh", kind: "geometry" } },
+  entities: [{ id: "entity:cube", components: { mesh: { geometry: { ref: "asset:mesh" } } } }],
+}"#;
+        let document = titan_scene::parse(Some(file.to_str().unwrap()), source).unwrap();
+        let world =
+            titan_scene::load_world(&document, titan_scene::phase2_component_registry().unwrap())
+                .unwrap();
+        let error = extract_scene(&world).unwrap_err();
+        assert!(error.message.contains(&asset.display().to_string()));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn extraction_reports_unknown_builtin_and_dangling_asset_references() {
+        let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        let entity = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
+        world
+            .insert(
+                entity,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:missing"),
+                    submeshes: None,
+                },
+            )
+            .unwrap();
+        let error = extract_scene(&world).unwrap_err();
+        assert_eq!(error.code, error::ASSET_UNAVAILABLE);
+        assert_eq!(error.path.as_deref(), Some("asset:missing"));
+
+        world.set_scene_asset(
+            "missing",
+            titan_core::AssetEntry {
+                path: "__builtin__/geometry/not-a-real-version".into(),
+                kind: "geometry".into(),
+            },
+        );
+        let error = extract_scene(&world).unwrap_err();
+        assert_eq!(error.code, error::UNKNOWN_BUILTIN);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("__builtin__/geometry/not-a-real-version")
+        );
+    }
+
+    #[test]
+    fn selected_submeshes_drive_exact_draw_and_triangle_stats() {
+        let geometry = MeshAsset {
+            vertices: vec![
+                MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                };
+                6
+            ],
+            indices: vec![0; 9],
+            submeshes: vec![
+                Submesh {
+                    index_start: 0,
+                    index_count: 3,
+                },
+                Submesh {
+                    index_start: 3,
+                    index_count: 6,
+                },
+            ],
+        };
+        let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        world.set_scene_asset(
+            "multi",
+            titan_core::AssetEntry {
+                path: "multi.mesh".into(),
+                kind: "geometry".into(),
+            },
+        );
+        let entity = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
+        world.insert(entity, Transform::default()).unwrap();
+        world
+            .insert(
+                entity,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:multi"),
+                    submeshes: Some(vec![1]),
+                },
+            )
+            .unwrap();
+        let scene = extract_scene_with_resolver(&world, |path| {
+            assert_eq!(path, "multi.mesh");
+            Ok(geometry.clone())
+        })
+        .unwrap();
+        assert_eq!(scene.draw_list[0].geometry.submeshes.len(), 1);
+        let stats = stats_for_scene(&scene, EntityId::from_raw(9));
+        assert_eq!(stats.draw_calls, 1);
+        assert_eq!(stats.triangles, 2);
+
+        let error = select_submeshes(cube_v1(), Some(&[1]), "cube").unwrap_err();
+        assert_eq!(error.code, error::ASSET_UNAVAILABLE);
+
+        let error = select_submeshes(cube_v1(), Some(&[]), "cube").unwrap_err();
+        assert_eq!(error.code, error::INVALID_GEOMETRY);
+        assert_eq!(error.path.as_deref(), Some("asset:cube/submeshes"));
+    }
+
+    #[test]
+    fn extraction_rejects_malformed_resolved_geometry() {
+        let cases = [
+            MeshAsset {
+                vertices: vec![MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                }],
+                indices: vec![0, 0, 0],
+                submeshes: vec![Submesh {
+                    index_start: u32::MAX,
+                    index_count: 1,
+                }],
+            },
+            MeshAsset {
+                vertices: vec![MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                }],
+                indices: vec![0, 0, 0],
+                submeshes: vec![Submesh {
+                    index_start: 1,
+                    index_count: 3,
+                }],
+            },
+            MeshAsset {
+                vertices: vec![MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                }],
+                indices: vec![0, 0, 0],
+                submeshes: vec![Submesh {
+                    index_start: 0,
+                    index_count: 2,
+                }],
+            },
+            MeshAsset {
+                vertices: vec![MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                }],
+                indices: vec![1, 0, 0],
+                submeshes: vec![Submesh {
+                    index_start: 0,
+                    index_count: 3,
+                }],
+            },
+            MeshAsset {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                submeshes: Vec::new(),
+            },
+            MeshAsset {
+                vertices: vec![MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0; 3],
+                    uv: [0.0; 2],
+                }],
+                indices: vec![0, 0, 0],
+                submeshes: Vec::new(),
+            },
+        ];
+        for geometry in cases {
+            let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+            world.set_scene_asset(
+                "bad",
+                titan_core::AssetEntry {
+                    path: "bad.mesh".into(),
+                    kind: "geometry".into(),
+                },
+            );
+            let entity = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
+            world
+                .insert(
+                    entity,
+                    Mesh {
+                        geometry: titan_core::AssetReference::new("asset:bad"),
+                        submeshes: None,
+                    },
+                )
+                .unwrap();
+            let error = extract_scene_with_resolver(&world, |_| Ok(geometry.clone())).unwrap_err();
+            assert_eq!(error.code, error::INVALID_GEOMETRY);
+        }
     }
 
     #[test]
     fn stats_are_derived_from_the_stable_mesh_draw_plan() {
         let mut world = world_with_camera();
+        world.set_scene_asset(
+            "fixture",
+            titan_core::AssetEntry {
+                path: CUBE_V1_PATH.into(),
+                kind: "geometry".into(),
+            },
+        );
         for id in [7, 3] {
             let entity = world.spawn_with_id(EntityId::from_raw(id)).unwrap();
             world.insert(entity, Transform::default()).unwrap();
@@ -922,7 +1285,7 @@ mod tests {
         );
         assert_eq!(output.stats.visible_meshes, 2);
         assert_eq!(output.stats.draw_calls, 2);
-        assert_eq!(output.stats.triangles, 2);
+        assert_eq!(output.stats.triangles, 24);
     }
 
     #[test]
@@ -952,6 +1315,13 @@ mod tests {
             )
             .unwrap();
         let mesh = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.set_scene_asset(
+            "fixture",
+            titan_core::AssetEntry {
+                path: CUBE_V1_PATH.into(),
+                kind: "geometry".into(),
+            },
+        );
         world.insert(mesh, Transform::default()).unwrap();
         world
             .insert(

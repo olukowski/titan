@@ -4,6 +4,7 @@ use std::{
     any::{Any, TypeId, type_name},
     collections::{BTreeMap, BTreeSet},
     fmt,
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -263,6 +264,15 @@ pub struct World {
     seed: u64,
     scene_entity_ids: BTreeMap<String, u64>,
     scene_entity_names: BTreeMap<String, Vec<EntityId>>,
+    scene_assets: BTreeMap<String, AssetEntry>,
+    scene_base_dir: Option<PathBuf>,
+}
+
+/// A scene asset declaration retained for renderer and other asset consumers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AssetEntry {
+    pub path: String,
+    pub kind: String,
 }
 
 impl World {
@@ -279,6 +289,8 @@ impl World {
             seed: 0,
             scene_entity_ids: BTreeMap::new(),
             scene_entity_names: BTreeMap::new(),
+            scene_assets: BTreeMap::new(),
+            scene_base_dir: None,
         }
     }
 
@@ -510,6 +522,22 @@ impl World {
         entities.sort_unstable();
         entities.retain(|entity| self.entities.contains(entity));
         entities
+    }
+
+    pub fn set_scene_asset(&mut self, alias: impl Into<String>, asset: AssetEntry) {
+        self.scene_assets.insert(alias.into(), asset);
+    }
+
+    pub fn scene_asset(&self, alias: &str) -> Option<&AssetEntry> {
+        self.scene_assets.get(alias)
+    }
+
+    pub fn set_scene_base_dir(&mut self, base_dir: impl Into<PathBuf>) {
+        self.scene_base_dir = Some(base_dir.into());
+    }
+
+    pub fn scene_base_dir(&self) -> Option<&std::path::Path> {
+        self.scene_base_dir.as_deref()
     }
 
     fn require_entity(&self, id: EntityId) -> Result<()> {

@@ -167,7 +167,7 @@ impl GpuContext {
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("titan first draw shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                "@group(0) @binding(0) var<uniform> camera: mat4x4<f32>;\n@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n  var p = array<vec3<f32>, 3>(vec3<f32>(-0.7, -0.6, 0.0), vec3<f32>(0.0, 0.75, 0.0), vec3<f32>(0.7, -0.6, 0.0));\n  return camera * vec4<f32>(p[i], 1.0);\n}\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.95, 0.2, 0.08, 1.0); }\n",
+                "@group(0) @binding(0) var<uniform> camera: mat4x4<f32>;\nstruct VertexIn { @location(0) position: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> @builtin(position) vec4<f32> { return camera * vec4<f32>(vertex.position, 1.0); }\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.95, 0.2, 0.08, 1.0); }\n",
             )),
         });
         let bind_layout = self
@@ -211,6 +211,39 @@ impl GpuContext {
                 (uniform, bind_group)
             })
             .collect::<Vec<_>>();
+        let mesh_buffers = draw_list
+            .iter()
+            .map(|item| {
+                let vertex_bytes = item
+                    .geometry
+                    .vertices
+                    .iter()
+                    .flat_map(|vertex| vertex.position)
+                    .flat_map(f32::to_ne_bytes)
+                    .collect::<Vec<_>>();
+                let index_bytes = item
+                    .geometry
+                    .indices
+                    .iter()
+                    .flat_map(|index| index.to_ne_bytes())
+                    .collect::<Vec<_>>();
+                let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("titan mesh vertex buffer"),
+                    size: vertex_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(&vertex_buffer, 0, &vertex_bytes);
+                let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("titan mesh index buffer"),
+                    size: index_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(&index_buffer, 0, &index_bytes);
+                (vertex_buffer, index_buffer)
+            })
+            .collect::<Vec<_>>();
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -225,7 +258,15 @@ impl GpuContext {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs"),
-                    buffers: &[],
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 12,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -300,9 +341,21 @@ impl GpuContext {
                 multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
-            for (_, bind_group) in &bind_groups {
+            for ((item, (vertex_buffer, index_buffer)), (_, bind_group)) in draw_list
+                .iter()
+                .zip(mesh_buffers.iter())
+                .zip(bind_groups.iter())
+            {
                 pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..3, 0..1);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                for submesh in &item.geometry.submeshes {
+                    pass.draw_indexed(
+                        submesh.index_start..submesh.index_start + submesh.index_count,
+                        0,
+                        0..1,
+                    );
+                }
             }
         }
         encoder.copy_texture_to_buffer(
