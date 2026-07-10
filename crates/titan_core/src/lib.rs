@@ -4,6 +4,7 @@ use std::{
     any::{Any, TypeId, type_name},
     collections::{BTreeMap, BTreeSet},
     fmt,
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -264,6 +265,7 @@ pub struct World {
     scene_entity_ids: BTreeMap<String, u64>,
     scene_entity_names: BTreeMap<String, Vec<EntityId>>,
     scene_assets: BTreeMap<String, AssetEntry>,
+    scene_base_dir: Option<PathBuf>,
 }
 
 /// A scene asset declaration retained for renderer and other asset consumers.
@@ -288,6 +290,7 @@ impl World {
             scene_entity_ids: BTreeMap::new(),
             scene_entity_names: BTreeMap::new(),
             scene_assets: BTreeMap::new(),
+            scene_base_dir: None,
         }
     }
 
@@ -527,6 +530,14 @@ impl World {
 
     pub fn scene_asset(&self, alias: &str) -> Option<&AssetEntry> {
         self.scene_assets.get(alias)
+    }
+
+    pub fn set_scene_base_dir(&mut self, base_dir: impl Into<PathBuf>) {
+        self.scene_base_dir = Some(base_dir.into());
+    }
+
+    pub fn scene_base_dir(&self) -> Option<&std::path::Path> {
+        self.scene_base_dir.as_deref()
     }
 
     fn require_entity(&self, id: EntityId) -> Result<()> {

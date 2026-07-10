@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use titan_core::{AssetEntry, ComponentRegistry, EntityId, World};
 
@@ -56,6 +56,9 @@ fn load_document(
 ) -> TsfResult<World> {
     let runtime_registry = component_registry.clone();
     let mut world = World::new(component_registry);
+    if let Some(file) = document.file.as_deref() {
+        world.set_scene_base_dir(Path::new(file).parent().unwrap_or_else(|| Path::new(".")));
+    }
     load_assets(document, &mut world)?;
     let entities = required_array(document, &document.root, "entities", "/entities")?;
     let entity_ids = scene_entity_ids(document, entities)?;

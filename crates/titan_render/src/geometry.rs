@@ -31,6 +31,52 @@ pub struct MeshAsset {
 }
 
 impl MeshAsset {
+    pub fn validate(&self, path: &str) -> ServiceResult<()> {
+        if self.vertices.is_empty() || self.indices.is_empty() {
+            return Err(RenderError::with_path(
+                error::INVALID_GEOMETRY,
+                "geometry must contain vertices and indices",
+                path,
+            ));
+        }
+        for submesh in &self.submeshes {
+            let end = submesh
+                .index_start
+                .checked_add(submesh.index_count)
+                .ok_or_else(|| {
+                    RenderError::with_path(
+                        error::INVALID_GEOMETRY,
+                        "submesh index range overflows",
+                        path,
+                    )
+                })?;
+            if submesh.index_count == 0
+                || submesh.index_count % 3 != 0
+                || end as usize > self.indices.len()
+            {
+                return Err(RenderError::with_path(
+                    error::INVALID_GEOMETRY,
+                    format!(
+                        "invalid submesh index range {}..{}",
+                        submesh.index_start, end
+                    ),
+                    path,
+                ));
+            }
+            if self.indices[submesh.index_start as usize..end as usize]
+                .iter()
+                .any(|&index| index as usize >= self.vertices.len())
+            {
+                return Err(RenderError::with_path(
+                    error::INVALID_GEOMETRY,
+                    "submesh index references a vertex outside the vertex buffer",
+                    path,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn triangle_count(&self) -> u64 {
         self.submeshes
             .iter()
@@ -149,7 +195,9 @@ impl GeometryResolver {
             ));
         }
         if virtual_relative_path == CUBE_V1_PATH {
-            return Ok(cube_v1());
+            let asset = cube_v1();
+            asset.validate(virtual_relative_path)?;
+            return Ok(asset);
         }
         if virtual_relative_path.split('/').next() == Some("__builtin__") {
             return Err(RenderError::with_path(
@@ -168,7 +216,10 @@ impl GeometryResolver {
         })?;
         Err(RenderError::with_path(
             error::ASSET_UNAVAILABLE,
-            "filesystem geometry loading is not implemented",
+            format!(
+                "filesystem geometry loading is not implemented: {}",
+                path.display()
+            ),
             virtual_relative_path,
         ))
     }
