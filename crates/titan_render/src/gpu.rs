@@ -46,6 +46,8 @@ impl AdapterBackend {
 pub struct AdapterInfo {
     pub name: String,
     pub backend: AdapterBackend,
+    pub driver: String,
+    pub driver_info: String,
 }
 
 /// CPU-side interpretation of the two supported adapter-selection variables.
@@ -154,6 +156,8 @@ impl GpuContext {
             adapter_info: AdapterInfo {
                 name: info.name,
                 backend: AdapterBackend::from_wgpu(info.backend),
+                driver: info.driver,
+                driver_info: info.driver_info,
             },
         })
     }

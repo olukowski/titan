@@ -31,3 +31,61 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  render-golden:
+    name: Render goldens (Vulkan llvmpipe)
+    runs-on: ubuntu-24.04
+    env:
+      WGPU_BACKEND: vulkan
+      WGPU_ADAPTER_NAME: llvmpipe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Mesa Vulkan llvmpipe
+        run: sudo apt-get update && sudo apt-get install --yes mesa-vulkan-drivers
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # The ignored test asserts both adapter name and backend. A missing
+      # golden or metadata file fails this job; it is never auto-skipped.
+      # Goldens can only be produced in this pinned environment, so when one
+      # is missing the job regenerates both, uploads them as an artifact for
+      # review, and still fails.
+      # Download the artifact, review it, commit it under
+      # crates/titan_render/tests/fixtures/, and rerun.
+      - name: Run llvmpipe pixel goldens
+        id: goldens
+        run: |
+          set -o pipefail
+          if [ -f crates/titan_render/tests/fixtures/red_cube.png ] && \
+             [ -f crates/titan_render/tests/fixtures/red_cube.golden.json ]; then
+            cargo test -p titan_render --test red_cube -- --ignored 2>&1 | \
+              tee "$RUNNER_TEMP/red-cube-test.log"
+            grep -Fq "test result: ok. 1 passed" "$RUNNER_TEMP/red-cube-test.log"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+            TITAN_REGEN_GOLDENS=1 cargo test -p titan_render --test red_cube -- --ignored 2>&1 | \
+              tee "$RUNNER_TEMP/red-cube-test.log"
+            grep -Fq "test result: ok. 1 passed" "$RUNNER_TEMP/red-cube-test.log"
+          fi
+
+      - name: Upload regenerated golden
+        if: steps.goldens.outputs.missing == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: red-cube-golden
+          path: |
+            crates/titan_render/tests/fixtures/red_cube.png
+            crates/titan_render/tests/fixtures/red_cube.golden.json
+
+      - name: Fail when the golden was missing
+        if: steps.goldens.outputs.missing == 'true'
+        run: |
+          echo "::error::Golden red_cube.png or red_cube.golden.json was missing. Download the red-cube-golden artifact, review both files, commit them to crates/titan_render/tests/fixtures/, and rerun."
+          exit 1

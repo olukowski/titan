@@ -13,6 +13,8 @@ titan_math.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+png.workspace = true
+serde_json.workspace = true
 titan_scene.workspace = true
 
 [lib]

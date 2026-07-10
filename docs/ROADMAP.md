@@ -34,6 +34,7 @@ Goal: agents (and humans) can look at what they built.
 - [ ] `titan run --capture-every N` for frame sequences
 - [ ] Windowed viewer (`titan view`) as a thin shell over the headless renderer
 - [ ] Render stats as structured output (draw calls, triangle counts) for verification without pixels
+- [x] Pinned Vulkan llvmpipe pixel goldens with stats-only tests elsewhere
 
 Exit criterion: an agent adds a red cube to a scene, renders headlessly, and can verify the cube is visible (via the image + render stats).
 

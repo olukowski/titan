@@ -1273,8 +1273,10 @@ dependencies = [
 name = "titan_render"
 version = "0.1.0"
 dependencies = [
+ "png",
  "pollster",
  "serde",
+ "serde_json",
  "titan_core",
  "titan_math",
  "titan_scene",
