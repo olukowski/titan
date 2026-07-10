@@ -536,16 +536,28 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
 }
 
 fn normalized_output_path(path: &Path) -> Result<std::path::PathBuf, TitanError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let parent = parent.unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
         TitanError::new(
             "TITAN_OUTPUT_PATH",
             format!("output path {} has no file name", path.display()),
         )
     })?;
+
+    match fs::canonicalize(path) {
+        Ok(path) => return Ok(path),
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("failed to resolve output path {}: {source}", path.display()),
+            ));
+        }
+        Err(_) => {}
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent).map_err(|source| {
         TitanError::new(
             "TITAN_OUTPUT_PATH",
