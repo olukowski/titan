@@ -416,6 +416,7 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
             ),
         ));
     }
+    reject_symlink(&args.out, "PNG output")?;
     let document = read_scene(&args.scene).map_err(|error| match error {
         SceneLoadError::Io(error) => error,
         SceneLoadError::Tsf(error) => TitanError::from_tsf("failed to parse scene", error),
@@ -537,26 +538,7 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
 }
 
 fn open_stats_file(path: &Path) -> Result<fs::File, TitanError> {
-    // Pathname- and symlink-level aliasing is rejected; hard-link aliases are intentionally not detected.
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(TitanError::new(
-                "TITAN_OUTPUT_PATH",
-                format!("stats output {} must not be a symlink", path.display()),
-            ));
-        }
-        Ok(_) => {}
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(TitanError::new(
-                "TITAN_OUTPUT_PATH",
-                format!(
-                    "failed to inspect stats output {}: {source}",
-                    path.display()
-                ),
-            ));
-        }
-    }
+    reject_symlink(path, "stats output")?;
 
     fs::OpenOptions::new()
         .write(true)
@@ -569,6 +551,27 @@ fn open_stats_file(path: &Path) -> Result<fs::File, TitanError> {
                 format!("failed to write {}: {source}", path.display()),
             )
         })
+}
+
+fn reject_symlink(path: &Path, label: &str) -> Result<(), TitanError> {
+    // Pathname- and symlink-level aliasing is rejected for both outputs; hard-link aliases are intentionally not detected.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("{label} {} must not be a symlink", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("failed to inspect {label} {}: {source}", path.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalized_output_path(path: &Path) -> Result<std::path::PathBuf, TitanError> {

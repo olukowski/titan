@@ -191,6 +191,39 @@ fn render_rejects_dangling_stats_symlink() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn render_rejects_dangling_png_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("tempdir");
+    let output_path = dir.path().join("frame.png");
+    let stats_path = dir.path().join("stats.json");
+    symlink(&stats_path, &output_path).expect("create dangling PNG symlink");
+    let path = scene(&dir, RED_CUBE);
+
+    let output = titan()
+        .args(["--json", "render"])
+        .arg(path)
+        .args(["--camera", "main", "--out"])
+        .arg(&output_path)
+        .args(["--stats-json"])
+        .arg(&stats_path)
+        .output()
+        .expect("run titan render");
+
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+    assert_eq!(error["error"]["code"], "TITAN_OUTPUT_PATH");
+    assert!(
+        fs::symlink_metadata(&output_path)
+            .expect("read PNG symlink metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!stats_path.exists());
+}
+
 #[test]
 fn render_selects_camera_by_name_and_serialized_id() {
     let dir = TempDir::new().expect("tempdir");
