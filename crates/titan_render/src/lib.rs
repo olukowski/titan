@@ -9,8 +9,12 @@ use serde::Serialize;
 use titan_core::{Camera, CameraProjection, Component, EntityId, Mesh, Transform, Velocity, World};
 use titan_math::Vec3;
 
+mod geometry;
 mod gpu;
 
+pub use geometry::{
+    AssetResolver, CUBE_V1_PATH, GeometryResolver, MeshAsset, MeshVertex, Submesh, cube_v1,
+};
 pub use gpu::{AdapterBackend, AdapterInfo, AdapterSelection};
 
 /// Stable codes used by structured renderer diagnostics.
@@ -24,6 +28,7 @@ pub mod error {
     pub const UNKNOWN_BUILTIN: &str = "RENDER_UNKNOWN_BUILTIN";
     pub const MISSING_NORMALS: &str = "RENDER_MISSING_NORMALS";
     pub const INVALID_NORMALS: &str = "RENDER_INVALID_NORMALS";
+    pub const ASSET_UNAVAILABLE: &str = "RENDER_ASSET_UNAVAILABLE";
 }
 
 /// A structured renderer failure, suitable for a CLI error envelope.
@@ -41,6 +46,14 @@ impl RenderError {
             code,
             message: message.into(),
             path: None,
+        }
+    }
+
+    fn with_path(code: &'static str, message: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            path: Some(path.into()),
         }
     }
 }
@@ -146,10 +159,11 @@ pub struct ExtractedEntity {
 }
 
 /// One planned fixture draw, including the entity's model transform.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DrawItem {
     pub entity: EntityId,
     pub model: Mat4,
+    pub geometry: MeshAsset,
 }
 
 /// Deterministic CPU render plan.
@@ -461,6 +475,7 @@ pub fn extract_scene(world: &World) -> RenderScene {
                 .ok()
                 .flatten()
                 .map_or(Mat4::IDENTITY, Mat4::from_transform),
+            geometry: cube_v1(),
         })
         .collect();
     RenderScene {
@@ -528,7 +543,11 @@ impl RenderService {
         let stats = RenderStats {
             visible_meshes: scene.draw_list.len() as u32,
             draw_calls: scene.draw_list.len() as u32,
-            triangles: scene.draw_list.len() as u64,
+            triangles: scene
+                .draw_list
+                .iter()
+                .map(|item| item.geometry.triangle_count())
+                .sum(),
             active_camera: Some(camera.0),
             ..RenderStats::default()
         };
@@ -922,7 +941,7 @@ mod tests {
         );
         assert_eq!(output.stats.visible_meshes, 2);
         assert_eq!(output.stats.draw_calls, 2);
-        assert_eq!(output.stats.triangles, 2);
+        assert_eq!(output.stats.triangles, 24);
     }
 
     #[test]
