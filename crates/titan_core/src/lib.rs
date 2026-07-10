@@ -493,10 +493,10 @@ impl World {
         entity: EntityId,
     ) -> Result<()> {
         self.require_entity(entity)?;
-        self.scene_entity_names
-            .entry(name.into())
-            .or_default()
-            .push(entity);
+        let entities = self.scene_entity_names.entry(name.into()).or_default();
+        if !entities.contains(&entity) {
+            entities.push(entity);
+        }
         Ok(())
     }
 
@@ -1441,6 +1441,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3]
         );
+    }
+
+    #[test]
+    fn duplicate_scene_entity_name_binding_returns_one_entity() {
+        let mut world = World::new(registry());
+        let entity = world.spawn_with_id(EntityId::from_raw(3)).unwrap();
+
+        world.bind_scene_entity_name("player", entity).unwrap();
+        world.bind_scene_entity_name("player", entity).unwrap();
+
+        assert_eq!(world.scene_entities_named("player"), vec![entity]);
     }
 
     #[test]

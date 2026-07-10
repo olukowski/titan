@@ -337,7 +337,7 @@ impl std::ops::Mul for Mat4 {
 fn resolve_camera(
     world: &World,
     selection: &CameraSelection,
-) -> ServiceResult<Option<(EntityId, Camera, Transform)>> {
+) -> ServiceResult<(EntityId, Camera, Transform)> {
     let candidates: Vec<EntityId> = match selection {
         CameraSelection::Entity(entity) => vec![*entity],
         CameraSelection::Name(name) => world.scene_entities_named(name),
@@ -377,7 +377,7 @@ fn resolve_camera(
                 "selected camera has no transform",
             )
         })?;
-    Ok(Some((entity, *camera, *transform)))
+    Ok((entity, *camera, *transform))
 }
 
 fn projection_viewport(projection: &CameraProjection) -> Option<OutputSize> {
@@ -516,49 +516,33 @@ impl RenderService {
         let output_size = if let Some(output_size) = request.output_size {
             output_size
         } else {
-            camera
-                .as_ref()
-                .and_then(|(_, camera, _)| projection_viewport(&camera.projection))
-                .unwrap_or_default()
+            projection_viewport(&camera.1.projection).unwrap_or_default()
         };
         validate_output_size(output_size, max_texture_dimension)?;
         let scene = extract_scene(world);
-        let view_projection = camera
-            .as_ref()
-            .map(|(_, camera, transform)| {
-                Mat4::projection(
-                    &camera.projection,
-                    output_size.width as f32 / output_size.height as f32,
-                )
-                .map(|projection| projection * Mat4::view_from_transform(transform))
-            })
-            .transpose()?
-            .unwrap_or(Mat4::IDENTITY);
+        let view_projection = Mat4::projection(
+            &camera.1.projection,
+            output_size.width as f32 / output_size.height as f32,
+        )
+        .map(|projection| projection * Mat4::view_from_transform(&camera.2))?;
         let stats = RenderStats {
             visible_meshes: scene.draw_list.len() as u32,
             draw_calls: scene.draw_list.len() as u32,
             triangles: scene.draw_list.len() as u64,
-            active_camera: camera.as_ref().map(|(id, _, _)| *id),
+            active_camera: Some(camera.0),
             ..RenderStats::default()
         };
         let rgba8 = match (&self.gpu, request.capture) {
-            (Some(gpu), CaptureMode::Image) if camera.is_some() => Some(gpu.draw_plan(
+            (Some(gpu), CaptureMode::Image) => Some(gpu.draw_plan(
                 output_size,
                 request.clear_color.0,
                 view_projection.0,
                 &scene.draw_list,
             )?),
-            (_, CaptureMode::Image) if camera.is_none() => {
-                return Err(RenderError::new(
-                    error::CAMERA_UNAVAILABLE,
-                    "a camera is required for image rendering",
-                ));
-            }
-            (_, CaptureMode::Image) => unreachable!("CPU image capture was rejected above"),
             _ => None,
         };
         Ok(RenderResult {
-            camera: camera.as_ref().map(|(id, _, _)| *id),
+            camera: Some(camera.0),
             output_size,
             stats,
             scene,
