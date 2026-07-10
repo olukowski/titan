@@ -330,7 +330,7 @@ impl Mat4 {
 
     /// The inverse-transpose of a rigid transform's upper-left 3x3 matrix.
     /// Transforms currently contain rotation and translation only, so the
-    /// inverse-transpose is the rotation transpose.
+    /// inverse-transpose is the rotation itself.
     pub fn normal_from_transform(transform: &Transform) -> Self {
         Self::normal_from_model(Self::from_transform(transform))
     }
@@ -340,7 +340,7 @@ impl Mat4 {
         let mut normal = Self::IDENTITY.0;
         for (row, values) in normal.iter_mut().take(3).enumerate() {
             for (column, value) in values.iter_mut().take(3).enumerate() {
-                *value = model[column][row];
+                *value = model[row][column];
             }
         }
         Self(normal)
@@ -1588,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_matrix_is_the_inverse_transpose_for_rigid_transforms() {
+    fn normal_matrix_rotates_normals_with_the_mesh() {
         let transform = Transform {
             translation: Vec3::new(4.0, 5.0, 6.0),
             rotation: [0.0, 0.70710677, 0.0, 0.70710677],
@@ -1597,8 +1597,34 @@ mod tests {
         let normal = Mat4::normal_from_transform(&transform).0;
         for row in 0..3 {
             for column in 0..3 {
-                assert!((normal[row][column] - model[column][row]).abs() < 1e-5);
+                assert!((normal[row][column] - model[row][column]).abs() < 1e-5);
             }
+        }
+        let local_normal = [1.0, 0.0, 0.0];
+        let world_normal = [
+            model[0][0] * local_normal[0]
+                + model[0][1] * local_normal[1]
+                + model[0][2] * local_normal[2],
+            model[1][0] * local_normal[0]
+                + model[1][1] * local_normal[1]
+                + model[1][2] * local_normal[2],
+            model[2][0] * local_normal[0]
+                + model[2][1] * local_normal[1]
+                + model[2][2] * local_normal[2],
+        ];
+        let transformed_normal = [
+            normal[0][0] * local_normal[0]
+                + normal[0][1] * local_normal[1]
+                + normal[0][2] * local_normal[2],
+            normal[1][0] * local_normal[0]
+                + normal[1][1] * local_normal[1]
+                + normal[1][2] * local_normal[2],
+            normal[2][0] * local_normal[0]
+                + normal[2][1] * local_normal[1]
+                + normal[2][2] * local_normal[2],
+        ];
+        for (actual, expected) in transformed_normal.into_iter().zip(world_normal) {
+            assert!((actual - expected).abs() < 1e-5);
         }
         assert_eq!(normal[0][3], 0.0);
         assert_eq!(normal[3][0], 0.0);

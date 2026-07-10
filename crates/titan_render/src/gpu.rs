@@ -9,6 +9,13 @@ use crate::{
     error, validate_output_size,
 };
 
+const UNIFORM_SIZE: usize = 272;
+const MVP_OFFSET: usize = 0;
+const MODEL_OFFSET: usize = 64;
+const NORMAL_MATRIX_OFFSET: usize = 128;
+const CAMERA_POSITION_OFFSET: usize = 192;
+const BASE_COLOR_OFFSET: usize = 208;
+
 /// The graphics backend selected for a Titan GPU context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,7 +192,7 @@ impl GpuContext {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(272),
+                        min_binding_size: std::num::NonZeroU64::new(UNIFORM_SIZE as u64),
                     },
                     count: None,
                 }],
@@ -196,14 +203,10 @@ impl GpuContext {
                 let matrix = (Mat4(view_projection) * item.model).transpose().0;
                 let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("titan draw transform uniform"),
-                    size: 272,
+                    size: UNIFORM_SIZE as u64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let mut bytes = [0u8; 272];
-                for (index, value) in matrix.iter().flatten().enumerate() {
-                    bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
-                }
                 let material = item.material;
                 let model = match material.model {
                     MaterialModel::Unlit => 0.0,
@@ -248,30 +251,19 @@ impl GpuContext {
                         },
                     ],
                 ];
-                let model = item.model.transpose().0;
-                let normal_matrix = Mat4::normal_from_model(item.model).transpose().0;
-                for (matrix_offset, matrix) in [(1, model), (2, normal_matrix)] {
-                    for (index, value) in matrix.iter().flatten().enumerate() {
-                        let byte_index = matrix_offset * 64 + index * 4;
-                        bytes[byte_index..byte_index + 4].copy_from_slice(&value.to_ne_bytes());
-                    }
-                }
                 let camera = [
                     camera_position[0],
                     camera_position[1],
                     camera_position[2],
                     0.0,
                 ];
-                for (vector_index, vector) in values.into_iter().enumerate() {
-                    for (component, value) in vector.into_iter().enumerate() {
-                        let index = 208 + (vector_index * 4 + component) * 4;
-                        bytes[index..index + 4].copy_from_slice(&value.to_ne_bytes());
-                    }
-                }
-                for (component, value) in camera.into_iter().enumerate() {
-                    let index = 128 + component * 4;
-                    bytes[index..index + 4].copy_from_slice(&value.to_ne_bytes());
-                }
+                let bytes = pack_uniform_bytes(
+                    matrix,
+                    item.model,
+                    Mat4::normal_from_model(item.model),
+                    camera,
+                    values,
+                );
                 self.queue.write_buffer(&uniform, 0, &bytes);
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("titan draw transform bind group"),
@@ -536,6 +528,41 @@ impl GpuContext {
     }
 }
 
+fn pack_uniform_bytes(
+    mvp: [[f32; 4]; 4],
+    model: Mat4,
+    normal_matrix: Mat4,
+    camera_position: [f32; 4],
+    values: [[f32; 4]; 4],
+) -> [u8; UNIFORM_SIZE] {
+    let mut bytes = [0u8; UNIFORM_SIZE];
+    for (offset, matrix) in [
+        (MVP_OFFSET, mvp),
+        (MODEL_OFFSET, model.transpose().0),
+        (NORMAL_MATRIX_OFFSET, normal_matrix.transpose().0),
+    ] {
+        for (index, value) in matrix.iter().flatten().enumerate() {
+            let byte_index = offset + index * 4;
+            bytes[byte_index..byte_index + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+    for (offset, vector) in [(CAMERA_POSITION_OFFSET, camera_position)]
+        .into_iter()
+        .chain(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, vector)| (BASE_COLOR_OFFSET + index * 16, vector)),
+        )
+    {
+        for (component, value) in vector.into_iter().enumerate() {
+            let byte_index = offset + component * 4;
+            bytes[byte_index..byte_index + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+    bytes
+}
+
 /// GPU-owned color/depth targets with no public `wgpu` types in the contract.
 pub(crate) struct OffscreenRenderTargets {
     color: wgpu::Texture,
@@ -545,6 +572,41 @@ pub(crate) struct OffscreenRenderTargets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_at(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn uniform_buffer_layout_has_expected_field_offsets() {
+        let mvp = [[1.0; 4]; 4];
+        let model = Mat4([[2.0; 4]; 4]);
+        let normal_matrix = Mat4([[3.0; 4]; 4]);
+        let camera = [4.0, 5.0, 6.0, 7.0];
+        let values = [
+            [8.0, 9.0, 10.0, 11.0],
+            [12.0, 13.0, 14.0, 15.0],
+            [16.0, 17.0, 18.0, 19.0],
+            [20.0, 21.0, 22.0, 23.0],
+        ];
+        let bytes = pack_uniform_bytes(mvp, model, normal_matrix, camera, values);
+
+        assert_eq!(bytes.len(), 272);
+        assert_eq!(f32_at(&bytes, 0), 1.0);
+        assert_eq!(f32_at(&bytes, 64), 2.0);
+        assert_eq!(f32_at(&bytes, 128), 3.0);
+        assert_eq!(
+            &bytes[192..208],
+            &camera
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(f32_at(&bytes, 208), 8.0);
+        assert_eq!(f32_at(&bytes, 224), 12.0);
+        assert_eq!(f32_at(&bytes, 240), 16.0);
+        assert_eq!(f32_at(&bytes, 256), 20.0);
+    }
 
     #[test]
     fn selection_is_case_insensitive_and_uses_name_substrings() {
