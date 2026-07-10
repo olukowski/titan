@@ -6,7 +6,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::Serialize;
-use titan_core::{Component, EntityId, Transform, Velocity, World};
+use titan_core::{Camera, CameraProjection, Component, EntityId, Mesh, Transform, Velocity, World};
 use titan_math::Vec3;
 
 mod gpu;
@@ -56,13 +56,13 @@ impl std::error::Error for RenderError {}
 /// Result type for renderer operations.
 pub type ServiceResult<T> = Result<T, RenderError>;
 
-/// Camera selection reserved for the camera component implementation.
+/// Camera selection for a render request.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum CameraSelection {
     Entity(EntityId),
     Name(String),
-    /// Let the renderer choose its default camera once cameras exist.
+    /// Resolve the only camera in the world.
     #[default]
     Default,
 }
@@ -130,7 +130,7 @@ pub enum CaptureMode {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RenderRequest {
     pub camera: CameraSelection,
-    pub output_size: OutputSize,
+    pub output_size: Option<OutputSize>,
     pub clear_color: ClearColor,
     pub capture: CaptureMode,
 }
@@ -140,16 +140,16 @@ pub struct RenderRequest {
 pub struct ExtractedEntity {
     pub entity: EntityId,
     pub transform: Transform,
+    pub model: Mat4,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub velocity: Option<Vec3>,
 }
 
-/// Future GPU draw input. Mesh/material fields will be added with their TSF
-/// components; keeping this type separate prevents renderer state leaking into
-/// `titan_core`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+/// One planned fixture draw, including the entity's model transform.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct DrawItem {
     pub entity: EntityId,
+    pub model: Mat4,
 }
 
 /// Deterministic CPU render plan.
@@ -168,6 +168,7 @@ pub struct RenderStats {
     pub active_directional_lights: u32,
     pub ignored_directional_lights: u32,
     pub material_models: BTreeMap<String, u32>,
+    pub active_camera: Option<EntityId>,
 }
 
 /// Result returned by the service. Pixels are deliberately unavailable until
@@ -196,6 +197,198 @@ pub struct RenderComponentRegistry {
     components: Vec<RenderComponentMetadata>,
 }
 
+/// A deterministic row-major 4x4 matrix, with column vectors on the right.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Mat4(pub [[f32; 4]; 4]);
+
+impl Mat4 {
+    pub const IDENTITY: Self = Self([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]);
+
+    pub fn from_transform(transform: &Transform) -> Self {
+        let [x, y, z, w] = transform.rotation;
+        Self([
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+                transform.translation.x,
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+                transform.translation.y,
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+                transform.translation.z,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    }
+
+    pub fn view_from_transform(transform: &Transform) -> Self {
+        let model = Self::from_transform(transform).0;
+        let mut view = Self::IDENTITY.0;
+        for row in 0..3 {
+            for column in 0..3 {
+                view[row][column] = model[column][row];
+            }
+        }
+        for values in view.iter_mut().take(3) {
+            values[3] =
+                -(values[0] * model[0][3] + values[1] * model[1][3] + values[2] * model[2][3]);
+        }
+        Self(view)
+    }
+
+    pub fn projection(projection: &CameraProjection, aspect: f32) -> ServiceResult<Self> {
+        if !aspect.is_finite() || aspect <= 0.0 {
+            return Err(RenderError::new(
+                error::INVALID_OUTPUT_SIZE,
+                "camera aspect ratio must be positive",
+            ));
+        }
+        match *projection {
+            CameraProjection::Perspective {
+                vertical_fov_degrees,
+                near,
+                far,
+                ..
+            } => {
+                if !(vertical_fov_degrees.is_finite()
+                    && near.is_finite()
+                    && far.is_finite()
+                    && 0.0 < vertical_fov_degrees
+                    && vertical_fov_degrees < 180.0
+                    && 0.0 < near
+                    && near < far)
+                {
+                    return Err(RenderError::new(
+                        error::CAMERA_UNAVAILABLE,
+                        "invalid perspective camera parameters",
+                    ));
+                }
+                let f = 1.0 / (vertical_fov_degrees.to_radians() * 0.5).tan();
+                Ok(Self([
+                    [f / aspect, 0.0, 0.0, 0.0],
+                    [0.0, f, 0.0, 0.0],
+                    [0.0, 0.0, far / (near - far), (near * far) / (near - far)],
+                    [0.0, 0.0, -1.0, 0.0],
+                ]))
+            }
+            CameraProjection::Orthographic {
+                height, near, far, ..
+            } => {
+                if !(height.is_finite()
+                    && near.is_finite()
+                    && far.is_finite()
+                    && height > 0.0
+                    && 0.0 < near
+                    && near < far)
+                {
+                    return Err(RenderError::new(
+                        error::CAMERA_UNAVAILABLE,
+                        "invalid orthographic camera parameters",
+                    ));
+                }
+                let half = height * 0.5;
+                Ok(Self([
+                    [1.0 / (half * aspect), 0.0, 0.0, 0.0],
+                    [0.0, 1.0 / half, 0.0, 0.0],
+                    [0.0, 0.0, 1.0 / (near - far), near / (near - far)],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]))
+            }
+        }
+    }
+
+    fn transpose(self) -> Self {
+        let mut result = [[0.0; 4]; 4];
+        for (row, values) in result.iter_mut().enumerate() {
+            for (column, value) in values.iter_mut().enumerate() {
+                *value = self.0[column][row];
+            }
+        }
+        Self(result)
+    }
+}
+
+impl std::ops::Mul for Mat4 {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        let mut out = [[0.0; 4]; 4];
+        for (row, values) in out.iter_mut().enumerate() {
+            for (column, value) in values.iter_mut().enumerate() {
+                *value = (0..4).map(|i| self.0[row][i] * rhs.0[i][column]).sum();
+            }
+        }
+        Self(out)
+    }
+}
+
+fn resolve_camera(
+    world: &World,
+    selection: &CameraSelection,
+) -> ServiceResult<(EntityId, Camera, Transform)> {
+    let candidates: Vec<EntityId> = match selection {
+        CameraSelection::Entity(entity) => vec![*entity],
+        CameraSelection::Name(name) => world.scene_entities_named(name),
+        CameraSelection::Default => world
+            .query::<&'static Camera>()
+            .map(|(entity, _)| entity)
+            .collect(),
+    };
+    if candidates.len() > 1 {
+        return Err(RenderError::new(
+            error::CAMERA_UNAVAILABLE,
+            "camera selection is ambiguous",
+        ));
+    }
+    if candidates.is_empty() {
+        return Err(RenderError::new(
+            error::CAMERA_UNAVAILABLE,
+            "selected camera was not found",
+        ));
+    }
+    let entity = candidates[0];
+    let camera = world
+        .get::<Camera>(entity)
+        .map_err(|error| RenderError::new(error::CAMERA_UNAVAILABLE, error.to_string()))?
+        .ok_or_else(|| {
+            RenderError::new(
+                error::CAMERA_UNAVAILABLE,
+                "selected entity has no camera component",
+            )
+        })?;
+    let transform = world
+        .get::<Transform>(entity)
+        .map_err(|error| RenderError::new(error::CAMERA_UNAVAILABLE, error.to_string()))?
+        .ok_or_else(|| {
+            RenderError::new(
+                error::CAMERA_UNAVAILABLE,
+                "selected camera has no transform",
+            )
+        })?;
+    Ok((entity, *camera, *transform))
+}
+
+fn projection_viewport(projection: &CameraProjection) -> Option<OutputSize> {
+    match *projection {
+        CameraProjection::Perspective { viewport, .. }
+        | CameraProjection::Orthographic { viewport, .. } => {
+            viewport.map(|v| OutputSize::new(v.width, v.height))
+        }
+    }
+}
+
 impl RenderComponentRegistry {
     pub fn phase1() -> Self {
         Self {
@@ -212,6 +405,29 @@ impl RenderComponentRegistry {
         }
     }
 
+    pub fn phase2() -> Self {
+        let mut registry = Self::phase1();
+        registry.components.extend([
+            RenderComponentMetadata {
+                registered_name: Camera::NAME,
+                schema_version: Camera::SCHEMA_VERSION,
+            },
+            RenderComponentMetadata {
+                registered_name: titan_core::DirectionalLight::NAME,
+                schema_version: titan_core::DirectionalLight::SCHEMA_VERSION,
+            },
+            RenderComponentMetadata {
+                registered_name: Mesh::NAME,
+                schema_version: Mesh::SCHEMA_VERSION,
+            },
+            RenderComponentMetadata {
+                registered_name: titan_core::Material::NAME,
+                schema_version: titan_core::Material::SCHEMA_VERSION,
+            },
+        ]);
+        registry
+    }
+
     pub fn components(&self) -> &[RenderComponentMetadata] {
         &self.components
     }
@@ -224,6 +440,7 @@ pub fn extract_scene(world: &World) -> RenderScene {
         .map(|(entity, transform)| ExtractedEntity {
             entity,
             transform: *transform,
+            model: Mat4::from_transform(transform),
             velocity: match world.get::<Velocity>(entity) {
                 Ok(Some(velocity)) => Some(velocity.linear),
                 Ok(None) => None,
@@ -235,9 +452,20 @@ pub fn extract_scene(world: &World) -> RenderScene {
         })
         .collect();
 
+    let draw_list = world
+        .query::<&'static Mesh>()
+        .map(|(entity, _)| DrawItem {
+            entity,
+            model: world
+                .get::<Transform>(entity)
+                .ok()
+                .flatten()
+                .map_or(Mat4::IDENTITY, Mat4::from_transform),
+        })
+        .collect();
     RenderScene {
         entities,
-        draw_list: Vec::new(),
+        draw_list,
     }
 }
 
@@ -253,7 +481,7 @@ impl RenderService {
     /// suitable headless device is available.
     pub fn new() -> ServiceResult<Self> {
         Ok(Self {
-            components: RenderComponentRegistry::phase1(),
+            components: RenderComponentRegistry::phase2(),
             gpu: Some(gpu::GpuContext::new()?),
         })
     }
@@ -261,7 +489,7 @@ impl RenderService {
     /// Creates the CPU-only service used by stats and extraction tests.
     pub fn cpu_only() -> Self {
         Self {
-            components: RenderComponentRegistry::phase1(),
+            components: RenderComponentRegistry::phase2(),
             gpu: None,
         }
     }
@@ -271,39 +499,54 @@ impl RenderService {
         self.gpu.as_ref().map(gpu::GpuContext::adapter_info)
     }
 
-    /// Renders the CPU-side phase-1 plan. GPU-backed services share this plan
-    /// until the draw pipeline is added.
+    /// Renders the deterministic CPU draw plan and, when requested, submits it
+    /// to the GPU backend.
     pub fn render(&self, world: &World, request: RenderRequest) -> ServiceResult<RenderResult> {
         let max_texture_dimension = self
             .gpu
             .as_ref()
             .map(|gpu| gpu.device_limits().max_texture_dimension_2d);
-        validate_output_size(request.output_size, max_texture_dimension)?;
-        if !matches!(request.camera, CameraSelection::Default) {
-            return Err(RenderError::new(
-                error::CAMERA_UNAVAILABLE,
-                "camera components are not available in the phase 1 render extraction",
-            ));
-        }
-        if request.capture == CaptureMode::Image {
+        if request.capture == CaptureMode::Image && self.gpu.is_none() {
             return Err(RenderError::new(
                 error::CAPTURE_UNAVAILABLE,
-                "image capture is not available before GPU backend initialization",
+                "image capture requires a GPU-backed render service",
             ));
         }
-
+        let camera = resolve_camera(world, &request.camera)?;
+        let output_size = if let Some(output_size) = request.output_size {
+            output_size
+        } else {
+            projection_viewport(&camera.1.projection).unwrap_or_default()
+        };
+        validate_output_size(output_size, max_texture_dimension)?;
         let scene = extract_scene(world);
+        let view_projection = Mat4::projection(
+            &camera.1.projection,
+            output_size.width as f32 / output_size.height as f32,
+        )
+        .map(|projection| projection * Mat4::view_from_transform(&camera.2))?;
         let stats = RenderStats {
             visible_meshes: scene.draw_list.len() as u32,
             draw_calls: scene.draw_list.len() as u32,
+            triangles: scene.draw_list.len() as u64,
+            active_camera: Some(camera.0),
             ..RenderStats::default()
         };
+        let rgba8 = match (&self.gpu, request.capture) {
+            (Some(gpu), CaptureMode::Image) => Some(gpu.draw_plan(
+                output_size,
+                request.clear_color.0,
+                view_projection.0,
+                &scene.draw_list,
+            )?),
+            _ => None,
+        };
         Ok(RenderResult {
-            camera: None,
-            output_size: request.output_size,
+            camera: Some(camera.0),
+            output_size,
             stats,
             scene,
-            rgba8: None,
+            rgba8,
         })
     }
 }
@@ -326,6 +569,34 @@ mod tests {
         world
     }
 
+    fn world_with_camera() -> World {
+        let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        let entity = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
+        world
+            .insert(
+                entity,
+                Transform::from_translation(Vec3::new(0.0, 0.0, 3.0)),
+            )
+            .unwrap();
+        world
+            .insert(
+                entity,
+                Camera {
+                    projection: CameraProjection::Perspective {
+                        vertical_fov_degrees: 60.0,
+                        near: 0.1,
+                        far: 100.0,
+                        viewport: Some(titan_core::Viewport {
+                            width: 320,
+                            height: 200,
+                        }),
+                    },
+                },
+            )
+            .unwrap();
+        world
+    }
+
     #[test]
     fn extraction_is_stable_and_keeps_cpu_components() {
         let scene = extract_scene(&world_with_components());
@@ -338,7 +609,7 @@ mod tests {
     #[test]
     fn stats_reflect_the_current_empty_draw_plan() {
         let output = RenderService::cpu_only()
-            .render(&world_with_components(), RenderRequest::default())
+            .render(&world_with_camera(), RenderRequest::default())
             .unwrap();
         assert_eq!(output.stats.draw_calls, 0);
         assert_eq!(output.stats.triangles, 0);
@@ -347,13 +618,43 @@ mod tests {
     }
 
     #[test]
-    fn invalid_requests_use_stable_codes() {
+    fn default_camera_requires_exactly_one_camera() {
         let world = world_with_components();
+        let error = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap_err();
+        assert_eq!(error.code, error::CAMERA_UNAVAILABLE);
+
+        let mut world = world_with_camera();
+        let second = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.insert(second, Transform::default()).unwrap();
+        world
+            .insert(
+                second,
+                Camera {
+                    projection: CameraProjection::Perspective {
+                        vertical_fov_degrees: 60.0,
+                        near: 0.1,
+                        far: 100.0,
+                        viewport: None,
+                    },
+                },
+            )
+            .unwrap();
+        let error = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap_err();
+        assert_eq!(error.code, error::CAMERA_UNAVAILABLE);
+    }
+
+    #[test]
+    fn invalid_requests_use_stable_codes() {
+        let world = world_with_camera();
         let error = RenderService::cpu_only()
             .render(
                 &world,
                 RenderRequest {
-                    output_size: OutputSize::new(0, 10),
+                    output_size: Some(OutputSize::new(0, 10)),
                     ..RenderRequest::default()
                 },
             )
@@ -364,7 +665,7 @@ mod tests {
             .render(
                 &world,
                 RenderRequest {
-                    output_size: OutputSize::new(10, 0),
+                    output_size: Some(OutputSize::new(10, 0)),
                     ..RenderRequest::default()
                 },
             )
@@ -395,12 +696,12 @@ mod tests {
     }
 
     #[test]
-    fn default_service_registers_phase1_components() {
+    fn default_service_registers_phase2_components() {
         assert_eq!(
             RenderService::cpu_only().components,
             RenderService::cpu_only().components
         );
-        assert_eq!(RenderService::cpu_only().components.components().len(), 2);
+        assert_eq!(RenderService::cpu_only().components.components().len(), 6);
         assert_eq!(
             RenderService::cpu_only().components.components()[0].registered_name,
             Transform::NAME
@@ -409,5 +710,281 @@ mod tests {
             RenderService::cpu_only().components.components()[1].registered_name,
             Velocity::NAME
         );
+    }
+
+    #[test]
+    fn perspective_view_projection_places_origin_at_center() {
+        let camera = CameraProjection::Perspective {
+            vertical_fov_degrees: 60.0,
+            near: 0.1,
+            far: 100.0,
+            viewport: None,
+        };
+        let projection = Mat4::projection(&camera, 16.0 / 9.0).unwrap();
+        let view =
+            Mat4::view_from_transform(&Transform::from_translation(Vec3::new(0.0, 0.0, 3.0)));
+        let clip = (projection * view).0;
+        assert!((clip[0][3]).abs() < 1e-6);
+        assert!((clip[1][3]).abs() < 1e-6);
+        assert!((clip[3][3] - 3.0).abs() < 1e-6);
+        assert!((projection.0[0][0] - projection.0[1][1] / (16.0 / 9.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn orthographic_projection_uses_requested_height() {
+        let projection = Mat4::projection(
+            &CameraProjection::Orthographic {
+                height: 10.0,
+                near: 1.0,
+                far: 11.0,
+                viewport: None,
+            },
+            2.0,
+        )
+        .unwrap();
+        assert!((projection.0[0][0] - 0.1).abs() < 1e-6);
+        assert!((projection.0[1][1] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn invalid_projection_parameters_return_structured_errors() {
+        for projection in [
+            CameraProjection::Perspective {
+                vertical_fov_degrees: 0.0,
+                near: 0.1,
+                far: 10.0,
+                viewport: None,
+            },
+            CameraProjection::Perspective {
+                vertical_fov_degrees: 180.0,
+                near: 0.1,
+                far: 10.0,
+                viewport: None,
+            },
+            CameraProjection::Perspective {
+                vertical_fov_degrees: f32::NAN,
+                near: 0.1,
+                far: 10.0,
+                viewport: None,
+            },
+            CameraProjection::Perspective {
+                vertical_fov_degrees: 60.0,
+                near: f32::INFINITY,
+                far: 10.0,
+                viewport: None,
+            },
+            CameraProjection::Orthographic {
+                height: 0.0,
+                near: 0.1,
+                far: 10.0,
+                viewport: None,
+            },
+            CameraProjection::Orthographic {
+                height: 10.0,
+                near: 10.0,
+                far: 10.0,
+                viewport: None,
+            },
+        ] {
+            let error = Mat4::projection(&projection, 1.0).unwrap_err();
+            assert_eq!(error.code, error::CAMERA_UNAVAILABLE);
+        }
+    }
+
+    #[test]
+    fn explicit_output_size_overrides_camera_viewport() {
+        let result = RenderService::cpu_only()
+            .render(
+                &world_with_camera(),
+                RenderRequest {
+                    output_size: Some(OutputSize::new(640, 480)),
+                    ..RenderRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.output_size, OutputSize::new(640, 480));
+    }
+
+    #[test]
+    fn named_camera_resolves_and_ambiguous_names_fail() {
+        let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        let first = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
+        let second = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        let camera = Camera {
+            projection: CameraProjection::Perspective {
+                vertical_fov_degrees: 60.0,
+                near: 0.1,
+                far: 10.0,
+                viewport: None,
+            },
+        };
+        for entity in [first, second] {
+            world.insert(entity, camera).unwrap();
+            world
+                .insert(
+                    entity,
+                    Transform::from_translation(Vec3::new(0.0, 0.0, 3.0)),
+                )
+                .unwrap();
+        }
+        world.bind_scene_entity_name("main", first).unwrap();
+        let result = RenderService::cpu_only()
+            .render(
+                &world,
+                RenderRequest {
+                    camera: CameraSelection::Name("main".into()),
+                    ..RenderRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.camera, Some(first));
+        world.bind_scene_entity_name("main", second).unwrap();
+        let error = RenderService::cpu_only()
+            .render(
+                &world,
+                RenderRequest {
+                    camera: CameraSelection::Name("main".into()),
+                    ..RenderRequest::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, error::CAMERA_UNAVAILABLE);
+    }
+
+    #[test]
+    fn extraction_contains_models_and_meshes_in_entity_order() {
+        let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        for id in [7, 2] {
+            let entity = world.spawn_with_id(EntityId::from_raw(id)).unwrap();
+            world
+                .insert(
+                    entity,
+                    Transform::from_translation(Vec3::new(id as f32, 0.0, 0.0)),
+                )
+                .unwrap();
+            world
+                .insert(
+                    entity,
+                    Mesh {
+                        geometry: titan_core::AssetReference::new("asset:fixture"),
+                        submeshes: None,
+                    },
+                )
+                .unwrap();
+        }
+        let scene = extract_scene(&world);
+        assert_eq!(
+            scene
+                .draw_list
+                .iter()
+                .map(|item| item.entity.raw())
+                .collect::<Vec<_>>(),
+            vec![2, 7]
+        );
+        assert_eq!(
+            scene
+                .entities
+                .iter()
+                .map(|item| item.entity.raw())
+                .collect::<Vec<_>>(),
+            vec![2, 7]
+        );
+        assert!((scene.entities[0].model.0[0][3] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stats_are_derived_from_the_stable_mesh_draw_plan() {
+        let mut world = world_with_camera();
+        for id in [7, 3] {
+            let entity = world.spawn_with_id(EntityId::from_raw(id)).unwrap();
+            world.insert(entity, Transform::default()).unwrap();
+            world
+                .insert(
+                    entity,
+                    Mesh {
+                        geometry: titan_core::AssetReference::new("asset:fixture"),
+                        submeshes: None,
+                    },
+                )
+                .unwrap();
+        }
+        let output = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap();
+        assert_eq!(
+            output
+                .scene
+                .draw_list
+                .iter()
+                .map(|item| item.entity.raw())
+                .collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert_eq!(output.stats.visible_meshes, 2);
+        assert_eq!(output.stats.draw_calls, 2);
+        assert_eq!(output.stats.triangles, 2);
+    }
+
+    #[test]
+    fn gpu_smoke_returns_pixels_or_no_adapter() {
+        let mut world = World::new(titan_core::phase2_component_registry().unwrap());
+        let camera = world.spawn_with_id(EntityId::from_raw(1)).unwrap();
+        world
+            .insert(
+                camera,
+                Transform::from_translation(Vec3::new(0.0, 0.0, 3.0)),
+            )
+            .unwrap();
+        world
+            .insert(
+                camera,
+                Camera {
+                    projection: CameraProjection::Perspective {
+                        vertical_fov_degrees: 60.0,
+                        near: 0.1,
+                        far: 10.0,
+                        viewport: Some(titan_core::Viewport {
+                            width: 32,
+                            height: 32,
+                        }),
+                    },
+                },
+            )
+            .unwrap();
+        let mesh = world.spawn_with_id(EntityId::from_raw(2)).unwrap();
+        world.insert(mesh, Transform::default()).unwrap();
+        world
+            .insert(
+                mesh,
+                Mesh {
+                    geometry: titan_core::AssetReference::new("asset:fixture"),
+                    submeshes: None,
+                },
+            )
+            .unwrap();
+        match RenderService::new() {
+            Err(error) => assert_eq!(error.code, error::NO_ADAPTER),
+            Ok(service) => {
+                let result = service
+                    .render(
+                        &world,
+                        RenderRequest {
+                            camera: CameraSelection::Entity(camera),
+                            capture: CaptureMode::Image,
+                            clear_color: ClearColor([0.1, 0.2, 0.3, 1.0]),
+                            ..RenderRequest::default()
+                        },
+                    )
+                    .unwrap();
+                let pixels = result.rgba8.unwrap();
+                assert_eq!(pixels.len(), 32 * 32 * 4);
+                assert_ne!(&pixels[0..4], &[26, 51, 76, 255]);
+                assert!(
+                    pixels
+                        .chunks_exact(4)
+                        .any(|pixel| pixel[0] > 200 && pixel[2] < 120)
+                );
+            }
+        }
     }
 }

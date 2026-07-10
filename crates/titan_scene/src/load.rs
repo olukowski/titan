@@ -106,6 +106,21 @@ fn load_document(
                     entity_span,
                 )
             })?;
+        if let Some(name_member) = member(members, "name")
+            && let ValueKind::String(name) = &name_member.value.kind
+        {
+            world
+                .bind_scene_entity_name(name, entity_id)
+                .map_err(|error| {
+                    one(
+                        document,
+                        "TSF_LOAD_WORLD",
+                        error.to_string(),
+                        format!("{path}/name"),
+                        name_member.value.span,
+                    )
+                })?;
+        }
 
         if let Some(components) = member(members, "components") {
             load_components(
