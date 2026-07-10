@@ -570,7 +570,6 @@ impl GpuContext {
     }
 
     /// Creates an sRGB color target and a depth target for an offscreen pass.
-    #[allow(dead_code, reason = "consumed by the later render-pass implementation")]
     pub(crate) fn create_render_targets(
         &self,
         size: OutputSize,
