@@ -63,6 +63,32 @@ fn render_writes_png_and_reports_red_cube_stats() {
     assert_eq!(result["triangles"], 12);
     assert_eq!(result["visible_meshes"], 1);
     assert_eq!(result["material_models"]["unlit"], 1);
+    let mut keys: Vec<_> = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "active_directional_lights",
+            "adapter",
+            "backend",
+            "camera",
+            "draw_calls",
+            "frame",
+            "height",
+            "material_models",
+            "ok",
+            "output",
+            "shader_version",
+            "triangles",
+            "visible_meshes",
+            "width",
+        ]
+    );
 
     let decoder = png::Decoder::new(fs::File::open(dir.path().join("frame.png")).expect("PNG"));
     let mut reader = decoder.read_info().expect("PNG header");
@@ -73,6 +99,44 @@ fn render_writes_png_and_reports_red_cube_stats() {
         info.height,
         result["height"].as_u64().expect("height") as u32
     );
+}
+
+#[test]
+fn render_applies_paired_output_dimensions() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = scene(&dir, RED_CUBE);
+    let output = titan()
+        .args(["--json", "render"])
+        .arg(path)
+        .args(["--camera", "main", "--out"])
+        .arg(dir.path().join("sized.png"))
+        .args(["--width", "37", "--height", "23"])
+        .output()
+        .expect("run titan render");
+    if !output.status.success() {
+        let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+        if error["error"]["code"] == "RENDER_NO_ADAPTER" {
+            return;
+        }
+        panic!("render failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let result: Value = serde_json::from_slice(&output.stdout).expect("render output");
+    assert_eq!(result["width"], 37);
+    assert_eq!(result["height"], 23);
+}
+
+#[test]
+fn render_rejects_unpaired_output_dimensions() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = scene(&dir, RED_CUBE);
+    titan()
+        .args(["render"])
+        .arg(path)
+        .args(["--out"])
+        .arg(dir.path().join("frame.png"))
+        .args(["--width", "37"])
+        .assert()
+        .failure();
 }
 
 #[test]

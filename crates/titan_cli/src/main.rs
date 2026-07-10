@@ -8,11 +8,11 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use serde::Serialize;
 use titan_core::{
-    DEFAULT_FIXED_DT, DEFAULT_RUN_SEED, FixedStepContext, Schedule, phase1_component_registry,
+    DEFAULT_FIXED_DT, DEFAULT_RUN_SEED, FixedStepContext, Schedule, World,
     velocity_integration_system,
 };
 use titan_render::{
-    CameraSelection, CaptureMode, RenderRequest, RenderService, error as render_error,
+    CameraSelection, CaptureMode, OutputSize, RenderRequest, RenderService, error as render_error,
 };
 use titan_scene::{
     Diagnostic, DiagnosticSpan, Document, Position, Span, TsfError, load_world, parse,
@@ -115,6 +115,30 @@ struct RunArgs {
     /// Write the event log as JSONL to this file.
     #[arg(long)]
     event_log: Option<PathBuf>,
+
+    /// Capture a frame after every N fixed-step updates.
+    #[arg(long)]
+    capture_every: Option<u64>,
+
+    /// Capture the initial frame before the first update.
+    #[arg(long)]
+    capture_initial: bool,
+
+    /// Directory for PNGs and the authoritative captures.jsonl manifest; stale PNGs are retained.
+    #[arg(long, default_value = ".titan/cache/captures")]
+    capture_dir: PathBuf,
+
+    /// Camera name or serialized entity ID.
+    #[arg(long)]
+    camera: Option<String>,
+
+    /// Captured image width (requires --height).
+    #[arg(long, requires = "height")]
+    width: Option<u32>,
+
+    /// Captured image height (requires --width).
+    #[arg(long, requires = "width")]
+    height: Option<u32>,
 }
 
 #[derive(Debug, Parser)]
@@ -133,6 +157,14 @@ struct RenderArgs {
     /// Write render statistics as JSON to a file.
     #[arg(long)]
     stats_json: Option<PathBuf>,
+
+    /// Output image width (requires --height).
+    #[arg(long, requires = "height")]
+    width: Option<u32>,
+
+    /// Output image height (requires --width).
+    #[arg(long, requires = "width")]
+    height: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -308,6 +340,24 @@ fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
             "--dt must be finite and positive",
         ));
     }
+    if args.capture_every == Some(0) {
+        return Err(TitanError::new(
+            "TITAN_CLI_ARGUMENT_ERROR",
+            "--capture-every must be greater than zero",
+        ));
+    }
+    let capture_requested = args.capture_initial || args.capture_every.is_some();
+    if !capture_requested
+        && (args.camera.is_some() || args.width.is_some() || args.height.is_some())
+    {
+        return Err(TitanError::new(
+            "TITAN_CLI_ARGUMENT_ERROR",
+            "--camera, --width, and --height require --capture-initial or --capture-every",
+        ));
+    }
+    let output_size = paired_output_size(args.width, args.height)?;
+    let capture_scheduled =
+        args.capture_initial || args.capture_every.is_some_and(|every| every <= args.frames);
 
     let source = fs::read_to_string(&args.scene).map_err(|source| {
         TitanError::new(
@@ -318,7 +368,7 @@ fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
     let file = args.scene.to_string_lossy();
     let document = parse(Some(&file), &source)
         .map_err(|error| TitanError::from_tsf("failed to parse scene", error))?;
-    let registry = phase1_component_registry().map_err(|source| {
+    let registry = phase2_component_registry().map_err(|source| {
         TitanError::new(
             "TITAN_COMPONENT_REGISTRY",
             format!("failed to build component registry: {source}"),
@@ -327,6 +377,47 @@ fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
     let mut world = load_world(&document, registry)
         .map_err(|error| TitanError::from_tsf("failed to load scene", error))?;
     world.set_runtime_metadata(0, args.seed);
+
+    let mut capture = if capture_scheduled {
+        Some(CaptureSession::new(
+            &args.capture_dir,
+            &world,
+            args.camera.as_deref(),
+            output_size,
+            json,
+            CaptureSchedule {
+                initial: args.capture_initial,
+                every: args.capture_every,
+                frames: args.frames,
+            },
+        )?)
+    } else {
+        if capture_requested {
+            // An empty schedule still validates the camera and scene-facing
+            // render inputs before the stale manifest is replaced, so a
+            // mistyped --camera or --capture-every never exits 0 silently.
+            let camera = select_camera(&world, args.camera.as_deref())?;
+            RenderService::cpu_only()
+                .render(
+                    &world,
+                    RenderRequest {
+                        camera,
+                        output_size,
+                        capture: CaptureMode::StatsOnly,
+                        ..RenderRequest::default()
+                    },
+                )
+                .map_err(TitanError::from_render)?;
+            create_empty_capture_manifest(&args.capture_dir)?;
+        }
+        None
+    };
+    if args.capture_initial {
+        capture
+            .as_mut()
+            .expect("capture session")
+            .capture(&world, 0, args.seed)?;
+    }
 
     let mut schedule = Schedule::new();
     schedule.add_system(
@@ -342,6 +433,12 @@ fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
                     format!("runtime system failed: {source}"),
                 )
             })?;
+        if args.capture_every.is_some_and(|every| frame % every == 0) {
+            capture
+                .as_mut()
+                .expect("capture session")
+                .capture(&world, frame, args.seed)?;
+        }
     }
 
     let dump = world.dump_state().map_err(|source| {
@@ -363,7 +460,7 @@ fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
                 format!("failed to write {}: {source}", path.display()),
             )
         })?;
-    } else if json {
+    } else if json && !capture_requested {
         println!("{dump_json}");
     }
 
@@ -403,7 +500,384 @@ struct RenderOutput {
     material_models: std::collections::BTreeMap<String, u32>,
 }
 
+struct CaptureSession {
+    directory: PathBuf,
+    stats: fs::File,
+    service: RenderService,
+    camera: CameraSelection,
+    output_size: Option<OutputSize>,
+    mirror_stdout: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureSchedule {
+    initial: bool,
+    every: Option<u64>,
+    frames: u64,
+}
+
+impl CaptureSession {
+    fn new(
+        directory: &Path,
+        world: &World,
+        camera: Option<&str>,
+        output_size: Option<OutputSize>,
+        mirror_stdout: bool,
+        schedule: CaptureSchedule,
+    ) -> Result<Self, TitanError> {
+        let camera = select_camera(world, camera)?;
+        let request = RenderRequest {
+            camera: camera.clone(),
+            output_size,
+            capture: CaptureMode::Image,
+            ..RenderRequest::default()
+        };
+        // CPU validation cannot request pixels, so validate the scene-facing
+        // inputs without capture before initializing the image-capable backend.
+        RenderService::cpu_only()
+            .render(
+                world,
+                RenderRequest {
+                    capture: CaptureMode::StatsOnly,
+                    ..request.clone()
+                },
+            )
+            .map_err(TitanError::from_render)?;
+        // Validate filesystem paths before initializing the image-capable
+        // backend. Existing PNGs are deliberately retained; only records in
+        // captures.jsonl belong to this run.
+        prepare_capture_directory(directory)?;
+        validate_scheduled_capture_paths(directory, schedule)?;
+        validate_capture_manifest_path(directory)?;
+
+        // Validate the complete render path before replacing the authoritative
+        // manifest.
+        let service = RenderService::new().map_err(TitanError::from_render)?;
+        let preflight = service
+            .render(world, request)
+            .map_err(TitanError::from_render)?;
+        require_capture_pixels(&preflight)?;
+        let stats = open_capture_manifest(directory)?;
+        Ok(Self {
+            directory: directory.to_owned(),
+            stats,
+            service,
+            camera,
+            output_size,
+            mirror_stdout,
+        })
+    }
+
+    fn capture(&mut self, world: &World, frame: u64, seed: u64) -> Result<(), TitanError> {
+        let path = self.directory.join(format!("frame-{frame:06}.png"));
+        validate_capture_output_path(&path)?;
+        let result = self
+            .service
+            .render(
+                world,
+                RenderRequest {
+                    camera: self.camera.clone(),
+                    output_size: self.output_size,
+                    capture: CaptureMode::Image,
+                    ..RenderRequest::default()
+                },
+            )
+            .map_err(TitanError::from_render)?;
+        let pixels = require_capture_pixels(&result)?;
+        write_png(
+            &path,
+            result.output_size.width,
+            result.output_size.height,
+            pixels,
+        )?;
+        // The manifest is authoritative: write the PNG before appending its
+        // record. A later stats failure may leave an unreferenced PNG, but a
+        // record never claims a PNG that this run failed to write.
+        let mut output = render_output(world, &self.service, result, frame, &path)?;
+        let record = CaptureOutput::from_render(seed, &mut output);
+        serde_json::to_writer(&mut self.stats, &record).map_err(|source| {
+            TitanError::new(
+                "TITAN_OUTPUT_SERIALIZE",
+                format!("failed to encode capture stats: {source}"),
+            )
+        })?;
+        self.stats.write_all(b"\n").map_err(|source| {
+            TitanError::new(
+                "TITAN_STATS_WRITE",
+                format!("failed to write capture stats: {source}"),
+            )
+        })?;
+        self.stats.flush().map_err(|source| {
+            TitanError::new(
+                "TITAN_STATS_WRITE",
+                format!("failed to flush capture stats: {source}"),
+            )
+        })?;
+        if self.mirror_stdout {
+            print_json(&record)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_scheduled_capture_paths(
+    directory: &Path,
+    schedule: CaptureSchedule,
+) -> Result<(), TitanError> {
+    if schedule.initial {
+        validate_capture_output_path(&directory.join(format!("frame-{:06}.png", 0)))?;
+    }
+    if let Some(every) = schedule.every {
+        debug_assert!(every > 0);
+        let mut frame = every;
+        while frame <= schedule.frames {
+            validate_capture_output_path(&directory.join(format!("frame-{frame:06}.png")))?;
+            let Some(next) = frame.checked_add(every) else {
+                break;
+            };
+            frame = next;
+        }
+    }
+    Ok(())
+}
+
+fn validate_capture_output_path(path: &Path) -> Result<(), TitanError> {
+    reject_symlink(path, "capture PNG output")?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => Err(TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!(
+                "capture PNG output {} must be a regular file or not exist",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!(
+                "failed to inspect capture PNG output {}: {source}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn require_capture_pixels(result: &titan_render::RenderResult) -> Result<&[u8], TitanError> {
+    result.rgba8.as_deref().ok_or_else(|| {
+        TitanError::from_render(titan_render::RenderError {
+            code: render_error::CAPTURE_UNAVAILABLE,
+            message: "renderer did not return captured pixels".to_owned(),
+            path: None,
+        })
+    })
+}
+
+fn open_capture_manifest(directory: &Path) -> Result<fs::File, TitanError> {
+    let stats_path = directory.join("captures.jsonl");
+    validate_capture_manifest_path(directory)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&stats_path)
+        .map_err(|source| {
+            TitanError::new(
+                "TITAN_STATS_WRITE",
+                format!("failed to write {}: {source}", stats_path.display()),
+            )
+        })
+}
+
+fn validate_capture_manifest_path(directory: &Path) -> Result<(), TitanError> {
+    let stats_path = directory.join("captures.jsonl");
+    reject_symlink(&stats_path, "capture stats output")?;
+    match fs::symlink_metadata(&stats_path) {
+        Ok(metadata) if !metadata.is_file() => Err(TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!(
+                "capture stats output {} must be a regular file or not exist",
+                stats_path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!(
+                "failed to inspect capture stats output {}: {source}",
+                stats_path.display()
+            ),
+        )),
+    }
+}
+
+fn create_empty_capture_manifest(directory: &Path) -> Result<(), TitanError> {
+    prepare_capture_directory(directory)?;
+    open_capture_manifest(directory)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CaptureOutput {
+    ok: bool,
+    frame: u64,
+    seed: u64,
+    camera: String,
+    output: String,
+    width: u32,
+    height: u32,
+    draw_calls: u32,
+    triangles: u64,
+    visible_meshes: u32,
+    active_directional_lights: u32,
+    backend: &'static str,
+    adapter: String,
+    shader_version: u32,
+    material_models: std::collections::BTreeMap<String, u32>,
+}
+
+impl CaptureOutput {
+    fn from_render(seed: u64, output: &mut RenderOutput) -> Self {
+        Self {
+            ok: output.ok,
+            frame: output.frame,
+            seed,
+            camera: std::mem::take(&mut output.camera),
+            output: std::mem::take(&mut output.output),
+            width: output.width,
+            height: output.height,
+            draw_calls: output.draw_calls,
+            triangles: output.triangles,
+            visible_meshes: output.visible_meshes,
+            active_directional_lights: output.active_directional_lights,
+            backend: output.backend,
+            adapter: std::mem::take(&mut output.adapter),
+            shader_version: output.shader_version,
+            material_models: std::mem::take(&mut output.material_models),
+        }
+    }
+}
+
+fn paired_output_size(
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Option<OutputSize>, TitanError> {
+    match (width, height) {
+        (None, None) => Ok(None),
+        (Some(width), Some(height)) => Ok(Some(OutputSize::new(width, height))),
+        _ => Err(TitanError::new(
+            "TITAN_CLI_ARGUMENT_ERROR",
+            "--width and --height must be provided together",
+        )),
+    }
+}
+
+fn prepare_capture_directory(path: &Path) -> Result<(), TitanError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!(
+                    "capture directory {} must be a directory, not a symlink",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|source| {
+                TitanError::new(
+                    "TITAN_OUTPUT_PATH",
+                    format!(
+                        "failed to create capture directory {}: {source}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        Err(source) => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!(
+                    "failed to inspect capture directory {}: {source}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn select_camera(world: &World, camera: Option<&str>) -> Result<CameraSelection, TitanError> {
+    match camera {
+        None => Ok(CameraSelection::Default),
+        Some(value) if value.starts_with("entity:") => {
+            let state = world.dump_state().map_err(|source| {
+                TitanError::new(
+                    "TITAN_STATE_DUMP",
+                    format!("failed to resolve scene entity IDs: {source}"),
+                )
+            })?;
+            let raw = state.entity_ids.get(value).copied().ok_or_else(|| {
+                TitanError::from_render(titan_render::RenderError {
+                    code: render_error::CAMERA_UNAVAILABLE,
+                    message: format!("camera entity '{value}' was not found"),
+                    path: Some(format!("camera:{value}")),
+                })
+            })?;
+            Ok(CameraSelection::Entity(titan_core::EntityId::from_raw(raw)))
+        }
+        Some(value) => Ok(CameraSelection::Name(value.to_owned())),
+    }
+}
+
+fn render_output(
+    world: &World,
+    service: &RenderService,
+    result: titan_render::RenderResult,
+    frame: u64,
+    path: &Path,
+) -> Result<RenderOutput, TitanError> {
+    let state = world.dump_state().map_err(|source| {
+        TitanError::new(
+            "TITAN_STATE_DUMP",
+            format!("failed to resolve scene entity IDs: {source}"),
+        )
+    })?;
+    let camera = result
+        .camera
+        .and_then(|id| {
+            state
+                .entity_ids
+                .iter()
+                .find_map(|(name, raw)| (*raw == id.raw()).then(|| name.clone()))
+        })
+        .unwrap_or_else(|| "entity:unknown".to_owned());
+    let adapter = service
+        .adapter_info()
+        .map(|info| info.name.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
+    Ok(RenderOutput {
+        ok: true,
+        frame,
+        camera,
+        output: path.display().to_string(),
+        width: result.output_size.width,
+        height: result.output_size.height,
+        draw_calls: result.stats.draw_calls,
+        triangles: result.stats.triangles,
+        visible_meshes: result.stats.visible_meshes,
+        active_directional_lights: result.stats.active_directional_lights,
+        backend: "wgpu",
+        adapter,
+        shader_version: result.stats.shader_version,
+        material_models: result.stats.material_models,
+    })
+}
+
 fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
+    let output_size = paired_output_size(args.width, args.height)?;
     if let Some(stats_path) = args.stats_json.as_ref()
         && normalized_output_path(&args.out)? == normalized_output_path(stats_path)?
     {
@@ -429,26 +903,7 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
     })?;
     let world = load_world(&document, registry)
         .map_err(|error| TitanError::from_tsf("failed to load scene", error))?;
-    let state = world.dump_state().map_err(|source| {
-        TitanError::new(
-            "TITAN_STATE_DUMP",
-            format!("failed to resolve scene entity IDs: {source}"),
-        )
-    })?;
-    let selection = match args.camera.as_deref() {
-        None => CameraSelection::Default,
-        Some(value) if value.starts_with("entity:") => {
-            let raw = state.entity_ids.get(value).copied().ok_or_else(|| {
-                TitanError::from_render(titan_render::RenderError {
-                    code: render_error::CAMERA_UNAVAILABLE,
-                    message: format!("camera entity '{value}' was not found"),
-                    path: Some(format!("camera:{value}")),
-                })
-            })?;
-            CameraSelection::Entity(titan_core::EntityId::from_raw(raw))
-        }
-        Some(value) => CameraSelection::Name(value.to_owned()),
-    };
+    let selection = select_camera(&world, args.camera.as_deref())?;
     // Validate camera selection and all scene-facing render inputs before asking
     // wgpu for an adapter, so diagnostics are useful on adapter-less hosts.
     RenderService::cpu_only()
@@ -456,6 +911,7 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
             &world,
             RenderRequest {
                 camera: selection.clone(),
+                output_size,
                 ..RenderRequest::default()
             },
         )
@@ -466,6 +922,7 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
             &world,
             RenderRequest {
                 camera: selection,
+                output_size,
                 capture: CaptureMode::Image,
                 ..RenderRequest::default()
             },
@@ -485,35 +942,7 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
         pixels,
     )?;
 
-    let camera = result
-        .camera
-        .and_then(|id| {
-            state
-                .entity_ids
-                .iter()
-                .find_map(|(name, raw)| (*raw == id.raw()).then(|| name.clone()))
-        })
-        .unwrap_or_else(|| "entity:unknown".to_owned());
-    let adapter = service
-        .adapter_info()
-        .map(|info| info.name.clone())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let output = RenderOutput {
-        ok: true,
-        frame: 0,
-        camera,
-        output: args.out.display().to_string(),
-        width: result.output_size.width,
-        height: result.output_size.height,
-        draw_calls: result.stats.draw_calls,
-        triangles: result.stats.triangles,
-        visible_meshes: result.stats.visible_meshes,
-        active_directional_lights: result.stats.active_directional_lights,
-        backend: "wgpu",
-        adapter,
-        shader_version: result.stats.shader_version,
-        material_models: result.stats.material_models,
-    };
+    let output = render_output(&world, &service, result, 0, &args.out)?;
     if let Some(path) = args.stats_json {
         let body = serde_json::to_vec(&output).map_err(|source| {
             TitanError::new(
