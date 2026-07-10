@@ -1,0 +1,31 @@
+{
+  tsf: 1,
+  scene: { id: "scene:examples/red_cube" },
+  assets: {
+    cube_mesh: { path: "__builtin__/geometry/cube-v1", kind: "geometry" },
+  },
+  entities: [
+    {
+      id: "entity:main_camera",
+      name: "main",
+      components: {
+        transform: { translation: [0.0, 0.0, 3.0] },
+        camera: {
+          projection: "perspective",
+          vertical_fov_degrees: 60.0,
+          near: 0.1,
+          far: 100.0,
+          viewport: { width: 64, height: 64 },
+        },
+      },
+    },
+    {
+      id: "entity:red_cube",
+      components: {
+        transform: { translation: [0.0, 0.0, 0.0] },
+        mesh: { geometry: { ref: "asset:cube_mesh" }, submeshes: [0] },
+        material: { model: "unlit", base_color: [1.0, 0.0, 0.0, 1.0] },
+      },
+    },
+  ],
+}

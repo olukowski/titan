@@ -4,7 +4,10 @@ use std::env;
 
 use serde::Serialize;
 
-use crate::{DrawItem, Mat4, OutputSize, RenderError, ServiceResult, error, validate_output_size};
+use crate::{
+    DirectionalLightData, DrawItem, Mat4, MaterialModel, OutputSize, RenderError, ServiceResult,
+    error, validate_output_size,
+};
 
 /// The graphics backend selected for a Titan GPU context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -162,12 +165,13 @@ impl GpuContext {
         clear: [f32; 4],
         view_projection: [[f32; 4]; 4],
         draw_list: &[DrawItem],
+        light: Option<DirectionalLightData>,
     ) -> ServiceResult<Vec<u8>> {
         let targets = self.create_render_targets(size)?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("titan first draw shader"),
+            label: Some("titan unlit and basic pbr shaders"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                "@group(0) @binding(0) var<uniform> camera: mat4x4<f32>;\nstruct VertexIn { @location(0) position: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> @builtin(position) vec4<f32> { return camera * vec4<f32>(vertex.position, 1.0); }\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.95, 0.2, 0.08, 1.0); }\n",
+                "struct Uniforms { mvp: mat4x4<f32>, base_color: vec4<f32>, light_color: vec4<f32>, light_direction: vec4<f32>, params: vec4<f32> };\n@group(0) @binding(0) var<uniform> uniforms: Uniforms;\nstruct VertexIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };\nstruct VertexOut { @builtin(position) position: vec4<f32>, @location(0) normal: vec3<f32> };\n@vertex fn vs(vertex: VertexIn) -> VertexOut { var out: VertexOut; out.position = uniforms.mvp * vec4<f32>(vertex.position, 1.0); out.normal = vertex.normal; return out; }\n@fragment fn fs(in: VertexOut) -> @location(0) vec4<f32> { let base = uniforms.base_color.rgb; if (uniforms.params.x < 0.5) { return vec4<f32>(base, uniforms.base_color.a); } let n = normalize(in.normal); let l = normalize(-uniforms.light_direction.xyz); let diffuse = max(dot(n, l), 0.0); let metallic = uniforms.params.y; let roughness = max(uniforms.params.z, 0.04); let ambient = uniforms.params.w; let light = uniforms.light_color.rgb * uniforms.light_color.a * diffuse; let f0 = mix(vec3<f32>(0.04), base, metallic); let specular = f0 * pow(max(dot(reflect(-l, n), vec3<f32>(0.0, 0.0, 1.0)), 0.0), 2.0 / (roughness * roughness)); return vec4<f32>(base * (ambient + light * (1.0 - metallic)) + specular * light, uniforms.base_color.a); }\n",
             )),
         });
         let bind_layout = self
@@ -176,11 +180,11 @@ impl GpuContext {
                 label: Some("titan camera layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        min_binding_size: std::num::NonZeroU64::new(128),
                     },
                     count: None,
                 }],
@@ -191,13 +195,63 @@ impl GpuContext {
                 let matrix = (Mat4(view_projection) * item.model).transpose().0;
                 let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("titan draw transform uniform"),
-                    size: 64,
+                    size: 128,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let mut bytes = [0u8; 64];
+                let mut bytes = [0u8; 128];
                 for (index, value) in matrix.iter().flatten().enumerate() {
                     bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+                }
+                let material = item.material;
+                let model = match material.model {
+                    MaterialModel::Unlit => 0.0,
+                    MaterialModel::Pbr => 1.0,
+                };
+                let metallic = material.metallic.unwrap_or(0.0);
+                let roughness = material.roughness.unwrap_or(1.0);
+                let selected = light.unwrap_or(DirectionalLightData {
+                    entity: titan_core::EntityId::from_raw(0),
+                    direction: [0.0, 0.0, 1.0],
+                    color: [0.0, 0.0, 0.0],
+                    illuminance: 0.0,
+                    ambient: 0.08,
+                });
+                let values = [
+                    [
+                        material.base_color[0],
+                        material.base_color[1],
+                        material.base_color[2],
+                        material.base_color[3],
+                    ],
+                    [
+                        selected.color[0],
+                        selected.color[1],
+                        selected.color[2],
+                        selected.illuminance,
+                    ],
+                    [
+                        selected.direction[0],
+                        selected.direction[1],
+                        selected.direction[2],
+                        0.0,
+                    ],
+                    [
+                        model,
+                        metallic,
+                        roughness,
+                        if light.is_some() {
+                            selected.ambient
+                        } else {
+                            0.08
+                        },
+                    ],
+                ];
+                for (vector_index, vector) in values.into_iter().enumerate() {
+                    for (component, value) in vector.into_iter().enumerate() {
+                        let index = 64 + (vector_index * 4 + component) * 4;
+                        bytes[index..index + 4].copy_from_slice(&value.to_ne_bytes());
+                    }
                 }
                 self.queue.write_buffer(&uniform, 0, &bytes);
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -218,7 +272,13 @@ impl GpuContext {
                     .geometry
                     .vertices
                     .iter()
-                    .flat_map(|vertex| vertex.position)
+                    .flat_map(|vertex| {
+                        vertex
+                            .position
+                            .into_iter()
+                            .chain(vertex.normal)
+                            .chain(vertex.uv)
+                    })
                     .flat_map(f32::to_ne_bytes)
                     .collect::<Vec<_>>();
                 let index_bytes = item
@@ -259,13 +319,25 @@ impl GpuContext {
                     module: &shader,
                     entry_point: Some("vs"),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: 12,
+                        array_stride: 32,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        }],
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 24,
+                                shader_location: 2,
+                            },
+                        ],
                     })],
                     compilation_options: Default::default(),
                 },

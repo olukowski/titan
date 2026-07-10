@@ -6,7 +6,10 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::Serialize;
-use titan_core::{Camera, CameraProjection, Component, EntityId, Mesh, Transform, Velocity, World};
+use titan_core::{
+    Camera, CameraProjection, Component, DirectionalLight, EntityId, Material, MaterialModel, Mesh,
+    Transform, Velocity, World,
+};
 use titan_math::Vec3;
 
 mod geometry;
@@ -30,6 +33,7 @@ pub mod error {
     pub const INVALID_NORMALS: &str = "RENDER_INVALID_NORMALS";
     pub const ASSET_UNAVAILABLE: &str = "RENDER_ASSET_UNAVAILABLE";
     pub const INVALID_GEOMETRY: &str = "RENDER_INVALID_GEOMETRY";
+    pub const INVALID_MATERIAL: &str = "RENDER_INVALID_MATERIAL";
 }
 
 /// A structured renderer failure, suitable for a CLI error envelope.
@@ -165,6 +169,7 @@ pub struct DrawItem {
     pub entity: EntityId,
     pub model: Mat4,
     pub geometry: MeshAsset,
+    pub material: Material,
 }
 
 /// Deterministic CPU render plan.
@@ -172,6 +177,17 @@ pub struct DrawItem {
 pub struct RenderScene {
     pub entities: Vec<ExtractedEntity>,
     pub draw_list: Vec<DrawItem>,
+    pub directional_light: Option<DirectionalLightData>,
+}
+
+/// The selected light, including its entity transform-derived direction.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct DirectionalLightData {
+    pub entity: EntityId,
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub illuminance: f32,
+    pub ambient: f32,
 }
 
 /// Exact stats computed from a render plan, not GPU timing.
@@ -184,6 +200,52 @@ pub struct RenderStats {
     pub ignored_directional_lights: u32,
     pub material_models: BTreeMap<String, u32>,
     pub active_camera: Option<EntityId>,
+    pub shader_version: u32,
+}
+
+pub const SHADER_VERSION: u32 = 1;
+
+pub fn validate_material(material: &Material) -> ServiceResult<()> {
+    if material
+        .base_color
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(RenderError::new(
+            error::INVALID_MATERIAL,
+            "material.base_color must contain finite values in the range 0..=1",
+        ));
+    }
+    match material.model {
+        MaterialModel::Unlit => {
+            if material.metallic.is_some() || material.roughness.is_some() {
+                return Err(RenderError::new(
+                    error::INVALID_MATERIAL,
+                    "unlit materials must not specify metallic or roughness",
+                ));
+            }
+        }
+        MaterialModel::Pbr => {
+            for (name, value) in [
+                ("metallic", material.metallic),
+                ("roughness", material.roughness),
+            ] {
+                let Some(value) = value else {
+                    return Err(RenderError::new(
+                        error::INVALID_MATERIAL,
+                        format!("pbr materials require {name}"),
+                    ));
+                };
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(RenderError::new(
+                        error::INVALID_MATERIAL,
+                        format!("material.{name} must be finite and in the range 0..=1"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Result returned by the service. Pixels are deliberately unavailable until
@@ -479,6 +541,16 @@ fn extract_scene_with_resolver(
         })
         .collect();
 
+    let directional_light = world
+        .query::<(&'static DirectionalLight, &'static Transform)>()
+        .next()
+        .map(|(entity, (light, transform))| DirectionalLightData {
+            entity,
+            direction: forward_direction(transform),
+            color: light.color,
+            illuminance: light.illuminance,
+            ambient: light.ambient,
+        });
     let draw_list = world
         .query::<&'static Mesh>()
         .map(|(entity, mesh)| {
@@ -516,12 +588,24 @@ fn extract_scene_with_resolver(
                     .flatten()
                     .map_or(Mat4::IDENTITY, Mat4::from_transform),
                 geometry,
+                material: world
+                    .get::<Material>(entity)
+                    .ok()
+                    .flatten()
+                    .copied()
+                    .unwrap_or(Material {
+                        model: MaterialModel::Unlit,
+                        base_color: [1.0, 0.0, 0.0, 1.0],
+                        metallic: None,
+                        roughness: None,
+                    }),
             })
         })
         .collect::<ServiceResult<Vec<_>>>()?;
     Ok(RenderScene {
         entities,
         draw_list,
+        directional_light,
     })
 }
 
@@ -555,6 +639,15 @@ fn select_submeshes(
     geometry.submeshes = selected;
     geometry.validate(alias)?;
     Ok(geometry)
+}
+
+fn forward_direction(transform: &Transform) -> [f32; 3] {
+    let [x, y, z, w] = transform.rotation;
+    [
+        -2.0 * (x * z + y * w),
+        -2.0 * (y * z - x * w),
+        -1.0 + 2.0 * (x * x + y * y),
+    ]
 }
 
 /// Headless render service boundary. CPU-only services are available for
@@ -608,18 +701,32 @@ impl RenderService {
         };
         validate_output_size(output_size, max_texture_dimension)?;
         let scene = extract_scene(world)?;
+        for item in &scene.draw_list {
+            validate_material(&item.material)?;
+            if matches!(item.material.model, MaterialModel::Pbr) {
+                validate_normals(&item.geometry)?;
+            }
+        }
         let view_projection = Mat4::projection(
             &camera.1.projection,
             output_size.width as f32 / output_size.height as f32,
         )
         .map(|projection| projection * Mat4::view_from_transform(&camera.2))?;
-        let stats = stats_for_scene(&scene, camera.0);
+        let stats = stats_for_scene(
+            &scene,
+            camera.0,
+            world
+                .query::<&'static DirectionalLight>()
+                .count()
+                .saturating_sub(usize::from(scene.directional_light.is_some())) as u32,
+        );
         let rgba8 = match (&self.gpu, request.capture) {
             (Some(gpu), CaptureMode::Image) => Some(gpu.draw_plan(
                 output_size,
                 request.clear_color.0,
                 view_projection.0,
                 &scene.draw_list,
+                scene.directional_light,
             )?),
             _ => None,
         };
@@ -633,7 +740,11 @@ impl RenderService {
     }
 }
 
-fn stats_for_scene(scene: &RenderScene, camera: EntityId) -> RenderStats {
+fn stats_for_scene(
+    scene: &RenderScene,
+    camera: EntityId,
+    ignored_directional_lights: u32,
+) -> RenderStats {
     RenderStats {
         visible_meshes: scene.draw_list.len() as u32,
         draw_calls: scene
@@ -646,9 +757,41 @@ fn stats_for_scene(scene: &RenderScene, camera: EntityId) -> RenderStats {
             .iter()
             .map(|item| item.geometry.triangle_count())
             .sum(),
+        active_directional_lights: u32::from(scene.directional_light.is_some()),
+        ignored_directional_lights,
+        shader_version: SHADER_VERSION,
+        material_models: scene
+            .draw_list
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, item| {
+                let name = match item.material.model {
+                    MaterialModel::Unlit => "unlit",
+                    MaterialModel::Pbr => "pbr",
+                };
+                *counts.entry(name.to_owned()).or_insert(0) += 1;
+                counts
+            }),
         active_camera: Some(camera),
-        ..RenderStats::default()
     }
+}
+
+fn validate_normals(mesh: &MeshAsset) -> ServiceResult<()> {
+    if mesh.vertices.is_empty() {
+        return Err(RenderError::new(
+            error::MISSING_NORMALS,
+            "pbr mesh has no normals",
+        ));
+    }
+    if mesh.vertices.iter().any(|vertex| {
+        vertex.normal.iter().any(|value| !value.is_finite())
+            || (vertex.normal.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() > 1e-4
+    }) {
+        return Err(RenderError::new(
+            error::INVALID_NORMALS,
+            "pbr mesh normals must be finite unit vectors",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1146,7 +1289,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(scene.draw_list[0].geometry.submeshes.len(), 1);
-        let stats = stats_for_scene(&scene, EntityId::from_raw(9));
+        let stats = stats_for_scene(&scene, EntityId::from_raw(9), 0);
         assert_eq!(stats.draw_calls, 1);
         assert_eq!(stats.triangles, 2);
 
@@ -1286,6 +1429,46 @@ mod tests {
         assert_eq!(output.stats.visible_meshes, 2);
         assert_eq!(output.stats.draw_calls, 2);
         assert_eq!(output.stats.triangles, 24);
+    }
+
+    #[test]
+    fn light_selection_and_material_validation_are_structured_and_stable() {
+        let mut world = world_with_camera();
+        for (id, ambient) in [(2, 0.1), (7, 0.2)] {
+            let entity = world.spawn_with_id(EntityId::from_raw(id)).unwrap();
+            world.insert(entity, Transform::default()).unwrap();
+            world
+                .insert(
+                    entity,
+                    DirectionalLight {
+                        color: [1.0, 1.0, 1.0],
+                        illuminance: 1.0,
+                        ambient,
+                    },
+                )
+                .unwrap();
+        }
+        let output = RenderService::cpu_only()
+            .render(&world, RenderRequest::default())
+            .unwrap();
+        assert_eq!(output.stats.active_directional_lights, 1);
+        assert_eq!(output.stats.ignored_directional_lights, 1);
+        assert_eq!(output.scene.directional_light.unwrap().entity.raw(), 2);
+        assert_eq!(
+            output.scene.directional_light.unwrap().direction,
+            [0.0, 0.0, -1.0]
+        );
+
+        let invalid = Material {
+            model: MaterialModel::Pbr,
+            base_color: [1.0, 0.0, 0.0, 1.0],
+            metallic: Some(0.5),
+            roughness: None,
+        };
+        assert_eq!(
+            validate_material(&invalid).unwrap_err().code,
+            error::INVALID_MATERIAL
+        );
     }
 
     #[test]
