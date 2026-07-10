@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -11,8 +11,12 @@ use titan_core::{
     DEFAULT_FIXED_DT, DEFAULT_RUN_SEED, FixedStepContext, Schedule, phase1_component_registry,
     velocity_integration_system,
 };
+use titan_render::{
+    CameraSelection, CaptureMode, RenderRequest, RenderService, error as render_error,
+};
 use titan_scene::{
     Diagnostic, DiagnosticSpan, Document, Position, Span, TsfError, load_world, parse,
+    phase2_component_registry,
 };
 
 const APP_NAME: &str = "titan";
@@ -38,6 +42,8 @@ struct Cli {
 enum Command {
     /// Run a scene in the deterministic headless runtime.
     Run(RunArgs),
+    /// Render one frame of a scene without opening a window.
+    Render(RenderArgs),
     /// Print version information.
     Version,
     /// Validate, query, edit, and format Titan Scene Format files.
@@ -111,12 +117,31 @@ struct RunArgs {
     event_log: Option<PathBuf>,
 }
 
+#[derive(Debug, Parser)]
+struct RenderArgs {
+    /// Scene file to render.
+    scene: PathBuf,
+
+    /// Camera name or serialized entity ID (for example entity:main_camera).
+    #[arg(long)]
+    camera: Option<String>,
+
+    /// PNG output file.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Write render statistics as JSON to a file.
+    #[arg(long)]
+    stats_json: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 struct TitanError {
     code: &'static str,
     message: String,
     exit_code: u8,
     diagnostics: Option<Vec<Diagnostic>>,
+    location: Option<String>,
 }
 
 enum SceneLoadError {
@@ -135,6 +160,7 @@ impl TitanError {
             message: message.into(),
             exit_code,
             diagnostics: None,
+            location: None,
         }
     }
 
@@ -144,6 +170,17 @@ impl TitanError {
             message: message.into(),
             exit_code: EXIT_FAILURE,
             diagnostics: Some(error.errors),
+            location: None,
+        }
+    }
+
+    fn from_render(error: titan_render::RenderError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            exit_code: EXIT_FAILURE,
+            diagnostics: None,
+            location: error.path,
         }
     }
 }
@@ -246,6 +283,7 @@ fn run() -> Result<ExitCode, TitanError> {
 
     match cli.command {
         Some(Command::Run(args)) => run_runtime(args, cli.json),
+        Some(Command::Render(args)) => run_render(args, cli.json),
         Some(Command::Version) => print_version(cli.json),
         Some(Command::Scene { command }) => return run_scene(command, cli.json),
         None => {
@@ -347,6 +385,255 @@ fn run_runtime(args: RunArgs, json: bool) -> Result<(), TitanError> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct RenderOutput {
+    ok: bool,
+    frame: u64,
+    camera: String,
+    output: String,
+    width: u32,
+    height: u32,
+    draw_calls: u32,
+    triangles: u64,
+    visible_meshes: u32,
+    active_directional_lights: u32,
+    backend: &'static str,
+    adapter: String,
+    shader_version: u32,
+    material_models: std::collections::BTreeMap<String, u32>,
+}
+
+fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
+    if let Some(stats_path) = args.stats_json.as_ref()
+        && normalized_output_path(&args.out)? == normalized_output_path(stats_path)?
+    {
+        return Err(TitanError::new(
+            "TITAN_OUTPUT_COLLISION",
+            format!(
+                "PNG output {} and stats output {} must be different files",
+                args.out.display(),
+                stats_path.display()
+            ),
+        ));
+    }
+    reject_symlink(&args.out, "PNG output")?;
+    let document = read_scene(&args.scene).map_err(|error| match error {
+        SceneLoadError::Io(error) => error,
+        SceneLoadError::Tsf(error) => TitanError::from_tsf("failed to parse scene", error),
+    })?;
+    let registry = phase2_component_registry().map_err(|source| {
+        TitanError::new(
+            "TITAN_COMPONENT_REGISTRY",
+            format!("failed to build component registry: {source}"),
+        )
+    })?;
+    let world = load_world(&document, registry)
+        .map_err(|error| TitanError::from_tsf("failed to load scene", error))?;
+    let state = world.dump_state().map_err(|source| {
+        TitanError::new(
+            "TITAN_STATE_DUMP",
+            format!("failed to resolve scene entity IDs: {source}"),
+        )
+    })?;
+    let selection = match args.camera.as_deref() {
+        None => CameraSelection::Default,
+        Some(value) if value.starts_with("entity:") => {
+            let raw = state.entity_ids.get(value).copied().ok_or_else(|| {
+                TitanError::from_render(titan_render::RenderError {
+                    code: render_error::CAMERA_UNAVAILABLE,
+                    message: format!("camera entity '{value}' was not found"),
+                    path: Some(format!("camera:{value}")),
+                })
+            })?;
+            CameraSelection::Entity(titan_core::EntityId::from_raw(raw))
+        }
+        Some(value) => CameraSelection::Name(value.to_owned()),
+    };
+    // Validate camera selection and all scene-facing render inputs before asking
+    // wgpu for an adapter, so diagnostics are useful on adapter-less hosts.
+    RenderService::cpu_only()
+        .render(
+            &world,
+            RenderRequest {
+                camera: selection.clone(),
+                ..RenderRequest::default()
+            },
+        )
+        .map_err(TitanError::from_render)?;
+    let service = RenderService::new().map_err(TitanError::from_render)?;
+    let result = service
+        .render(
+            &world,
+            RenderRequest {
+                camera: selection,
+                capture: CaptureMode::Image,
+                ..RenderRequest::default()
+            },
+        )
+        .map_err(TitanError::from_render)?;
+    let pixels = result.rgba8.as_deref().ok_or_else(|| {
+        TitanError::from_render(titan_render::RenderError {
+            code: render_error::CAPTURE_UNAVAILABLE,
+            message: "renderer did not return captured pixels".to_owned(),
+            path: None,
+        })
+    })?;
+    write_png(
+        &args.out,
+        result.output_size.width,
+        result.output_size.height,
+        pixels,
+    )?;
+
+    let camera = result
+        .camera
+        .and_then(|id| {
+            state
+                .entity_ids
+                .iter()
+                .find_map(|(name, raw)| (*raw == id.raw()).then(|| name.clone()))
+        })
+        .unwrap_or_else(|| "entity:unknown".to_owned());
+    let adapter = service
+        .adapter_info()
+        .map(|info| info.name.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let output = RenderOutput {
+        ok: true,
+        frame: 0,
+        camera,
+        output: args.out.display().to_string(),
+        width: result.output_size.width,
+        height: result.output_size.height,
+        draw_calls: result.stats.draw_calls,
+        triangles: result.stats.triangles,
+        visible_meshes: result.stats.visible_meshes,
+        active_directional_lights: result.stats.active_directional_lights,
+        backend: "wgpu",
+        adapter,
+        shader_version: result.stats.shader_version,
+        material_models: result.stats.material_models,
+    };
+    if let Some(path) = args.stats_json {
+        let body = serde_json::to_vec(&output).map_err(|source| {
+            TitanError::new(
+                "TITAN_OUTPUT_SERIALIZE",
+                format!("failed to encode render stats: {source}"),
+            )
+        })?;
+        let mut file = open_stats_file(&path)?;
+        file.write_all(&body).map_err(|source| {
+            TitanError::new(
+                "TITAN_STATS_WRITE",
+                format!("failed to write {}: {source}", path.display()),
+            )
+        })?;
+    }
+    if json {
+        print_json(&output)?;
+    } else {
+        println!("rendered {}", args.out.display());
+    }
+    Ok(())
+}
+
+fn open_stats_file(path: &Path) -> Result<fs::File, TitanError> {
+    reject_symlink(path, "stats output")?;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| {
+            TitanError::new(
+                "TITAN_STATS_WRITE",
+                format!("failed to write {}: {source}", path.display()),
+            )
+        })
+}
+
+fn reject_symlink(path: &Path, label: &str) -> Result<(), TitanError> {
+    // Pathname- and symlink-level aliasing is rejected for both outputs; hard-link aliases are intentionally not detected.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("{label} {} must not be a symlink", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("failed to inspect {label} {}: {source}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_output_path(path: &Path) -> Result<std::path::PathBuf, TitanError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!("output path {} has no file name", path.display()),
+        )
+    })?;
+
+    match fs::canonicalize(path) {
+        Ok(path) => return Ok(path),
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("failed to resolve output path {}: {source}", path.display()),
+            ));
+        }
+        Err(_) => {}
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|source| {
+        TitanError::new(
+            "TITAN_OUTPUT_PATH",
+            format!(
+                "failed to resolve output directory {}: {source}",
+                parent.display()
+            ),
+        )
+    })?;
+    Ok(parent.join(file_name))
+}
+
+fn write_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), TitanError> {
+    let file = fs::File::create(path).map_err(|source| {
+        TitanError::new(
+            "TITAN_PNG_WRITE",
+            format!("failed to create {}: {source}", path.display()),
+        )
+    })?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|source| {
+        TitanError::new(
+            "TITAN_PNG_WRITE",
+            format!("failed to write PNG header: {source}"),
+        )
+    })?;
+    writer.write_image_data(pixels).map_err(|source| {
+        TitanError::new(
+            "TITAN_PNG_WRITE",
+            format!("failed to write PNG pixels: {source}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn print_version(json: bool) -> Result<(), TitanError> {
     let output = VersionOutput {
         name: APP_NAME,
@@ -373,7 +660,7 @@ fn report_error(error: &TitanError) {
         error: ErrorBody {
             code: error.code,
             message: &error.message,
-            location: None,
+            location: error.location.as_deref(),
             diagnostics: error.diagnostics.as_deref(),
         },
     };

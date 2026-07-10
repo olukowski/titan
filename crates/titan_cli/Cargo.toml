@@ -11,10 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3.23.0"
 titan_core.workspace = true
+titan_render.workspace = true
 titan_scene.workspace = true
 
 [dev-dependencies]
