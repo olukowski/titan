@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -520,7 +520,8 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
                 format!("failed to encode render stats: {source}"),
             )
         })?;
-        fs::write(&path, body).map_err(|source| {
+        let mut file = open_stats_file(&path)?;
+        file.write_all(&body).map_err(|source| {
             TitanError::new(
                 "TITAN_STATS_WRITE",
                 format!("failed to write {}: {source}", path.display()),
@@ -533,6 +534,41 @@ fn run_render(args: RenderArgs, json: bool) -> Result<(), TitanError> {
         println!("rendered {}", args.out.display());
     }
     Ok(())
+}
+
+fn open_stats_file(path: &Path) -> Result<fs::File, TitanError> {
+    // Pathname- and symlink-level aliasing is rejected; hard-link aliases are intentionally not detected.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!("stats output {} must not be a symlink", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(TitanError::new(
+                "TITAN_OUTPUT_PATH",
+                format!(
+                    "failed to inspect stats output {}: {source}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| {
+            TitanError::new(
+                "TITAN_STATS_WRITE",
+                format!("failed to write {}: {source}", path.display()),
+            )
+        })
 }
 
 fn normalized_output_path(path: &Path) -> Result<std::path::PathBuf, TitanError> {

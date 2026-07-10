@@ -152,6 +152,45 @@ fn render_rejects_stats_symlink_to_png_output() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn render_rejects_dangling_stats_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("tempdir");
+    let output_path = dir.path().join("frame.png");
+    let stats_path = dir.path().join("stats.json");
+    symlink(&output_path, &stats_path).expect("create dangling stats symlink");
+    let path = scene(&dir, RED_CUBE);
+
+    let output = titan()
+        .args(["--json", "render"])
+        .arg(path)
+        .args(["--camera", "main", "--out"])
+        .arg(&output_path)
+        .args(["--stats-json"])
+        .arg(&stats_path)
+        .output()
+        .expect("run titan render");
+
+    if !output.status.success() {
+        let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+        if error["error"]["code"] == "RENDER_NO_ADAPTER" {
+            return;
+        }
+        assert_eq!(error["error"]["code"], "TITAN_OUTPUT_PATH");
+    } else {
+        panic!("render unexpectedly succeeded");
+    }
+
+    if output_path.exists() {
+        let decoder = png::Decoder::new(fs::File::open(&output_path).expect("PNG output"));
+        let mut reader = decoder.read_info().expect("valid PNG output");
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        reader.next_frame(&mut pixels).expect("valid PNG frame");
+    }
+}
+
 #[test]
 fn render_selects_camera_by_name_and_serialized_id() {
     let dir = TempDir::new().expect("tempdir");
