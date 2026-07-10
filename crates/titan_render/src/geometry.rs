@@ -230,12 +230,9 @@ pub(crate) fn is_valid_virtual_relative_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains('\\')
         && !path.contains(':')
-        && Path::new(path).components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::ParentDir
-            )
-        })
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -345,5 +342,15 @@ mod tests {
             error.path.as_deref(),
             Some("__builtin__/geometry/not-a-real-version")
         );
+    }
+
+    #[test]
+    fn parent_dir_geometry_path_is_rejected_before_filesystem_access() {
+        let resolver = GeometryResolver::new("/definitely/nonexistent/titan-base");
+        let error = resolver.resolve("../../etc/passwd").unwrap_err();
+
+        assert_eq!(error.code, error::ASSET_UNAVAILABLE);
+        assert_eq!(error.path.as_deref(), Some("../../etc/passwd"));
+        assert!(error.message.contains("not virtual-relative"));
     }
 }
