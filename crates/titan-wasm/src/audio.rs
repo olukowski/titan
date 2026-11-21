@@ -94,7 +94,8 @@ mod wasm {
     /// Plays an [`AudioMixer`] through Web Audio until dropped.
     ///
     /// The browser keeps audio suspended until the user first presses a key or pointer button on
-    /// the page; the mixer does not advance while it is.
+    /// the page. Until then the host mixes at most one lead (about 60 ms) ahead, then the mixer
+    /// pauses until audio resumes.
     #[derive(Debug)]
     pub struct AudioOutput {
         mixer: Rc<RefCell<AudioMixer>>,

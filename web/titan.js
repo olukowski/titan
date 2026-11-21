@@ -1125,7 +1125,8 @@ export function renderAudioQuantum(queue, frame, left, right) {
 
 // A worklet runs in its own global scope and loads only whole modules, so its module is built
 // from source: renderAudioQuantum plus a processor that queues the chunks the main thread posts.
-const AUDIO_WORKLET_SOURCE = `${renderAudioQuantum}
+// The processor calls it by a local name, since a minifier may rename the function itself.
+const AUDIO_WORKLET_SOURCE = `const render = ${renderAudioQuantum};
 registerProcessor(${JSON.stringify(AUDIO_PROCESSOR)}, class extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -1133,7 +1134,7 @@ registerProcessor(${JSON.stringify(AUDIO_PROCESSOR)}, class extends AudioWorklet
     this.port.onmessage = ({ data }) => this.queue.push(data);
   }
   process(inputs, [[left, right]]) {
-    renderAudioQuantum(this.queue, currentFrame, left, right);
+    render(this.queue, currentFrame, left, right);
     return true;
   }
 });
@@ -1160,6 +1161,11 @@ export function createAudioHost({ AudioContext, AudioWorkletNode, URL, Blob, unl
       if (ctx.sampleRate !== sampleRate) {
         ctx.close();
         throw new Error(`the AudioContext runs at ${ctx.sampleRate} Hz, not the mixer's ${sampleRate} Hz`);
+      }
+      // Browsers expose AudioWorklet only to secure contexts.
+      if (!ctx.audioWorklet) {
+        ctx.close();
+        throw new Error("AudioWorklet needs a secure context (HTTPS or localhost)");
       }
       const session = { ctx, node: null, written: 0, lead: Math.ceil(AUDIO_LEAD_SECS * sampleRate) };
       session.unlock = () => ctx.resume().then(() => {
