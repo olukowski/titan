@@ -1,5 +1,5 @@
-//! Titan's macOS backend: an AppKit window and a Metal [`GpuDevice`](titan_gpu::GpuDevice), in
-//! pure Rust.
+//! Titan's macOS backend: an AppKit window, a Metal [`GpuDevice`](titan_gpu::GpuDevice), and
+//! CoreAudio output, in pure Rust.
 //!
 //! The crate has no dependencies beyond Titan's own crates and compiles no C or Objective-C. It
 //! links the system frameworks directly and talks to them through the Objective-C runtime's
@@ -10,11 +10,15 @@
 //! - `MetalGpu` implements [`GpuDevice`](titan_gpu::GpuDevice) on Metal, validating every call
 //!   exactly as [`RecordingGpu`](titan_gpu::RecordingGpu) does. `MetalGpu::new_headless` and
 //!   `MetalGpu::read_texture` render offscreen and read pixels back, for tests and tools.
+//! - `AudioOutput` plays a `titan_audio::AudioMixer` through the default output device on
+//!   CoreAudio's render thread; `AudioOutput::mixer` locks the mixer for the game thread.
 //! - [`map_macos_keycode`] maps macOS virtual key codes to [`KeyCode`](titan_app::KeyCode)s.
 //!
 //! On other platforms the crate still builds: [`run`] returns an error and only the key mapping
 //! is available, so workspaces that include it compile everywhere.
 
+#[cfg(target_os = "macos")]
+mod audio;
 mod input;
 #[cfg(target_os = "macos")]
 mod metal;
@@ -25,6 +29,8 @@ mod runner;
 #[cfg(target_os = "macos")]
 mod window;
 
+#[cfg(target_os = "macos")]
+pub use audio::{AudioOutput, AudioOutputError};
 pub use input::map_macos_keycode;
 #[cfg(target_os = "macos")]
 pub use metal::MetalGpu;

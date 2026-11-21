@@ -1,6 +1,6 @@
 [package]
 name = "titan-macos"
-description = "Titan's macOS backend: an AppKit window and a Metal GPU device in pure Rust, with no dependencies."
+description = "Titan's macOS backend: an AppKit window, a Metal GPU device, and CoreAudio output in pure Rust, with no dependencies."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,8 +12,10 @@ readme.workspace = true
 titan-app = { path = "../titan-app" }
 titan-gpu = { path = "../titan-gpu" }
 
-# Only the macOS runner uses it (for `FixedClock`); elsewhere `run` is a stub.
+# Only the macOS modules use these: the runner (`FixedClock`) and audio output (`AudioMixer`).
+# Elsewhere `run` is a stub and there is no audio output.
 [target.'cfg(target_os = "macos")'.dependencies]
+titan-audio = { path = "../titan-audio" }
 titan-core = { path = "../titan-core" }
 
 [lints]
