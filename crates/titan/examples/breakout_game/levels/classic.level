@@ -1,0 +1,15 @@
+# Classic Breakout: a silver row that takes two hits over five rows of color.
+# Grid symbols: . empty, R red 50, O orange 40, Y yellow 30, G green 20, B blue 10,
+# S silver 100 (two hits).
+name: Classic
+lives: 3
+ball_speed: 360
+paddle_width: 112
+
+---
+SSSSSSSSSS
+RRRRRRRRRR
+OOOOOOOOOO
+YYYYYYYYYY
+GGGGGGGGGG
+BBBBBBBBBB

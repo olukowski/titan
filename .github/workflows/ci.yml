@@ -51,6 +51,25 @@ jobs:
         with:
           shared-key: wasm
       - run: cargo check --workspace --target wasm32-unknown-unknown --locked
+      - run: cargo test --no-run --workspace --target wasm32-unknown-unknown --locked
+      - name: Report breakout_wasm size
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --profile wasm --target wasm32-unknown-unknown -p titan --example breakout_wasm --locked
+          wasm=target/wasm32-unknown-unknown/wasm/examples/breakout_wasm.wasm
+          raw=$(wc -c < "$wasm" | tr -d '[:space:]')
+          gz=$(gzip -9 -c "$wasm" | wc -c | tr -d '[:space:]')
+          kib() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1024 }'; }
+          echo "breakout_wasm.wasm: $raw bytes ($(kib "$raw") KiB) raw, $gz bytes ($(kib "$gz") KiB) gzip -9"
+          {
+            echo "### breakout_wasm.wasm size (\`--profile wasm\`)"
+            echo
+            echo "| Encoding | Bytes | KiB |"
+            echo "|---|--:|--:|"
+            echo "| raw | $raw | $(kib "$raw") |"
+            echo "| gzip -9 | $gz | $(kib "$gz") |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Single stable required check for the `main` ruleset.
   ci:

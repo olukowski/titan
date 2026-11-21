@@ -9,7 +9,24 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
+titan-2d = { path = "../titan-2d" }
+titan-app = { path = "../titan-app" }
 titan-core = { path = "../titan-core" }
+titan-gpu = { path = "../titan-gpu" }
+titan-wasm = { path = "../titan-wasm" }
+
+# Only macOS gets the native backend, so other targets never build its `std` code.
+[target.'cfg(target_os = "macos")'.dependencies]
+titan-macos = { path = "../titan-macos" }
+
+[[example]]
+name = "breakout"
+path = "examples/breakout.rs"
+
+[[example]]
+name = "breakout_wasm"
+path = "examples/breakout_wasm.rs"
+crate-type = ["cdylib"]
 
 [lints]
 workspace = true
