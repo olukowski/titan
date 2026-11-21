@@ -35,6 +35,13 @@ name = "titan-assets"
 version = "0.0.0"
 
 [[package]]
+name = "titan-audio"
+version = "0.0.0"
+dependencies = [
+ "titan-core",
+]
+
+[[package]]
 name = "titan-core"
 version = "0.0.0"
 
