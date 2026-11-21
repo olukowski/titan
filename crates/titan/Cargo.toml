@@ -12,6 +12,7 @@ readme.workspace = true
 titan-2d = { path = "../titan-2d" }
 titan-app = { path = "../titan-app" }
 titan-assets = { path = "../titan-assets" }
+titan-audio = { path = "../titan-audio" }
 titan-core = { path = "../titan-core" }
 titan-gpu = { path = "../titan-gpu" }
 titan-wasm = { path = "../titan-wasm" }

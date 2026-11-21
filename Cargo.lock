@@ -9,6 +9,7 @@ dependencies = [
  "titan-2d",
  "titan-app",
  "titan-assets",
+ "titan-audio",
  "titan-core",
  "titan-gpu",
  "titan-macos",
