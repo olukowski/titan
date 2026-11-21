@@ -33,6 +33,9 @@ dependencies = [
 [[package]]
 name = "titan-assets"
 version = "0.0.0"
+dependencies = [
+ "titan-core",
+]
 
 [[package]]
 name = "titan-audio"
