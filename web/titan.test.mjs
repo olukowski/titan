@@ -653,7 +653,7 @@ test("renderAudioQuantum drops a chunk that arrives after its frames played", ()
 
 // Fake Web Audio that records what createAudioHost does with it.
 // `fake.secure` false gives contexts no `audioWorklet`, as on a page served over plain HTTP.
-function fakeWebAudio({ contextRate, addModule = () => Promise.resolve() } = {}) {
+function fakeWebAudio({ contextRate, addModule = () => Promise.resolve(), resume = () => Promise.resolve() } = {}) {
   const fake = { contexts: [], nodes: [], blobs: [], revoked: [], errors: [], unlockTarget: new EventTarget(),
     secure: true };
   fake.deps = {
@@ -666,8 +666,7 @@ function fakeWebAudio({ contextRate, addModule = () => Promise.resolve() } = {})
       }
       resume() {
         this.resumes++;
-        this.state = "running";
-        return Promise.resolve();
+        return resume().then(() => { this.state = "running"; });
       }
       close() {
         this.closes++;
@@ -827,12 +826,33 @@ test("the audio host plays one context at a time, and stop closes it once", asyn
   host.stop();
 });
 
-test("the audio host fails loudly when the worklet or the sample rate is unavailable", async () => {
-  const rejected = fakeWebAudio({ addModule: () => Promise.reject(new Error("no worklet")) });
-  createAudioHost(rejected.deps).start(48_000);
-  await settle();
-  assert.deepEqual(rejected.errors.map((e) => e.message), ["no worklet"]);
-  assert.deepEqual(rejected.revoked, ["blob:1"]);
+test("the audio host stops before reporting a late failure, and fails loudly on a wrong sample rate", async () => {
+  const keydown = (target) => target.dispatchEvent(new Event("keydown"));
+  for (const [options, message, trigger] of [
+    [{ addModule: () => Promise.reject(new Error("no worklet")) }, "no worklet", () => {}],
+    [{ resume: () => Promise.reject(new Error("no device")) }, "no device", keydown],
+  ]) {
+    const rejected = fakeWebAudio(options);
+    const host = createAudioHost(rejected.deps);
+    const { calls, mix } = recordingMix();
+    host.start(48_000);
+    const [ctx] = rejected.contexts;
+    trigger(rejected.unlockTarget);
+    await settle();
+    assert.deepEqual(rejected.errors.map((e) => e.message), [message]);
+    assert.equal(ctx.closes, 1);
+    assert.ok(rejected.nodes.every((node) => node.disconnected));
+    assert.deepEqual(rejected.revoked, ["blob:1"]);
+    const resumes = ctx.resumes;
+    rejected.unlockTarget.dispatchEvent(new Event("pointerdown"));
+    assert.equal(ctx.resumes, resumes);
+    host.pump(mix);
+    assert.deepEqual(calls, []);
+    host.stop();
+    assert.equal(ctx.closes, 1);
+    host.start(48_000); // Not "already playing".
+    host.stop();
+  }
 
   // A failure after stop belongs to a context nobody uses any more.
   const stopped = fakeWebAudio({ addModule: () => Promise.reject(new Error("no worklet")) });

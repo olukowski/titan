@@ -1144,13 +1144,26 @@ registerProcessor(${JSON.stringify(AUDIO_PROCESSOR)}, class extends AudioWorklet
  * The page's audio: nothing until `start(sampleRate)` creates an AudioContext at that rate, which
  * then plays what `pump` mixes until `stop`. `deps` supplies `AudioContext`, `AudioWorkletNode`,
  * `URL`, and `Blob`, the `unlockTarget` whose input events resume a suspended context, and
- * `onError` for failures after `start` returns.
+ * `onError` for failures after `start` returns, by which time the host has stopped.
  */
 export function createAudioHost({ AudioContext, AudioWorkletNode, URL, Blob, unlockTarget, onError }) {
   // The playing context and its stream state, or null.
   let live = null;
   const removeUnlock = (session) => {
     for (const type of UNLOCK_EVENTS) unlockTarget.removeEventListener(type, session.unlock);
+  };
+  const stop = () => {
+    if (!live) return;
+    const { ctx, node } = live;
+    removeUnlock(live);
+    live = null;
+    node?.disconnect();
+    ctx.close();
+  };
+  const failLate = (session) => (error) => {
+    if (live !== session) return;
+    stop();
+    onError(error);
   };
   return {
     /** Starts playing at `sampleRate`; throws if audio is already playing or cannot start. */
@@ -1170,9 +1183,7 @@ export function createAudioHost({ AudioContext, AudioWorkletNode, URL, Blob, unl
       const session = { ctx, node: null, written: 0, lead: Math.ceil(AUDIO_LEAD_SECS * sampleRate) };
       session.unlock = () => ctx.resume().then(() => {
         if (ctx.state === "running") removeUnlock(session);
-      }, (error) => {
-        if (live === session) onError(error);
-      });
+      }, failLate(session));
       for (const type of UNLOCK_EVENTS) unlockTarget.addEventListener(type, session.unlock);
       live = session;
       const url = URL.createObjectURL(new Blob([AUDIO_WORKLET_SOURCE], { type: "text/javascript" }));
@@ -1180,19 +1191,10 @@ export function createAudioHost({ AudioContext, AudioWorkletNode, URL, Blob, unl
         if (live !== session) return;
         session.node = new AudioWorkletNode(ctx, AUDIO_PROCESSOR, { numberOfInputs: 0, outputChannelCount: [2] });
         session.node.connect(ctx.destination);
-      }).catch((error) => {
-        if (live === session) onError(error);
-      }).finally(() => URL.revokeObjectURL(url));
+      }).catch(failLate(session)).finally(() => URL.revokeObjectURL(url));
     },
     /** Closes the context, if one is playing. */
-    stop() {
-      if (!live) return;
-      const { ctx, node } = live;
-      removeUnlock(live);
-      live = null;
-      node?.disconnect();
-      ctx.close();
-    },
+    stop,
     /**
      * Tops up the worklet's audio. `mix(frames)` returns `2 * frames` interleaved samples, or
      * nothing after it has reported a failure. Does nothing until the worklet has loaded.
@@ -1220,7 +1222,8 @@ export function createAudioHost({ AudioContext, AudioWorkletNode, URL, Blob, unl
  * Resolves to `{ dispose, backend }` once running, where `backend` is "webgpu" or "webgl2";
  * rejects if neither API or the module can start. Later failures, including WebGPU validation
  * errors and WebGL2 context loss, stop the app and call `onError`. An app that starts an
- * `AudioOutput` is heard once the user first presses a key or pointer button on the page.
+ * `AudioOutput` is heard once the user first presses a key or pointer button on the page; a later
+ * audio failure mutes it with a console warning but keeps the app running.
  */
 export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
   // "starting" until runTitan resolves, then "running" until exit, failure, or dispose.
@@ -1249,9 +1252,11 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
       onError(error);
     }
   };
-  // Creates no AudioContext unless the app starts audio.
+  // Creates no AudioContext unless the app starts audio. A lost device or worklet leaves the app
+  // running muted, as when `AudioOutput::start` fails, and is still reported.
   const audio = createAudioHost({ AudioContext: globalThis.AudioContext,
-    AudioWorkletNode: globalThis.AudioWorkletNode, URL, Blob, unlockTarget: window, onError: fail });
+    AudioWorkletNode: globalThis.AudioWorkletNode, URL, Blob, unlockTarget: window,
+    onError: (error) => console.warn(`audio stopped, playing muted: ${error?.message ?? error}`) });
 
   let memory = null;
   let pendingError = new Uint8Array(0);
