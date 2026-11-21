@@ -1,0 +1,12 @@
+[package]
+name = "titan"
+description = "Titan: a fast, compact game engine for desktop and WASM."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true

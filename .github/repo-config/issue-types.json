@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Bug",
+    "description": "Something behaves incorrectly, crashes, or regresses.",
+    "color": "red",
+    "is_enabled": true
+  },
+  {
+    "name": "Feature",
+    "description": "A new capability or a change to an existing one.",
+    "color": "blue",
+    "is_enabled": true
+  },
+  {
+    "name": "Task",
+    "description": "A concrete piece of work such as a refactor, chore, or tooling change.",
+    "color": "green",
+    "is_enabled": true
+  }
+]

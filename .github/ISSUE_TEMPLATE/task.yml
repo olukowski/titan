@@ -1,0 +1,20 @@
+name: Task
+description: A concrete piece of work such as a refactor, chore, or tooling change.
+type: Task
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true once this is done, and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkable conditions that mean the task is done.
+      placeholder: |
+        - [ ] ...
+    validations:
+      required: true

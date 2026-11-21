@@ -1,0 +1,21 @@
+name: Feature
+description: Propose a new capability or a change to an existing one.
+type: Feature
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and why is it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed design or API shape
+      description: Sketch the API, data types, or file format. Code beats prose.
+  - type: textarea
+    id: costs
+    attributes:
+      label: Performance, binary size, and AI-usability notes
+      description: Expected impact on runtime, compile time, WASM size, dependencies, and how easily an agent can use it from code or plaintext.

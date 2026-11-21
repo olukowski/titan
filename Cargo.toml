@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/titan-engine/titan"
+readme = "README.md"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -2 }
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+needless_pass_by_value = "warn"
+large_futures = "warn"
+
+[workspace.lints.cargo]
+unused_dependencies = "warn"
+
+# Line tables keep file:line backtraces while shrinking artifacts and link times.
+[profile.dev]
+debug = "line-tables-only"
+
+# No debuginfo for dependencies: the biggest `target/` saving across parallel worktrees.
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# Smallest shippable WASM: `cargo build --profile wasm --target wasm32-unknown-unknown`.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

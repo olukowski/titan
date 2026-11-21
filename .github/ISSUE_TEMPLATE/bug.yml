@@ -1,0 +1,37 @@
+name: Bug
+description: Something behaves incorrectly, crashes, or regresses.
+type: Bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, in one or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal code or commands that trigger the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs. actual
+      description: What you expected to happen, and what happened instead (include error output).
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Target and environment
+      description: OS, native or WASM (and browser/runtime), Rust version (`rustc -V`), Titan version or commit.
+      placeholder: |
+        OS: macOS 27
+        Target: wasm32-unknown-unknown in Firefox 150
+        Rust: 1.100.0
+        Titan: main @ abc1234
+    validations:
+      required: true

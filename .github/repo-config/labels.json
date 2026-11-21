@@ -1,0 +1,14 @@
+[
+  { "name": "wasm", "color": "654ff0", "description": "WebAssembly target and browser runtime" },
+  { "name": "performance", "color": "d93f0b", "description": "Runtime speed or memory use" },
+  { "name": "compile-time", "color": "fbca04", "description": "Build times and incremental compilation" },
+  { "name": "binary-size", "color": "c5def5", "description": "Shipped binary or target/ artifact size" },
+  { "name": "ci", "color": "0e8a16", "description": "Continuous integration and automation" },
+  { "name": "docs", "color": "0075ca", "description": "Documentation and examples" },
+  { "name": "dx", "color": "bfd4f2", "description": "Developer and agent experience" },
+  { "name": "breaking", "color": "b60205", "description": "Changes public API or behavior without a compat shim" },
+  { "name": "blocked", "color": "000000", "description": "Waiting on another issue, PR, or decision" },
+  { "name": "good first issue", "color": "7057ff", "description": "Small, well-scoped, good for newcomers" },
+  { "name": "help wanted", "color": "008672", "description": "Maintainers would welcome a contribution" },
+  { "name": "needs-triage", "color": "ededed", "description": "Not yet reviewed by a maintainer" }
+]
