@@ -1,0 +1,49 @@
+<!doctype html>
+<!--
+  Runs a Titan WASM app: ./triangle.wasm by default, or the module named by ?wasm=<url>.
+
+  cargo build --profile wasm --target wasm32-unknown-unknown -p titan-wasm --example triangle
+  cp target/wasm32-unknown-unknown/wasm/examples/triangle.wasm web/
+  python3 -m http.server -d web    # then open http://localhost:8000
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Titan</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05050a; color: #e8e8f0; overflow: hidden;
+      font: 15px/1.5 system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+    #error { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; }
+    #error[hidden] { display: none; }
+    #error div { max-width: 640px; padding: 20px 24px; border: 1px solid #ff6b6b55;
+      border-radius: 8px; background: #1a0b10; }
+    #error h1 { margin: 0 0 8px; font-size: 17px; color: #ff8f8f; }
+    #error pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.5 ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" tabindex="0" aria-label="Titan app"></canvas>
+  <div id="error" role="alert" hidden>
+    <div><h1>Titan could not run</h1><pre id="error-message"></pre></div>
+  </div>
+  <script type="module">
+    import { runTitan } from "./titan.js";
+
+    const canvas = document.getElementById("canvas");
+    const showError = (error) => {
+      console.error(error);
+      document.getElementById("error-message").textContent = error?.message ?? String(error);
+      document.getElementById("error").hidden = false;
+    };
+    const wasmUrl = new URLSearchParams(location.search).get("wasm") ?? "./triangle.wasm";
+    canvas.focus();
+    try {
+      await runTitan({ canvas, wasmUrl, onError: showError });
+    } catch (error) {
+      showError(error);
+    }
+  </script>
+</body>
+</html>

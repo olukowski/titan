@@ -44,3 +44,12 @@ dependencies = [
  "titan-core",
  "titan-gpu",
 ]
+
+[[package]]
+name = "titan-wasm"
+version = "0.0.0"
+dependencies = [
+ "titan-app",
+ "titan-core",
+ "titan-gpu",
+]

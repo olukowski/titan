@@ -1,0 +1,22 @@
+[package]
+name = "titan-wasm"
+description = "Titan's browser backend: a WebGPU device and app runner over a direct WASM/JS bridge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+titan-app = { path = "../titan-app" }
+titan-core = { path = "../titan-core" }
+titan-gpu = { path = "../titan-gpu" }
+
+[[example]]
+name = "triangle"
+crate-type = ["cdylib"]
+test = true
+
+[lints]
+workspace = true
