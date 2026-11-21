@@ -1,6 +1,7 @@
 <!doctype html>
 <!--
   Runs a Titan WASM app: ./triangle.wasm by default, or the module named by ?wasm=<url>.
+  Uses WebGPU, or WebGL2 where WebGPU is unavailable; WebGL2 needs shaders with GLSL (Breakout).
 
   cargo build --profile wasm --target wasm32-unknown-unknown -p titan-wasm --example triangle
   cp target/wasm32-unknown-unknown/wasm/examples/triangle.wasm web/
@@ -46,7 +47,9 @@
     const wasmUrl = new URLSearchParams(location.search).get("wasm") ?? "./triangle.wasm";
     canvas.focus();
     try {
-      await runTitan({ canvas, wasmUrl, onError: showError });
+      const { backend } = await runTitan({ canvas, wasmUrl, onError: showError });
+      console.info(`Titan is rendering with ${backend}`);
+      document.documentElement.dataset.backend = backend;
     } catch (error) {
       showError(error);
     }

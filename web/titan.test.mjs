@@ -1,9 +1,11 @@
-// Checks titan.js's decoders against the wire layouts and tags in crates/titan-wasm/src/abi.rs.
+// Checks titan.js's decoders against the wire layouts and tags in crates/titan-wasm/src/abi.rs,
+// and its WebGL2 backend against a fake GL context.
 // Run with `node --test web/titan.test.mjs`.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { KEY_MAP, mapMouseButton, decodeTextureDesc, decodeShaderSource, decodePipelineDesc,
-  decodeFrame, shaderBindings } from "./titan.js";
+  decodeFrame, shaderBindings, GL_NAMES, glTextureFormat, glSamplerParams, glslStage, glslBinding, flipY,
+  createWebGL2Backend } from "./titan.js";
 
 // The WebGPU name of each Rust wire enum variant, indexed by its tag in abi.rs.
 const TEXTURE_FORMATS = ["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb",
@@ -330,4 +332,201 @@ test("shaderBindings rejects bindings outside Titan's convention and unsupported
     assert.throws(() => bindingOf(expr, `${PRELUDE} const A = B; const B = A;`),
       /unsupported WGSL integer expression/, expr);
   }
+});
+
+test("glslStage puts #version first, then the stage define, then the source", () => {
+  assert.equal(glslStage("VERTEX", "void main() {}"), "#version 300 es\n#define TITAN_VERTEX\nvoid main() {}");
+  assert.ok(glslStage("FRAGMENT", "x").startsWith("#version 300 es\n#define TITAN_FRAGMENT\n"));
+});
+
+test("glslBinding reads the _binding<N> suffix and rejects names without a valid one", () => {
+  assert.equal(glslBinding("CameraUniform_binding0"), 0);
+  assert.equal(glslBinding("a_binding1_binding12"), 12);
+  for (const name of ["camera", "tex_binding", "tex_binding01", "tex_binding-1", "tex_binding0[0]", "tex_binding0x"]) {
+    assert.throws(() => glslBinding(name), /must end in _binding<N>/, name);
+  }
+});
+
+test("flipY converts a top-left-origin rect to GL's bottom-left origin", () => {
+  assert.equal(flipY(0, 600, 600), 0); // Full target.
+  assert.equal(flipY(0, 10, 600), 590); // Top strip.
+  assert.equal(flipY(20, 50, 600), 530);
+});
+
+test("WebGL2 tables: texture formats, mip-aware min filter, and integer vs normalized attributes", () => {
+  assert.deepEqual(glTextureFormat("rgba8unorm-srgb"), { internalFormat: "SRGB8_ALPHA8", format: "RGBA", type: "UNSIGNED_BYTE" });
+  assert.deepEqual(glTextureFormat("r8unorm"), { internalFormat: "R8", format: "RED", type: "UNSIGNED_BYTE" });
+  for (const format of ["bgra8unorm", "bgra8unorm-srgb"]) {
+    assert.throws(() => glTextureFormat(format), new RegExp(`${format} is not supported on WebGL2`));
+  }
+  const sampler = { minFilter: "linear", magFilter: "nearest", addressModeU: "mirror-repeat", addressModeV: "clamp-to-edge" };
+  assert.deepEqual(glSamplerParams(sampler, 1), { TEXTURE_MIN_FILTER: "LINEAR", TEXTURE_MAG_FILTER: "NEAREST",
+    TEXTURE_WRAP_S: "MIRRORED_REPEAT", TEXTURE_WRAP_T: "CLAMP_TO_EDGE" });
+  assert.equal(glSamplerParams(sampler, 4).TEXTURE_MIN_FILTER, "LINEAR_MIPMAP_LINEAR");
+  assert.equal(glSamplerParams({ ...sampler, minFilter: "nearest" }, 2).TEXTURE_MIN_FILTER, "NEAREST_MIPMAP_NEAREST");
+  const { vertexFormat } = GL_NAMES;
+  assert.deepEqual(vertexFormat.uint32, { size: 1, type: "UNSIGNED_INT", normalized: false, integer: true });
+  assert.deepEqual(vertexFormat.sint32, { size: 1, type: "INT", normalized: false, integer: true });
+  assert.deepEqual(vertexFormat.unorm8x4, { size: 4, type: "UNSIGNED_BYTE", normalized: true, integer: false });
+  // Every wire value has a GL name, so no lookup can yield undefined.
+  for (const [table, names] of [["blendFactor", BLEND_FACTORS], ["blendOperation", BLEND_OPERATIONS],
+    ["compare", COMPARE_FUNCTIONS], ["topology", TOPOLOGIES], ["frontFace", FRONT_FACES], ["cullFace", CULL_MODES],
+    ["indexFormat", INDEX_FORMATS], ["addressMode", ADDRESS_MODES], ["vertexFormat", VERTEX_FORMATS]]) {
+    assert.deepEqual(Object.keys(GL_NAMES[table]), names, table);
+  }
+  assert.equal(GL_NAMES.blendFactor["one-minus-src"], "ONE_MINUS_SRC_COLOR");
+});
+
+// SPRITE_SHADER_GLSL from crates/titan-2d/src/shader.rs, verbatim.
+const SPRITE_GLSL = `#ifdef TITAN_VERTEX
+layout(std140) uniform CameraUniform_binding0 {
+    mat4 view_proj;
+} camera;
+
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in vec4 color;
+
+out vec2 v_uv;
+out vec4 v_color;
+
+void main() {
+    gl_Position = camera.view_proj * vec4(position, 0.0, 1.0);
+    v_uv = uv;
+    v_color = color;
+}
+#endif
+
+#ifdef TITAN_FRAGMENT
+precision highp float;
+
+uniform highp sampler2D sprite_texture_binding0;
+
+in vec2 v_uv;
+in vec4 v_color;
+
+layout(location = 0) out vec4 frag_color;
+
+void main() {
+    frag_color = texture(sprite_texture_binding0, v_uv) * v_color;
+}
+#endif
+`;
+
+// A WebGL2 context that records every call. Enum constants read back as their own names, and
+// created objects as "<Kind><n>", counted per kind. Every program reports the sprite shader's
+// active uniforms.
+function fakeGl() {
+  const calls = [];
+  const created = {};
+  const gl = {
+    calls,
+    failCompile: false,
+    canvas: { addEventListener() {} },
+    drawingBufferWidth: 800,
+    drawingBufferHeight: 600,
+    TEXTURE0: 0x84c0,
+    COLOR_BUFFER_BIT: 0x4000,
+    DEPTH_BUFFER_BIT: 0x100,
+    STENCIL_BUFFER_BIT: 0x400,
+    getParameter: (name) => ({ UNIFORM_BUFFER_OFFSET_ALIGNMENT: 256, MAX_UNIFORM_BLOCK_SIZE: 16384,
+      MAX_TEXTURE_SIZE: 4096 })[name],
+    getShaderParameter: () => !gl.failCompile,
+    getShaderInfoLog: () => "ERROR: 0:3: 'vec9' : no matching overloaded function found",
+    getProgramParameter: (program, name) => ({ LINK_STATUS: true, ACTIVE_UNIFORM_BLOCKS: 1, ACTIVE_UNIFORMS: 2 })[name],
+    getActiveUniformBlockName: () => "CameraUniform_binding0",
+    // The block's member is an active uniform too; only samplers get a texture unit.
+    getActiveUniform: (program, i) => [{ name: "CameraUniform_binding0.view_proj", type: "FLOAT_MAT4" },
+      { name: "sprite_texture_binding0", type: "SAMPLER_2D" }][i],
+    getUniformLocation: (program, name) => `location(${name})`,
+    checkFramebufferStatus: () => "FRAMEBUFFER_COMPLETE",
+    getError: () => "NO_ERROR",
+  };
+  return new Proxy(gl, {
+    get(target, key) {
+      if (key in target) return target[key];
+      if (/^[A-Z][A-Z0-9_]*$/.test(key)) return key;
+      return (...args) => {
+        calls.push([key, ...args]);
+        const kind = key.startsWith("create") && key.slice(6);
+        if (kind) return `${kind}${created[kind] = (created[kind] ?? 0) + 1}`;
+      };
+    },
+  });
+}
+
+const [VERTEX_USAGE, INDEX_USAGE, UNIFORM_USAGE, STORAGE_USAGE, COPY_DST_USAGE] = [1, 2, 4, 8, 32];
+
+test("the WebGL2 backend draws a decoded sprite frame and presents it", () => {
+  const gl = fakeGl();
+  const backend = createWebGL2Backend(gl, assert.fail);
+  assert.equal(backend.surfaceFormat, "rgba8unorm-srgb");
+  backend.createBuffer(1, 512, UNIFORM_USAGE | COPY_DST_USAGE);
+  backend.createBuffer(2, 1024, VERTEX_USAGE | COPY_DST_USAGE);
+  backend.createBuffer(3, 256, INDEX_USAGE | COPY_DST_USAGE);
+  backend.createBuffer(4, 64, VERTEX_USAGE);
+  backend.createTexture(5, decodeTextureDesc(bytes(u32(2, 2, 1), 1, u32(0b1001), [1, 1, 0, 0], str(""))));
+  backend.createShader(6, decodeShaderSource(bytes(str("wgsl"), str(SPRITE_GLSL), str("vs_main"), str("fs_main"), str("sprite"))));
+  // Sprite vertices (stride 32), plus per-instance unorm8x4 and uint32 attributes in slot 1.
+  backend.createPipeline(7, decodePipelineDesc(bytes(u32(6), 1, 1, [2, 3, 0, 1, 3, 0], 0, [0, 0, 0], 2,
+    u32(32), 0, 3, [0x01, u32(0, 0)], [0x01, u32(8, 1)], [0x03, u32(16, 2)],
+    u32(8), 1, 2, [0x06, u32(0, 3)], [0x04, u32(4, 4)], str("sprites"))));
+  const setup = gl.calls.splice(0);
+  assert.ok(setup.some(([fn, , source]) => fn === "shaderSource" && source === glslStage("FRAGMENT", SPRITE_GLSL)));
+  // The index buffer is bound to ELEMENT_ARRAY_BUFFER from creation; the others never are.
+  assert.deepEqual(setup.filter(([fn]) => fn === "bindBuffer").map(([, target]) => target),
+    ["COPY_WRITE_BUFFER", "COPY_WRITE_BUFFER", "ELEMENT_ARRAY_BUFFER", "COPY_WRITE_BUFFER"]);
+  assert.ok(setup.some(([fn, , param, value]) =>
+    fn === "samplerParameteri" && param === "TEXTURE_MIN_FILTER" && value === "LINEAR"));
+  // Program1 is the present program, Program2 the sprite pipeline's.
+  assert.deepEqual(setup.filter(([fn]) => fn === "uniformBlockBinding" || fn === "uniform1i"),
+    [["uniformBlockBinding", "Program2", 0, 0], ["uniform1i", "location(sprite_texture_binding0)", 0]]);
+
+  backend.submitFrame(decodeFrame(bytes(u32(1), 1, u32(0), 1, f64(0, 0, 0, 1), 0, 0, u32(8),
+    0, u32(7), 3, u32(0, 1, 256), 1, u32(0, 2, 0), 1, u32(1, 4, 16), 2, u32(3), 1, u32(8), 5, u32(0, 5),
+    6, f32(10, 20, 100, 50, 0, 1), 9, u32(6, 2, 3), i32(4), u32(1))));
+  const frame = gl.calls;
+  const find = (fn) => frame.filter(([name]) => name === fn).map(([, ...args]) => args);
+  assert.deepEqual(find("clear"), [[0x4000]]);
+  assert.deepEqual(find("blendFuncSeparate"), [["SRC_ALPHA", "ONE_MINUS_SRC_ALPHA", "ONE", "ONE_MINUS_SRC_ALPHA"]]);
+  assert.deepEqual(find("bindBufferRange"), [["UNIFORM_BUFFER", 0, "Buffer1", 256, 256]]);
+  assert.deepEqual(find("bindSampler"), [[0, "Sampler1"]]);
+  // baseVertex 4 moves vertex attributes by 4 strides; firstInstance 1 moves instance ones by one,
+  // on top of slot 1's 16-byte binding offset.
+  assert.deepEqual(find("vertexAttribPointer"), [[0, 2, "FLOAT", false, 32, 128], [1, 2, "FLOAT", false, 32, 136],
+    [2, 4, "FLOAT", false, 32, 144], [3, 4, "UNSIGNED_BYTE", true, 8, 24]]);
+  assert.deepEqual(find("vertexAttribIPointer"), [[4, 1, "UNSIGNED_INT", 8, 28]]);
+  assert.deepEqual(find("vertexAttribDivisor"), [[0, 0], [1, 0], [2, 0], [3, 1], [4, 1]]);
+  assert.deepEqual(find("viewport"), [[0, 0, 800, 600], [10, 530, 100, 50], [0, 0, 800, 600]]);
+  // Byte offset: the 8-byte index buffer offset plus 3 uint32 indices.
+  assert.deepEqual(find("drawElementsInstanced"), [["TRIANGLES", 6, "UNSIGNED_INT", 20, 2]]);
+  // The surface pass drew into an sRGB texture, then the present pass copies it to the canvas.
+  assert.ok(find("texStorage2D").some(([, , format, w, h]) => format === "SRGB8_ALPHA8" && w === 800 && h === 600));
+  const present = frame.findIndex(([fn, , fb]) => fn === "bindFramebuffer" && fb === null);
+  assert.ok(present > frame.findIndex(([fn]) => fn === "drawElementsInstanced"));
+  assert.deepEqual(frame.slice(present).filter(([fn]) => fn === "useProgram" || fn.startsWith("draw")),
+    [["useProgram", "Program1"], ["drawArrays", "TRIANGLES", 0, 3]]);
+});
+
+test("the WebGL2 backend fails loudly on what it cannot run", () => {
+  const gl = fakeGl();
+  const backend = createWebGL2Backend(gl, assert.fail);
+  const shader = (glsl) => decodeShaderSource(bytes(str("wgsl"), str(glsl), str("vs"), str("fs"), str("sprite")));
+  backend.createShader(1, shader(""));
+  assert.throws(() => backend.createPipeline(2, { ...decodePipeline({ color: 1 }), shaderId: 1 }),
+    /shader "sprite" has no GLSL source, which WebGL2 needs/);
+  gl.failCompile = true;
+  assert.throws(() => backend.createShader(3, shader(SPRITE_GLSL)),
+    /shader "sprite": the GLSL vertex stage failed to compile:\nERROR: 0:3: 'vec9'/);
+  assert.throws(() => backend.createBuffer(4, 64, STORAGE_USAGE), /storage buffers are not supported on WebGL2/);
+  assert.throws(() => backend.createBuffer(4, 64, INDEX_USAGE | VERTEX_USAGE), /index buffer cannot also be a vertex/);
+  gl.failCompile = false;
+  backend.createBuffer(5, 512, UNIFORM_USAGE);
+  backend.createShader(6, shader(SPRITE_GLSL));
+  backend.createPipeline(7, { ...decodePipeline({ color: 1 }), shaderId: 6 });
+  const frame = (...commands) => decodeFrame(bytes(u32(1), 1, u32(0), 0, 0, 0, u32(commands.length + 2),
+    0, u32(7), commands, 8, u32(3, 1, 0, 0)));
+  assert.throws(() => backend.submitFrame(frame()), /a draw needs a uniform buffer at binding 0/);
+  assert.throws(() => backend.submitFrame(frame([3, u32(0, 5, 128)])), /offset 128 must be a multiple of 256/);
+  assert.throws(() => backend.submitFrame(frame([3, u32(0, 5, 0)])), /a draw needs a texture at binding 0/);
 });
