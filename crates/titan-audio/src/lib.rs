@@ -1,10 +1,14 @@
-//! Titan audio: immutable PCM [`Sound`] clips and a deterministic stereo [`AudioMixer`].
+//! Titan audio: immutable PCM [`Sound`] clips, WAV decoding, a procedural SFX synth, and a
+//! deterministic stereo [`AudioMixer`].
 //!
 //! The crate is `no_std` (it needs only `alloc`), forbids `unsafe`, and depends only on
 //! `titan-core`. Mixing is plain Rust arithmetic in slot order, so every target produces
 //! bit-identical output for the same calls.
 //!
 //! - [`Sound`] validates and stores `f32` samples, mono or interleaved stereo.
+//!   [`Sound::from_wav`] decodes 8/16-bit PCM and 32-bit float RIFF/WAVE files.
+//! - [`Sfx`] renders a seeded oscillator note with an ADSR [`Envelope`] into a mono [`Sound`],
+//!   bit-identically on every target.
 //! - [`AudioMixer`] owns registered sounds and the voices playing them, both addressed by
 //!   generational [`Handle`]s, and mixes them into an interleaved stereo buffer with linear
 //!   resampling, per-voice gain and pan, looping, and a master gain.
@@ -30,7 +34,11 @@ extern crate alloc;
 
 mod mixer;
 mod sound;
+mod synth;
+mod wav;
 
 pub use mixer::{AudioMixer, PlayParams, Voice};
 pub use sound::{AudioError, Channels, Sound};
+pub use synth::{Envelope, Sfx, SynthError, Waveform};
 pub use titan_core::Handle;
+pub use wav::WavError;
