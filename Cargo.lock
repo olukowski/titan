@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "titan-2d",
  "titan-app",
+ "titan-assets",
  "titan-core",
  "titan-gpu",
  "titan-macos",

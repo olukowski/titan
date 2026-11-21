@@ -11,13 +11,18 @@ extern crate alloc;
 
 pub(crate) mod level;
 
+use alloc::format;
 use alloc::vec::Vec;
 use level::{BrickKind, Level};
 use titan::app::{App, AppAction, InputState, KeyCode, MouseButton, SurfaceSize};
+use titan::assets::{Atlas, decode_qoi};
 use titan::core::math::sin_cos;
-use titan::core::{Color, Rect, Vec2};
-use titan::gpu::{ClearColor, FrameCommands, GpuDevice, GpuError, RenderPassDesc};
-use titan::render2d::{Camera2D, Renderer2D};
+use titan::core::{Color, Handle, Rect, Vec2};
+use titan::gpu::{
+    ClearColor, FrameCommands, GpuDevice, GpuError, RenderPassDesc, SamplerDesc, Texture,
+    TextureDesc, TextureFormat,
+};
+use titan::render2d::{Camera2D, Renderer2D, Sprite, TextStyle, create_font_texture, measure_text};
 
 /// The world the camera always shows in full.
 const ARENA: Vec2 = Vec2::new(800.0, 600.0);
@@ -60,6 +65,21 @@ const BALL_COLOR: Color = Color::WHITE;
 const PANEL_COLOR: Color = Color::rgba(0.02, 0.02, 0.05, 0.88);
 const WON_COLOR: Color = Color::rgb(0.4, 0.9, 0.5);
 const LOST_COLOR: Color = Color::rgb(0.95, 0.35, 0.3);
+
+// Layers, drawn lowest first; solid quads stay in layer 0. `Renderer2D` merges adjacent sprites
+// that share a texture into one draw, so keeping each texture's layers together draws a frame
+// with one call per texture: solid quads, then the sheet (sprites, then the banner panel over
+// them), then text.
+const SPRITE_LAYER: i32 = 1;
+const PANEL_LAYER: i32 = 2;
+const TEXT_LAYER: i32 = 3;
+
+const SCORE_STYLE: TextStyle = TextStyle::new(3.0)
+    .with_color(TEXT_COLOR)
+    .with_layer(TEXT_LAYER);
+const HINT_STYLE: TextStyle = TextStyle::new(2.0)
+    .with_color(HINT_COLOR)
+    .with_layer(TEXT_LAYER);
 
 /// Where the game is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,13 +300,83 @@ fn fit_camera(surface: SurfaceSize) -> Option<Camera2D> {
     })
 }
 
+/// The renderer and everything it draws from, made once in [`App::init`].
+#[derive(Debug)]
+struct Graphics {
+    renderer: Renderer2D,
+    font: Handle<Texture>,
+    sheet: Handle<Texture>,
+    /// UVs of the `sheet.atlas` regions. All but the panel are gray bevels tinted when drawn.
+    brick: Rect,
+    paddle: Rect,
+    ball: Rect,
+    /// Solid white, so the banner panel draws from the sheet and joins its draw call.
+    panel: Rect,
+}
+
+impl Graphics {
+    /// Decodes the embedded sprite sheet and uploads it and the font. The sheet is part of the
+    /// program, so a bad one panics rather than returning an error.
+    fn new(gpu: &mut dyn GpuDevice) -> Result<Self, GpuError> {
+        let image = decode_qoi(include_bytes!("sheet.qoi"))
+            .unwrap_or_else(|e| panic!("breakout sheet.qoi: {e}"));
+        let atlas = Atlas::parse(include_str!("sheet.atlas"))
+            .unwrap_or_else(|e| panic!("breakout sheet.atlas: {e}"));
+        assert_eq!(
+            (atlas.width(), atlas.height()),
+            (image.width(), image.height()),
+            "breakout sheet.atlas: size differs from sheet.qoi"
+        );
+        let uv = |name| {
+            atlas
+                .uv(name)
+                .unwrap_or_else(|| panic!("breakout sheet.atlas: no `{name}` region"))
+        };
+        let renderer = Renderer2D::new(gpu)?;
+        let font = create_font_texture(gpu)?;
+        let sheet = gpu.create_texture(&TextureDesc {
+            label: Some("breakout sheet"),
+            // Linear like the font, so a texel's gray scales its sprite's tint as is.
+            format: TextureFormat::Rgba8Unorm,
+            sampler: SamplerDesc::NEAREST_CLAMP,
+            ..TextureDesc::rgba8_2d(image.width(), image.height())
+        })?;
+        gpu.write_texture(sheet, image.as_bytes())?;
+        Ok(Self {
+            renderer,
+            font,
+            sheet,
+            brick: uv("brick"),
+            paddle: uv("paddle"),
+            ball: uv("ball"),
+            panel: uv("panel"),
+        })
+    }
+
+    fn draw_sheet(&mut self, rect: Rect, uv: Rect, color: Color, layer: i32) {
+        self.renderer.draw_sprite(
+            Sprite::textured(rect, self.sheet)
+                .with_uv(uv)
+                .with_color(color)
+                .with_layer(layer),
+        );
+    }
+
+    /// Draws `text` centered across the arena with its top at `top`.
+    fn draw_centered(&mut self, text: &str, top: f32, style: &TextStyle) {
+        let left = (ARENA.x - measure_text(text, style).x) / 2.0;
+        let list = self.renderer.draw_list_mut();
+        list.draw_text(self.font, text, Vec2::new(left, top), style);
+    }
+}
+
 /// Breakout as a Titan [`App`].
 #[derive(Debug)]
 pub(crate) struct BreakoutApp {
     level: Level,
     game: Game,
     surface: SurfaceSize,
-    renderer: Option<Renderer2D>,
+    graphics: Option<Graphics>,
 }
 
 impl BreakoutApp {
@@ -300,7 +390,7 @@ impl BreakoutApp {
             game: Game::new(&level),
             level,
             surface: SurfaceSize::default(),
-            renderer: None,
+            graphics: None,
         }
     }
 
@@ -335,7 +425,7 @@ pub(crate) struct Snapshot {
 
 impl App for BreakoutApp {
     fn init(&mut self, gpu: &mut dyn GpuDevice) -> Result<(), GpuError> {
-        self.renderer = Some(Renderer2D::new(gpu)?);
+        self.graphics = Some(Graphics::new(gpu)?);
         Ok(())
     }
 
@@ -384,18 +474,21 @@ impl App for BreakoutApp {
         let Some(camera) = fit_camera(self.surface) else {
             return Ok(());
         };
-        let renderer = self.renderer.as_mut().expect("init runs before render");
-        draw_game(renderer, &self.game, alpha.clamp(0.0, 1.0));
-        renderer.flush(gpu, commands, RenderPassDesc::clear_surface(CLEAR), &camera)
+        let graphics = self.graphics.as_mut().expect("init runs before render");
+        draw_game(graphics, &self.game, alpha.clamp(0.0, 1.0));
+        let pass = RenderPassDesc::clear_surface(CLEAR);
+        graphics.renderer.flush(gpu, commands, pass, &camera)
     }
 }
 
-/// Queues the whole frame. Every quad is solid, so it flushes as one draw call.
-fn draw_game(r: &mut Renderer2D, game: &Game, alpha: f32) {
+/// Queues the whole frame: one draw call each for solid quads, the sheet, and the font.
+fn draw_game(g: &mut Graphics, game: &Game, alpha: f32) {
+    let r = &mut g.renderer;
     r.draw_rect(rect(0.0, 0.0, ARENA.x, HUD_BOTTOM), ARENA_COLOR);
     r.draw_rect(rect(0.0, 0.0, PLAY_LEFT, HUD_BOTTOM), WALL_COLOR);
     r.draw_rect(rect(PLAY_RIGHT, 0.0, ARENA.x, HUD_BOTTOM), WALL_COLOR);
     r.draw_rect(rect(0.0, PLAY_TOP, ARENA.x, HUD_BOTTOM), WALL_COLOR);
+    r.draw_rect(rect(0.0, HUD_BOTTOM, ARENA.x, ARENA.y), HUD_COLOR);
 
     for brick in &game.bricks {
         let color = match (brick.kind, brick.hits_left) {
@@ -407,45 +500,48 @@ fn draw_game(r: &mut Renderer2D, game: &Game, alpha: f32) {
             (BrickKind::Silver, 2..) => Color::rgb(0.8, 0.82, 0.88),
             (BrickKind::Silver, _) => Color::rgb(0.48, 0.5, 0.57),
         };
-        draw_block(r, inset(brick.rect, 1.0), color);
+        g.draw_sheet(inset(brick.rect, 1.0), g.brick, color, SPRITE_LAYER);
     }
 
     let paddle_x = lerp(game.previous_paddle_x, game.paddle_x, alpha);
-    draw_block(r, game.paddle_rect(paddle_x), PADDLE_COLOR);
-
-    match game.phase {
-        Phase::Ready => draw_centered(r, b"PRESS SPACE", 200.0, 3.0, HINT_COLOR),
-        Phase::Playing => {}
-        Phase::Won => draw_banner(r, b"YOU WIN", WON_COLOR),
-        Phase::Lost => draw_banner(r, b"GAME OVER", LOST_COLOR),
-    }
+    g.draw_sheet(
+        game.paddle_rect(paddle_x),
+        g.paddle,
+        PADDLE_COLOR,
+        SPRITE_LAYER,
+    );
     if game.phase != Phase::Lost {
         let ball = game.previous_ball.lerp(game.ball, alpha);
-        r.draw_rect(ball_rect(ball), BALL_COLOR);
+        g.draw_sheet(ball_rect(ball), g.ball, BALL_COLOR, SPRITE_LAYER);
     }
-
-    r.draw_rect(rect(0.0, HUD_BOTTOM, ARENA.x, ARENA.y), HUD_COLOR);
-    draw_number(r, game.score, Vec2::new(24.0, 590.0), 4.0, TEXT_COLOR);
     for i in 0..game.lives {
-        let left = PLAY_RIGHT - 14.0 - i as f32 * 22.0;
-        r.draw_rect(rect(left, 574.0, left + 14.0, 586.0), PADDLE_COLOR);
+        let left = PLAY_RIGHT - BALL_SIZE - i as f32 * 22.0;
+        let icon = rect(left, 574.0, left + BALL_SIZE, 574.0 + BALL_SIZE);
+        g.draw_sheet(icon, g.ball, BALL_COLOR, SPRITE_LAYER);
     }
+
+    match game.phase {
+        Phase::Ready => g.draw_centered("PRESS SPACE", 200.0, &HINT_STYLE),
+        Phase::Playing => {}
+        Phase::Won => draw_banner(g, "YOU WIN", WON_COLOR),
+        Phase::Lost => draw_banner(g, "GAME OVER", LOST_COLOR),
+    }
+
+    let score = format!("{}", game.score);
+    let list = g.renderer.draw_list_mut();
+    list.draw_text(g.font, &score, Vec2::new(24.0, 590.0), &SCORE_STYLE);
 }
 
-/// A rectangle with a dark border and a light top edge.
-fn draw_block(r: &mut Renderer2D, area: Rect, color: Color) {
-    r.draw_rect(area, mix(color, Color::BLACK, 0.45));
-    let face = inset(area, 2.0);
-    r.draw_rect(face, color);
-    let shine_bottom = (face.max.y - 3.0).max(face.min.y);
-    let shine = Rect::from_min_max(Vec2::new(face.min.x, shine_bottom), face.max);
-    r.draw_rect(shine, mix(color, Color::WHITE, 0.35));
-}
-
-fn draw_banner(r: &mut Renderer2D, title: &[u8], color: Color) {
-    r.draw_rect(rect(180.0, 220.0, 620.0, 340.0), PANEL_COLOR);
-    draw_centered(r, title, 320.0, 8.0, color);
-    draw_centered(r, b"PRESS SPACE", 262.0, 3.0, HINT_COLOR);
+fn draw_banner(g: &mut Graphics, title: &str, color: Color) {
+    g.draw_sheet(
+        rect(180.0, 220.0, 620.0, 340.0),
+        g.panel,
+        PANEL_COLOR,
+        PANEL_LAYER,
+    );
+    let style = TextStyle::new(5.0).with_color(color).with_layer(TEXT_LAYER);
+    g.draw_centered(title, 320.0, &style);
+    g.draw_centered("PRESS SPACE", 262.0, &HINT_STYLE);
 }
 
 fn rect(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Rect {
@@ -461,89 +557,4 @@ fn inset(area: Rect, by: f32) -> Rect {
 
 fn lerp(from: f32, to: f32, t: f32) -> f32 {
     from + (to - from) * t
-}
-
-fn mix(from: Color, to: Color, t: f32) -> Color {
-    Color::rgba(
-        lerp(from.r, to.r, t),
-        lerp(from.g, to.g, t),
-        lerp(from.b, to.b, t),
-        from.a,
-    )
-}
-
-// A 3 x 5 pixel font with just the characters the game writes.
-
-/// Glyph columns plus one column of spacing.
-const GLYPH_ADVANCE: f32 = 4.0;
-
-/// Returns the glyph's 15 pixels, row by row from the top, the leftmost pixel in the highest
-/// bit. Unknown characters, including space, are blank.
-fn glyph(c: u8) -> u16 {
-    match c {
-        b'0' => 0b111_101_101_101_111,
-        b'1' => 0b010_110_010_010_111,
-        b'2' => 0b111_001_111_100_111,
-        b'3' => 0b111_001_111_001_111,
-        b'4' => 0b101_101_111_001_001,
-        b'5' => 0b111_100_111_001_111,
-        b'6' => 0b111_100_111_101_111,
-        b'7' => 0b111_001_001_001_001,
-        b'8' => 0b111_101_111_101_111,
-        b'9' => 0b111_101_111_001_111,
-        b'A' => 0b010_101_111_101_101,
-        b'C' => 0b011_100_100_100_011,
-        b'E' => 0b111_100_110_100_111,
-        b'G' => 0b011_100_101_101_011,
-        b'I' => 0b111_010_010_010_111,
-        b'M' => 0b101_111_111_101_101,
-        b'N' => 0b110_101_101_101_101,
-        b'O' => 0b010_101_101_101_010,
-        b'P' => 0b110_101_110_100_100,
-        b'R' => 0b110_101_110_101_101,
-        b'S' => 0b011_100_010_001_110,
-        b'U' => 0b101_101_101_101_111,
-        b'V' => 0b101_101_101_101_010,
-        b'W' => 0b101_101_111_111_101,
-        b'Y' => 0b101_101_010_010_010,
-        _ => 0,
-    }
-}
-
-/// Draws `text` with its top-left corner at `top_left`, each font pixel `pixel` world units.
-fn draw_text(r: &mut Renderer2D, text: &[u8], top_left: Vec2, pixel: f32, color: Color) {
-    for (i, &c) in text.iter().enumerate() {
-        let bits = glyph(c);
-        let left = top_left.x + i as f32 * GLYPH_ADVANCE * pixel;
-        for cell in 0..15 {
-            if bits & (1 << (14 - cell)) != 0 {
-                let (row, column) = ((cell / 3) as f32, (cell % 3) as f32);
-                let min = Vec2::new(left + column * pixel, top_left.y - (row + 1.0) * pixel);
-                r.draw_quad(min, Vec2::splat(pixel), color);
-            }
-        }
-    }
-}
-
-/// Draws `text` centered across the arena with its top at `top`.
-fn draw_centered(r: &mut Renderer2D, text: &[u8], top: f32, pixel: f32, color: Color) {
-    let width = (text.len() as f32 * GLYPH_ADVANCE - 1.0) * pixel;
-    let top_left = Vec2::new((ARENA.x - width) / 2.0, top);
-    draw_text(r, text, top_left, pixel, color);
-}
-
-fn draw_number(r: &mut Renderer2D, value: u32, top_left: Vec2, pixel: f32, color: Color) {
-    // `u32::MAX` has ten digits.
-    let mut digits = [0; 10];
-    let mut start = digits.len();
-    let mut rest = value;
-    loop {
-        start -= 1;
-        digits[start] = b'0' + (rest % 10) as u8;
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
-    }
-    draw_text(r, &digits[start..], top_left, pixel, color);
 }

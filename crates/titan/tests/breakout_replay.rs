@@ -1,5 +1,5 @@
-//! Breakout's level format, its gameplay rules, and a 1,260-frame headless replay that must
-//! reproduce the same game and the same GPU frames every time.
+//! Breakout's level format, its gameplay rules, its generated sprite sheet, and a 1,260-frame
+//! headless replay that must reproduce the same game and the same GPU frames every time.
 
 #[path = "../examples/breakout_game/mod.rs"]
 mod breakout;
@@ -9,6 +9,7 @@ use breakout::{BreakoutApp, Phase, Snapshot};
 use titan::app::{
     Event, EventLog, HeadlessConfig, HeadlessRunner, KeyCode, MouseButton, SurfaceSize,
 };
+use titan::assets::{Atlas, Image, encode_qoi};
 use titan::core::Vec2;
 use titan::gpu::{DrawCmd, RecordedFrame, RenderCmd};
 
@@ -52,26 +53,31 @@ fn tick_until(
     );
 }
 
-/// Asserts the frame is one `Renderer2D` pass: the sprite pipeline and a single indexed draw of
-/// whole quads.
-fn assert_one_batched_draw(frame: &RecordedFrame) {
+/// Asserts the frame is one `Renderer2D` pass: the sprite pipeline and indexed draws of whole
+/// quads, at most one per texture (solid quads, the sprite sheet, and the font).
+fn assert_one_draw_per_texture(frame: &RecordedFrame) {
     assert_eq!(frame.passes.len(), 1);
     let commands = &frame.passes[0].commands;
     assert!(
         matches!(commands[0], RenderCmd::SetPipeline(_)),
         "{commands:?}"
     );
-    let draws: Vec<_> = commands
-        .iter()
-        .filter_map(|c| match c {
-            RenderCmd::Draw(draw) => Some(*draw),
-            _ => None,
-        })
-        .collect();
-    let [DrawCmd::Indexed { index_count, .. }] = draws[..] else {
-        panic!("expected one indexed draw, got {draws:?}");
-    };
-    assert!(index_count > 0 && index_count % 6 == 0, "{index_count}");
+    let mut bound = None;
+    let mut textures = Vec::new();
+    for command in commands {
+        match *command {
+            RenderCmd::SetTexture { texture, .. } => bound = Some(texture),
+            RenderCmd::Draw(DrawCmd::Indexed { index_count, .. }) => {
+                assert!(index_count > 0 && index_count % 6 == 0, "{index_count}");
+                let texture = bound.expect("a draw before any texture is bound");
+                assert!(!textures.contains(&texture), "{texture:?} drawn twice");
+                textures.push(texture);
+            }
+            RenderCmd::Draw(draw) => panic!("expected indexed draws, got {draw:?}"),
+            _ => {}
+        }
+    }
+    assert!((1..=3).contains(&textures.len()), "{commands:?}");
 }
 
 // Level format.
@@ -137,10 +143,10 @@ fn the_largest_grid_parses_round_trips_and_renders() {
 
     let mut runner = run(BreakoutApp::with_level(level));
     tick(&mut runner, &[]);
-    assert_one_batched_draw(runner.gpu().last_frame().unwrap());
+    assert_one_draw_per_texture(runner.gpu().last_frame().unwrap());
     tap(&mut runner, KeyCode::Space);
     tick_until(&mut runner, 120, |s| s.score > 0);
-    assert_one_batched_draw(runner.gpu().last_frame().unwrap());
+    assert_one_draw_per_texture(runner.gpu().last_frame().unwrap());
 }
 
 #[test]
@@ -272,6 +278,90 @@ fn every_level_error_names_its_line() {
         assert_eq!(Level::parse(&text), Err(expected.clone()), "{text:?}");
         assert!(expected.to_string().starts_with(&format!("line {line}: ")));
     }
+}
+
+// Sprite sheet.
+
+/// How the generator draws each `sheet.atlas` region.
+enum Shape {
+    /// A gray block with a dark border, a light top shine two texels deep, and corners rounded
+    /// to `radius` texels.
+    Bevel {
+        radius: i64,
+    },
+    Solid,
+}
+
+const SHEET_SIZE: (u32, u32) = (48, 22);
+const SHAPES: [(&str, Shape); 4] = [
+    ("brick", Shape::Bevel { radius: 2 }),
+    ("ball", Shape::Bevel { radius: 6 }),
+    ("paddle", Shape::Bevel { radius: 4 }),
+    ("panel", Shape::Solid),
+];
+
+/// Draws every region of `atlas` into a transparent sheet, texel by texel.
+fn sheet_image(atlas: &Atlas) -> Image {
+    let (width, height) = SHEET_SIZE;
+    let mut image = Image::new(width, height, vec![0; (width * height * 4) as usize]).unwrap();
+    for (name, shape) in SHAPES {
+        let region = atlas
+            .region(name)
+            .unwrap_or_else(|| panic!("no `{name}` region"));
+        let (w, h) = (i64::from(region.width), i64::from(region.height));
+        // Doubled coordinates keep texel centers, and so the shape, in exact integers.
+        let inside = |x: i64, y: i64| {
+            let Shape::Bevel { radius } = shape else {
+                return true;
+            };
+            let (cx, cy) = (2 * x + 1, 2 * y + 1);
+            let dx = cx - cx.clamp(2 * radius, 2 * (w - radius));
+            let dy = cy - cy.clamp(2 * radius, 2 * (h - radius));
+            (0..w).contains(&x) && (0..h).contains(&y) && dx * dx + dy * dy <= 4 * radius * radius
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let gray = |v| [v, v, v, 255];
+                let texel = match shape {
+                    Shape::Solid => gray(255),
+                    Shape::Bevel { .. } if !inside(x, y) => [0; 4],
+                    _ if [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                        .iter()
+                        .any(|(dx, dy)| !inside(x + dx, y + dy)) =>
+                    {
+                        gray(110)
+                    }
+                    _ if !inside(x, y - 3) => gray(255),
+                    _ => gray(200),
+                };
+                let (x, y) = (region.x + x as u32, region.y + y as u32);
+                assert!(
+                    image.set_pixel(x, y, texel),
+                    "`{name}` is outside the sheet"
+                );
+            }
+        }
+    }
+    image
+}
+
+#[test]
+fn the_sprite_sheet_is_its_generators_output() {
+    let atlas = Atlas::parse(include_str!("../examples/breakout_game/sheet.atlas")).unwrap();
+    assert_eq!((atlas.width(), atlas.height()), SHEET_SIZE);
+    let qoi = encode_qoi(&sheet_image(&atlas));
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/breakout_game/sheet.qoi"
+    );
+    if std::env::var_os("TITAN_BLESS").is_some_and(|v| v == "1") {
+        std::fs::write(path, &qoi).unwrap();
+    }
+    let committed = std::fs::read(path).unwrap();
+    assert!(
+        committed == qoi,
+        "sheet.qoi differs from the generator; rerun with TITAN_BLESS=1"
+    );
 }
 
 // Gameplay.
@@ -407,6 +497,8 @@ fn clearing_the_level_wins_and_space_restarts() {
     tap(&mut runner, KeyCode::Space);
     let won = tick_until(&mut runner, 120, |s| s.phase == Phase::Won);
     assert_eq!((won.score, won.bricks_remaining, won.lives), (10, 0, 2));
+    // The banner panel and its text still draw once per texture: solid, sheet, font.
+    assert_one_draw_per_texture(runner.gpu().last_frame().unwrap());
     // Winning freezes the game until a restart.
     assert_eq!(
         tick(&mut runner, &[Event::KeyDown(KeyCode::ArrowLeft)]),
@@ -437,6 +529,7 @@ fn falling_balls_cost_lives_until_the_game_is_lost_and_enter_restarts() {
         assert_eq!(fallen.phase, expected);
     }
     let lost = runner.app().snapshot();
+    assert_one_draw_per_texture(runner.gpu().last_frame().unwrap());
     // A lost game ignores the paddle keys.
     assert_eq!(tick(&mut runner, &[Event::KeyDown(KeyCode::D)]), lost);
     let restarted = tap(&mut runner, KeyCode::Enter);
@@ -459,7 +552,7 @@ fn escape_or_closing_the_window_exits() {
 fn zero_size_surface_renders_nothing_without_panicking() {
     let mut runner = run(BreakoutApp::new());
     tick(&mut runner, &[]);
-    assert_one_batched_draw(runner.gpu().last_frame().unwrap());
+    assert_one_draw_per_texture(runner.gpu().last_frame().unwrap());
     for size in [SurfaceSize::new(0, 0, 1.0), SurfaceSize::new(640, 0, 2.0)] {
         tick(
             &mut runner,
@@ -471,7 +564,7 @@ fn zero_size_surface_renders_nothing_without_panicking() {
         &mut runner,
         &[Event::Resize(SurfaceSize::new(320, 200, 1.0))],
     );
-    assert_one_batched_draw(runner.gpu().last_frame().unwrap());
+    assert_one_draw_per_texture(runner.gpu().last_frame().unwrap());
     assert_eq!(runner.app().snapshot().phase, Phase::Playing);
 }
 
@@ -602,5 +695,5 @@ fn a_recorded_game_replays_identically_from_its_text_log() {
         .gpu()
         .frames()
         .iter()
-        .for_each(assert_one_batched_draw);
+        .for_each(assert_one_draw_per_texture);
 }
