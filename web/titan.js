@@ -825,10 +825,9 @@ export function createWebGL2Backend(gl, fail) {
         if (c.offset % uniformAlignment) {
           throw new Error(`${where}: offset ${c.offset} must be a multiple of ${uniformAlignment}`);
         }
-        if (bound <= 0 || bound > maxUniformSize) {
-          throw new Error(`${where}: the ${bound} bytes after offset ${c.offset} must be 1 to ${maxUniformSize}`);
-        }
-        gl.bindBufferRange(gl.UNIFORM_BUFFER, binding, buffer, c.offset, bound);
+        if (bound <= 0) throw new Error(`${where}: offset ${c.offset} leaves no bytes of its ${size}-byte buffer`);
+        // No block can exceed MAX_UNIFORM_BLOCK_SIZE (16 KiB at minimum), so bind at most that much.
+        gl.bindBufferRange(gl.UNIFORM_BUFFER, binding, buffer, c.offset, Math.min(bound, maxUniformSize));
       }
       for (const binding of pipeline.textureBindings) {
         const t = boundTextures.get(binding);
