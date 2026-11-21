@@ -42,6 +42,8 @@ pub enum WavError {
         /// The `data` chunk length in bytes.
         len: usize,
     },
+    /// The decoded samples do not fit in memory.
+    TooLarge,
     /// The decoded samples do not form a valid [`Sound`].
     Sound(AudioError),
 }
@@ -73,6 +75,7 @@ impl fmt::Display for WavError {
             Self::UnalignedData { len } => {
                 write!(f, "{len}-byte `data` chunk is not a whole number of frames")
             }
+            Self::TooLarge => f.write_str("decoded WAV samples are too large to allocate"),
             Self::Sound(error) => write!(f, "invalid sound: {error}"),
         }
     }
@@ -98,8 +101,8 @@ impl Sound {
     ///
     /// Returns a [`WavError`] if the input is truncated (including a RIFF or chunk size that
     /// runs past the end of `bytes`), is not RIFF/WAVE, lacks a `fmt ` chunk before its `data`
-    /// chunk, uses an unsupported format, or decodes to an invalid [`Sound`] (a zero sample rate
-    /// or a non-finite float sample).
+    /// chunk, uses an unsupported format, decodes to more samples than can be allocated, or
+    /// decodes to an invalid [`Sound`] (a zero sample rate or a non-finite float sample).
     pub fn from_wav(bytes: &[u8]) -> Result<Self, WavError> {
         let (&[r0, r1, r2, r3, s0, s1, s2, s3], rest) =
             bytes.split_first_chunk::<8>().ok_or(WavError::Truncated)?;
@@ -161,24 +164,22 @@ impl Sound {
             return Err(WavError::UnalignedData { len: data.len() });
         }
 
-        let samples: Vec<f32> = match bytes_per_sample {
-            1 => data
-                .iter()
-                .map(|&b| (f32::from(b) - 128.0) / 128.0)
-                .collect(),
-            2 => data
-                .as_chunks()
-                .0
-                .iter()
-                .map(|&b| f32::from(i16::from_le_bytes(b)) / 32768.0)
-                .collect(),
-            _ => data
-                .as_chunks()
-                .0
-                .iter()
-                .map(|&b| f32::from_le_bytes(b))
-                .collect(),
-        };
+        // Each decoded `f32` can be up to 4x its 8-bit source, which can exceed `isize::MAX`
+        // bytes on 32-bit targets.
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(data.len() / bytes_per_sample)
+            .map_err(|_| WavError::TooLarge)?;
+        match bytes_per_sample {
+            1 => samples.extend(data.iter().map(|&b| (f32::from(b) - 128.0) / 128.0)),
+            2 => samples.extend(
+                data.as_chunks()
+                    .0
+                    .iter()
+                    .map(|&b| f32::from(i16::from_le_bytes(b)) / 32768.0),
+            ),
+            _ => samples.extend(data.as_chunks().0.iter().map(|&b| f32::from_le_bytes(b))),
+        }
         Self::new(sample_rate, channels, samples).map_err(WavError::Sound)
     }
 }

@@ -18,7 +18,8 @@ pub enum Waveform {
     /// A ramp from `-1.0` up to `1.0` each cycle.
     Saw,
     /// Seeded random values, a new one at every cycle start (sample and hold), so the
-    /// frequency sets the noise's pitch.
+    /// frequency sets the noise's pitch. A new value is drawn at most once per output frame, so
+    /// at or above the sample rate this is white noise sampled at the output rate.
     Noise,
 }
 
@@ -64,6 +65,8 @@ pub struct Sfx {
 pub enum SynthError {
     /// The named [`Sfx`] or [`Envelope`] field is outside its documented range.
     InvalidParam(&'static str),
+    /// The sound has more frames than fit in memory.
+    TooLong,
     /// The rendered samples do not form a valid [`Sound`] (a zero sample rate).
     Sound(AudioError),
 }
@@ -72,6 +75,7 @@ impl fmt::Display for SynthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidParam(name) => write!(f, "synth parameter `{name}` is out of range"),
+            Self::TooLong => f.write_str("synth output is too long to allocate"),
             Self::Sound(error) => write!(f, "invalid sound: {error}"),
         }
     }
@@ -81,7 +85,7 @@ impl core::error::Error for SynthError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Sound(error) => Some(error),
-            Self::InvalidParam(_) => None,
+            Self::InvalidParam(_) | Self::TooLong => None,
         }
     }
 }
@@ -90,14 +94,16 @@ impl Sfx {
     /// Renders this effect as a mono [`Sound`] at `sample_rate` frames per second.
     ///
     /// Frame `n` samples time `n / sample_rate`. The sound has
-    /// `ceil((duration + release) * sample_rate) + 1` frames, so its last frame lies at or past
-    /// the end of the release and is exactly `0.0`. The output is bit-identical on every target:
+    /// `ceil((duration + release) * sample_rate) + 1` frames, plus one if rounding would leave the
+    /// last frame short of `duration + release`, so its last frame lies at or past the end of
+    /// the release and is exactly `0.0`. The output is bit-identical on every target:
     /// rendering uses only IEEE-exact arithmetic and `titan-core`'s portable sine.
     ///
     /// # Errors
     ///
-    /// Returns [`SynthError::InvalidParam`] if a field is outside its documented range, or
-    /// [`SynthError::Sound`] if `sample_rate` is zero.
+    /// Returns [`SynthError::InvalidParam`] if a field is outside its documented range,
+    /// [`SynthError::TooLong`] if the samples cannot be allocated, or [`SynthError::Sound`] if
+    /// `sample_rate` is zero.
     pub fn render(&self, sample_rate: u32) -> Result<Sound, SynthError> {
         let Envelope {
             attack,
@@ -160,9 +166,17 @@ impl Sfx {
 
         let span = end * rate;
         let whole = span as usize;
-        let frames = whole
+        let mut frames = whole
             .saturating_add(usize::from((whole as f64) < span))
             .saturating_add(1);
+        // `end * rate` can round down onto an integer, leaving the last frame just before `end`.
+        if ((frames - 1) as f64 / rate) < end {
+            frames = frames.saturating_add(1);
+        }
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(frames)
+            .map_err(|_| SynthError::TooLong)?;
 
         // xorshift32; a zero state would stay zero forever.
         let mut state = self.seed.max(1);
@@ -174,45 +188,43 @@ impl Sfx {
         };
         let mut noise = next_noise();
         let mut phase = 0.0_f64;
-        let samples: Vec<f32> = (0..frames)
-            .map(|n| {
-                let t = n as f64 / rate;
-                let wave = match self.waveform {
-                    Waveform::Sine => f64::from(sin_cos(TAU * phase as f32).0),
-                    Waveform::Square => {
-                        if phase < 0.5 {
-                            1.0
-                        } else {
-                            -1.0
-                        }
+        samples.extend((0..frames).map(|n| {
+            let t = n as f64 / rate;
+            let wave = match self.waveform {
+                Waveform::Sine => f64::from(sin_cos(TAU * phase as f32).0),
+                Waveform::Square => {
+                    if phase < 0.5 {
+                        1.0
+                    } else {
+                        -1.0
                     }
-                    Waveform::Triangle => {
-                        4.0 * if phase < 0.25 {
-                            phase
-                        } else if phase < 0.75 {
-                            0.5 - phase
-                        } else {
-                            phase - 1.0
-                        }
-                    }
-                    Waveform::Saw => 2.0 * phase - 1.0,
-                    Waveform::Noise => noise,
-                };
-                let hz = if t < duration {
-                    start_hz + (end_hz - start_hz) * (t / duration)
-                } else {
-                    end_hz
-                };
-                let next = phase + hz / rate;
-                if next >= 1.0 {
-                    noise = next_noise();
                 }
-                // IEEE remainder is exact, so this wraps identically everywhere, and unlike
-                // `phase -= 1.0` it also handles steps of a whole cycle or more.
-                phase = next % 1.0;
-                (wave * level(t) * gain) as f32
-            })
-            .collect();
+                Waveform::Triangle => {
+                    4.0 * if phase < 0.25 {
+                        phase
+                    } else if phase < 0.75 {
+                        0.5 - phase
+                    } else {
+                        phase - 1.0
+                    }
+                }
+                Waveform::Saw => 2.0 * phase - 1.0,
+                Waveform::Noise => noise,
+            };
+            let hz = if t < duration {
+                start_hz + (end_hz - start_hz) * (t / duration)
+            } else {
+                end_hz
+            };
+            let next = phase + hz / rate;
+            if next >= 1.0 {
+                noise = next_noise();
+            }
+            // IEEE remainder is exact, so this wraps identically everywhere, and unlike
+            // `phase -= 1.0` it also handles steps of a whole cycle or more.
+            phase = next % 1.0;
+            (wave * level(t) * gain) as f32
+        }));
         Sound::new(sample_rate, Channels::Mono, samples).map_err(SynthError::Sound)
     }
 }
@@ -267,6 +279,18 @@ mod tests {
             .render(1_000)
             .unwrap();
         assert_eq!(sound.frame_count(), 11);
+        assert_eq!(sound.samples().last(), Some(&0.0));
+
+        // Here `end * rate` rounds down to exactly 141.0, so frame 141 lands just before the
+        // end of the release and one more frame is needed to reach silence.
+        let short = Envelope {
+            release: 1.534_819_6e-9,
+            ..FLAT
+        };
+        let sound = sfx(Waveform::Square, 1.0, 0.017_624_998, short)
+            .render(8_000)
+            .unwrap();
+        assert_eq!(sound.frame_count(), 143);
         assert_eq!(sound.samples().last(), Some(&0.0));
     }
 
@@ -367,5 +391,10 @@ mod tests {
             base.render(0),
             Err(SynthError::Sound(AudioError::ZeroSampleRate))
         );
+        let endless = Sfx {
+            duration: f32::MAX,
+            ..base
+        };
+        assert_eq!(endless.render(48_000), Err(SynthError::TooLong));
     }
 }
