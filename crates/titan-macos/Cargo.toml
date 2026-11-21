@@ -1,0 +1,20 @@
+[package]
+name = "titan-macos"
+description = "Titan's macOS backend: an AppKit window and a Metal GPU device in pure Rust, with no dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+titan-app = { path = "../titan-app" }
+titan-gpu = { path = "../titan-gpu" }
+
+# Only the macOS runner uses it (for `FixedClock`); elsewhere `run` is a stub.
+[target.'cfg(target_os = "macos")'.dependencies]
+titan-core = { path = "../titan-core" }
+
+[lints]
+workspace = true
