@@ -1,6 +1,6 @@
 [package]
 name = "titan-audio"
-description = "Titan audio: validated PCM sounds and a deterministic stereo software mixer."
+description = "Titan audio: validated PCM sounds, WAV decoding, a procedural SFX synth, and a deterministic stereo software mixer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
