@@ -31,6 +31,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "titan-assets"
+version = "0.0.0"
+
+[[package]]
 name = "titan-core"
 version = "0.0.0"
 
