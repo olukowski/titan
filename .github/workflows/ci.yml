@@ -71,11 +71,29 @@ jobs:
             echo "| gzip -9 | $gz | $(kib "$gz") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos
+      - run: cargo clippy -p titan-macos --all-targets --locked -- -D warnings
+      - run: cargo test -p titan-macos --locked
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: node --version && node --test web/titan.test.mjs
+
   # Single stable required check for the `main` ruleset.
   ci:
     name: ci
     if: always()
-    needs: [fmt, check, wasm]
+    needs: [fmt, check, wasm, macos, web]
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to succeed
