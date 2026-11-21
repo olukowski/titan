@@ -54,7 +54,7 @@ fn tick_until(
 }
 
 /// Asserts the frame is one `Renderer2D` pass: the sprite pipeline and indexed draws of whole
-/// quads, at most one per texture (solid quads, the sprite sheet, and the font).
+/// quads, exactly one per texture (solid quads, the sprite sheet, and the font).
 fn assert_one_draw_per_texture(frame: &RecordedFrame) {
     assert_eq!(frame.passes.len(), 1);
     let commands = &frame.passes[0].commands;
@@ -77,7 +77,7 @@ fn assert_one_draw_per_texture(frame: &RecordedFrame) {
             _ => {}
         }
     }
-    assert!((1..=3).contains(&textures.len()), "{commands:?}");
+    assert_eq!(textures.len(), 3, "{commands:?}");
 }
 
 // Level format.
