@@ -5,8 +5,8 @@
 //!
 //! - Numbers are little-endian (`DataView` getters called with `littleEndian = true`).
 //! - Enums are one `u8` tag each; [`WireEnum`] lists the tag of every variant.
-//! - Strings are a `u32` byte length followed by UTF-8 bytes. An absent label is the empty
-//!   string.
+//! - Strings are a `u32` byte length followed by UTF-8 bytes. An absent optional string (a
+//!   label, or a shader's GLSL) is the empty string.
 //! - Resources are named by `u32` ids from 1 up. Id [`SURFACE_ID`] names the canvas surface as a
 //!   color target.
 //!
@@ -147,8 +147,8 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-fn put_label(out: &mut Vec<u8>, label: Option<&str>) {
-    put_str(out, label.unwrap_or(""));
+fn put_optional_str(out: &mut Vec<u8>, s: Option<&str>) {
+    put_str(out, s.unwrap_or(""));
 }
 
 /// Appends a texture descriptor: `width: u32`, `height: u32`, `mip_level_count: u32`,
@@ -164,16 +164,18 @@ pub fn encode_texture_desc(desc: &TextureDesc<'_>, out: &mut Vec<u8>) {
     put_tag(out, desc.sampler.mag_filter);
     put_tag(out, desc.sampler.address_u);
     put_tag(out, desc.sampler.address_v);
-    put_label(out, desc.label);
+    put_optional_str(out, desc.label);
 }
 
-/// Appends a shader source: `wgsl: str`, `vertex_entry: str`, `fragment_entry: str`,
-/// `label: str`. WebGPU reads only WGSL, so the other languages stay behind.
+/// Appends a shader source: `wgsl: str`, `glsl: str`, `vertex_entry: str`,
+/// `fragment_entry: str`, `label: str`. The browser reads WGSL for WebGPU and GLSL for WebGL2,
+/// so MSL stays behind.
 pub fn encode_shader_source(source: &ShaderSource<'_>, out: &mut Vec<u8>) {
     put_str(out, source.wgsl);
+    put_optional_str(out, source.glsl);
     put_str(out, source.vertex_entry);
     put_str(out, source.fragment_entry);
-    put_label(out, source.label);
+    put_optional_str(out, source.label);
 }
 
 fn put_blend_component(out: &mut Vec<u8>, component: BlendComponent) {
@@ -234,7 +236,7 @@ pub fn encode_pipeline_desc(shader_id: u32, desc: &PipelineDesc<'_>, out: &mut V
             put_u32(out, attribute.shader_location);
         }
     }
-    put_label(out, desc.label);
+    put_optional_str(out, desc.label);
 }
 
 /// A pass's color attachment, with its target resolved to a wire id.
@@ -532,7 +534,7 @@ pub(crate) mod decode {
             core::str::from_utf8(s).expect("wire strings are UTF-8")
         }
 
-        fn label(&mut self) -> Option<&'a str> {
+        fn optional_str(&mut self) -> Option<&'a str> {
             Some(self.str()).filter(|s| !s.is_empty())
         }
 
@@ -563,7 +565,7 @@ pub(crate) mod decode {
                 address_v: self.tag(),
             };
             TextureDesc {
-                label: self.label(),
+                label: self.optional_str(),
                 width,
                 height,
                 mip_level_count,
@@ -576,11 +578,11 @@ pub(crate) mod decode {
         pub(crate) fn shader_source(&mut self) -> ShaderSource<'a> {
             ShaderSource {
                 wgsl: self.str(),
+                glsl: self.optional_str(),
                 vertex_entry: self.str(),
                 fragment_entry: self.str(),
-                label: self.label(),
+                label: self.optional_str(),
                 msl: "",
-                glsl: None,
             }
         }
 
@@ -633,7 +635,7 @@ pub(crate) mod decode {
                 front_face,
                 cull_mode,
                 vertex_layouts,
-                label: self.label(),
+                label: self.optional_str(),
             }
         }
 
@@ -900,27 +902,48 @@ mod tests {
     }
 
     #[test]
-    fn shader_source_round_trips_without_other_languages() {
-        let source = ShaderSource {
-            label: Some("sprite"),
-            msl: "kernel void unused() {}",
-            wgsl: "@vertex fn vs() {}",
-            glsl: Some("void main() {}"),
-            vertex_entry: "vs",
-            fragment_entry: "fs",
+    fn shader_source_round_trips_with_and_without_glsl_but_drops_msl() {
+        for glsl in [Some("void main() {}"), None] {
+            let source = ShaderSource {
+                label: Some("sprite"),
+                msl: "kernel void unused() {}",
+                wgsl: "@vertex fn vs() {}",
+                glsl,
+                vertex_entry: "vs",
+                fragment_entry: "fs",
+            };
+            let mut out = Vec::new();
+            encode_shader_source(&source, &mut out);
+            let mut reader = Reader::new(&out);
+            assert_eq!(reader.shader_source(), ShaderSource { msl: "", ..source });
+            assert!(reader.is_empty());
+        }
+    }
+
+    /// `web/titan.test.mjs` decodes these exact bytes, so both sides agree on the layout.
+    #[test]
+    fn shader_source_matches_the_bytes_titan_js_decodes() {
+        let encode = |glsl| {
+            let mut out = Vec::new();
+            let source = ShaderSource {
+                label: Some("l"),
+                msl: "m",
+                wgsl: "w",
+                glsl,
+                vertex_entry: "vs",
+                fragment_entry: "fs",
+            };
+            encode_shader_source(&source, &mut out);
+            out
         };
-        let mut out = Vec::new();
-        encode_shader_source(&source, &mut out);
-        let mut reader = Reader::new(&out);
         assert_eq!(
-            reader.shader_source(),
-            ShaderSource {
-                msl: "",
-                glsl: None,
-                ..source
-            }
+            encode(Some("g")),
+            b"\x01\0\0\0w\x01\0\0\0g\x02\0\0\0vs\x02\0\0\0fs\x01\0\0\0l"
         );
-        assert!(reader.is_empty());
+        assert_eq!(
+            encode(None),
+            b"\x01\0\0\0w\0\0\0\0\x02\0\0\0vs\x02\0\0\0fs\x01\0\0\0l"
+        );
     }
 
     #[test]

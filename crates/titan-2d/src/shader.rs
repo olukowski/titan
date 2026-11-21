@@ -135,12 +135,72 @@ fragment float4 fs_main(VertexOut in [[stage_in]], texture2d<float> sprite_tex [
 }
 ";
 
+/// The sprite shader in GLSL ES 3.00, for WebGL2, with the same inputs and outputs as
+/// [`SPRITE_SHADER_WGSL`].
+///
+/// # Source convention
+///
+/// One source holds both stages. It has no `#version` line: a backend compiles each stage from
+/// `#version 300 es`, then `#define TITAN_VERTEX` or `#define TITAN_FRAGMENT`, then this source,
+/// which wraps each stage in `#ifdef` of its macro. Each stage's entry point is `main`, so GLSL
+/// ignores [`ShaderSource::vertex_entry`] and [`ShaderSource::fragment_entry`].
+///
+/// GLSL ES 3.00 has no `layout(binding = N)`, so a name carries its binding instead: a uniform
+/// block named `<name>_binding<N>` is uniform buffer binding `N`, and a `sampler2D` uniform named
+/// `<name>_binding<N>` is texture binding `N`. The backend reads those suffixes after linking and
+/// calls `uniformBlockBinding` and `uniform1i` (texture unit `N`) to match. Vertex attributes keep
+/// `layout(location = N)`, as in the other languages.
+///
+/// # Clip space and textures
+///
+/// - Clip-space `+Y` is up in GLSL as in WGSL and MSL, so the view-projection matrix needs no flip
+///   when drawing to the canvas.
+/// - GL clips `z` to `[-w, w]` and maps it to depth `[0, 1]`, where WebGPU and Metal clip to
+///   `[0, w]`. [`Camera2D`](crate::Camera2D) puts sprites at clip `z = 0.5`, inside both ranges;
+///   the sprite pipeline does not depth-test, so the different depth value has no effect.
+/// - Texture `v` grows with the uploaded row index, so `v = 0` is the image's top row, as long as
+///   textures are uploaded without `UNPACK_FLIP_Y_WEBGL`.
+pub const SPRITE_SHADER_GLSL: &str = r"#ifdef TITAN_VERTEX
+layout(std140) uniform CameraUniform_binding0 {
+    mat4 view_proj;
+} camera;
+
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in vec4 color;
+
+out vec2 v_uv;
+out vec4 v_color;
+
+void main() {
+    gl_Position = camera.view_proj * vec4(position, 0.0, 1.0);
+    v_uv = uv;
+    v_color = color;
+}
+#endif
+
+#ifdef TITAN_FRAGMENT
+precision highp float;
+
+uniform highp sampler2D sprite_texture_binding0;
+
+in vec2 v_uv;
+in vec4 v_color;
+
+layout(location = 0) out vec4 frag_color;
+
+void main() {
+    frag_color = texture(sprite_texture_binding0, v_uv) * v_color;
+}
+#endif
+";
+
 /// The sprite shader, with entry points `vs_main` and `fs_main`.
 pub const SPRITE_SHADER: ShaderSource<'static> = ShaderSource {
     label: Some("titan-2d sprite"),
     msl: SPRITE_SHADER_MSL,
     wgsl: SPRITE_SHADER_WGSL,
-    glsl: None,
+    glsl: Some(SPRITE_SHADER_GLSL),
     vertex_entry: "vs_main",
     fragment_entry: "fs_main",
 };
@@ -148,6 +208,7 @@ pub const SPRITE_SHADER: ShaderSource<'static> = ShaderSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     #[test]
     fn write_bytes_emits_fields_in_attribute_order() {
@@ -164,5 +225,24 @@ mod tests {
         };
         let floats: Vec<f32> = chunks.iter().map(|&b| f32::from_le_bytes(b)).collect();
         assert_eq!(floats, [1.0, -2.0, 0.25, 0.75, 0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn glsl_declares_every_vertex_attribute_and_both_stages() {
+        assert_eq!(SPRITE_SHADER.glsl, Some(SPRITE_SHADER_GLSL));
+        // The backend prepends `#version`, which must be a shader's first line.
+        assert!(!SPRITE_SHADER_GLSL.contains("#version"));
+        for stage in ["#ifdef TITAN_VERTEX", "#ifdef TITAN_FRAGMENT"] {
+            assert!(SPRITE_SHADER_GLSL.contains(stage), "{stage}");
+        }
+        for attribute in Vertex2D::ATTRIBUTES {
+            let ty = match attribute.format {
+                VertexFormat::Float32x2 => "vec2",
+                VertexFormat::Float32x4 => "vec4",
+                other => panic!("no GLSL type for {other:?}"),
+            };
+            let declaration = format!("layout(location = {}) in {ty} ", attribute.shader_location);
+            assert!(SPRITE_SHADER_GLSL.contains(&declaration), "{declaration}");
+        }
     }
 }

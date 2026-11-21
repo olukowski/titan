@@ -44,4 +44,6 @@ mod shader;
 pub use camera::Camera2D;
 pub use draw_list::{DrawList2D, Sprite, UV_FULL};
 pub use renderer::{INITIAL_QUAD_CAPACITY, Renderer2D};
-pub use shader::{SPRITE_SHADER, SPRITE_SHADER_MSL, SPRITE_SHADER_WGSL, Vertex2D};
+pub use shader::{
+    SPRITE_SHADER, SPRITE_SHADER_GLSL, SPRITE_SHADER_MSL, SPRITE_SHADER_WGSL, Vertex2D,
+};

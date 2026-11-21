@@ -77,7 +77,7 @@ class Reader {
     this.pos += len;
     return s;
   }
-  label() { return this.str() || undefined; }
+  optionalStr() { return this.str() || undefined; }
   list(count, read) { return Array.from({ length: count }, () => read(this)); }
 }
 
@@ -89,14 +89,14 @@ export function decodeTextureDesc(bytes) {
     usage: r.u32(),
     sampler: { minFilter: r.tag(FILTER_MODES), magFilter: r.tag(FILTER_MODES),
       addressModeU: r.tag(ADDRESS_MODES), addressModeV: r.tag(ADDRESS_MODES) },
-    label: r.label(),
+    label: r.optionalStr(),
   };
 }
 
 /** Decodes an `encode_shader_source` payload. */
 export function decodeShaderSource(bytes) {
   const r = new Reader(bytes);
-  return { wgsl: r.str(), vertexEntry: r.str(), fragmentEntry: r.str(), label: r.label() };
+  return { wgsl: r.str(), glsl: r.optionalStr(), vertexEntry: r.str(), fragmentEntry: r.str(), label: r.optionalStr() };
 }
 
 /** Decodes an `encode_pipeline_desc` payload into WebGPU descriptor pieces. */
@@ -118,7 +118,7 @@ export function decodePipelineDesc(bytes) {
     attributes: r.list(r.u8(), () => ({ format: r.tag(VERTEX_FORMATS), offset: r.u32(),
       shaderLocation: r.u32() })),
   }));
-  return { shaderId, colorFormat, blend, depthStencil, primitive, buffers, label: r.label() };
+  return { shaderId, colorFormat, blend, depthStencil, primitive, buffers, label: r.optionalStr() };
 }
 
 const COMMANDS = [

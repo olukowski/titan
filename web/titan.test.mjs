@@ -86,11 +86,23 @@ test("decodeTextureDesc maps every format, filter, and address tag, and rejects 
 
 test("decodeShaderSource reads its strings, from any byteOffset", () => {
   const wgsl = "@vertex fn vs() -> @builtin(position) vec4f { return vec4f(); }";
-  const payload = bytes(str(wgsl), str("vs"), str("fs_main"), str("sprite ✨"));
-  const expected = { wgsl, vertexEntry: "vs", fragmentEntry: "fs_main", label: "sprite ✨" };
+  const glsl = "#ifdef TITAN_VERTEX\nvoid main() {}\n#endif";
+  const payload = bytes(str(wgsl), str(glsl), str("vs"), str("fs_main"), str("sprite ✨"));
+  const expected = { wgsl, glsl, vertexEntry: "vs", fragmentEntry: "fs_main", label: "sprite ✨" };
   assert.deepEqual(decodeShaderSource(payload), expected);
   assert.deepEqual(decodeShaderSource(atOffset(payload)), expected);
-  assert.equal(decodeShaderSource(bytes(str(wgsl), str("vs"), str("fs"), str(""))).label, undefined);
+  assert.deepEqual(decodeShaderSource(bytes(str(wgsl), str(""), str("vs"), str("fs"), str(""))),
+    { wgsl, glsl: undefined, vertexEntry: "vs", fragmentEntry: "fs", label: undefined });
+});
+
+test("decodeShaderSource reads the exact bytes abi.rs encodes, with and without GLSL", () => {
+  // The byte strings abi.rs `shader_source_matches_the_bytes_titan_js_decodes` asserts, verbatim.
+  const rust = (latin1) => Uint8Array.from(latin1, (c) => c.charCodeAt(0));
+  const common = { wgsl: "w", vertexEntry: "vs", fragmentEntry: "fs", label: "l" };
+  assert.deepEqual(decodeShaderSource(rust("\x01\0\0\0w\x01\0\0\0g\x02\0\0\0vs\x02\0\0\0fs\x01\0\0\0l")),
+    { ...common, glsl: "g" });
+  assert.deepEqual(decodeShaderSource(rust("\x01\0\0\0w\0\0\0\0\x02\0\0\0vs\x02\0\0\0fs\x01\0\0\0l")),
+    { ...common, glsl: undefined });
 });
 
 // `blend` is six tags (color then alpha src, dst, op), `depth` is [format, write, compare], and
