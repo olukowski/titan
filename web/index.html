@@ -5,6 +5,12 @@
   cargo build --profile wasm --target wasm32-unknown-unknown -p titan-wasm --example triangle
   cp target/wasm32-unknown-unknown/wasm/examples/triangle.wasm web/
   python3 -m http.server -d web    # then open http://localhost:8000
+
+  Breakout:
+
+  cargo build --profile wasm --target wasm32-unknown-unknown -p titan --example breakout_wasm
+  cp target/wasm32-unknown-unknown/wasm/examples/breakout_wasm.wasm web/
+  python3 -m http.server -d web    # then open http://localhost:8000/?wasm=./breakout_wasm.wasm
 -->
 <html lang="en">
 <head>
