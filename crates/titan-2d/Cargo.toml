@@ -1,0 +1,16 @@
+[package]
+name = "titan-2d"
+description = "Titan batched 2D quad and sprite renderer on top of titan-gpu."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-gpu = { path = "../titan-gpu" }
+
+[lints]
+workspace = true
