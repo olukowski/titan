@@ -60,6 +60,7 @@ name = "titan-macos"
 version = "0.0.0"
 dependencies = [
  "titan-app",
+ "titan-audio",
  "titan-core",
  "titan-gpu",
 ]
