@@ -82,6 +82,8 @@ jobs:
           shared-key: macos
       - run: cargo clippy -p titan-macos --all-targets --locked -- -D warnings
       - run: cargo test -p titan-macos --locked
+      - run: cargo clippy -p titan --test metal_golden --locked -- -D warnings
+      - run: cargo test -p titan --test metal_golden --locked
 
   web:
     runs-on: ubuntu-latest
