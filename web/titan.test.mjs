@@ -419,7 +419,7 @@ void main() {
 
 // A WebGL2 context that records every call. Enum constants read back as their own names, and
 // created objects as "<Kind><n>", counted per kind. Every program reports the sprite shader's
-// active uniforms.
+// active uniforms, and `activeAttributes` as its active attributes.
 function fakeGl() {
   const calls = [];
   const created = {};
@@ -427,6 +427,7 @@ function fakeGl() {
     calls,
     created,
     failCompile: false,
+    activeAttributes: ["position", "uv"],
     canvas: new EventTarget(),
     drawingBufferWidth: 800,
     drawingBufferHeight: 600,
@@ -438,7 +439,9 @@ function fakeGl() {
       MAX_TEXTURE_SIZE: 4096 })[name],
     getShaderParameter: () => !gl.failCompile,
     getShaderInfoLog: () => "ERROR: 0:3: 'vec9' : no matching overloaded function found",
-    getProgramParameter: (program, name) => ({ LINK_STATUS: true, ACTIVE_UNIFORM_BLOCKS: 1, ACTIVE_UNIFORMS: 2 })[name],
+    getProgramParameter: (program, name) => ({ LINK_STATUS: true, ACTIVE_UNIFORM_BLOCKS: 1, ACTIVE_UNIFORMS: 2,
+      ACTIVE_ATTRIBUTES: gl.activeAttributes.length })[name],
+    getActiveAttrib: (program, i) => ({ name: gl.activeAttributes[i] }),
     getActiveUniformBlockName: () => "CameraUniform_binding0",
     // The block's member is an active uniform too; only samplers get a texture unit.
     getActiveUniform: (program, i) => [{ name: "CameraUniform_binding0.view_proj", type: "FLOAT_MAT4" },
@@ -540,19 +543,22 @@ test("the WebGL2 backend fails loudly on what it cannot run", () => {
 const surfacePass = (...commands) => [{ color: { target: 0, loadOp: "load" }, depth: null, commands }];
 const SPRITE_TEXTURE = bytes(u32(2, 2, 1), 1, u32(0b1001), [1, 1, 0, 0], str(""));
 
-test("the WebGL2 backend rejects draw offsets that gl_VertexID or gl_InstanceID cannot see", () => {
+test("the WebGL2 backend rejects draw offsets that the program's gl_VertexID or gl_InstanceID cannot see", () => {
   const gl = fakeGl();
   const backend = createWebGL2Backend(gl, assert.fail);
-  const shader = (label, id) => decodeShaderSource(bytes(str("wgsl"),
-    str(SPRITE_GLSL.replace("vec4(position, 0.0, 1.0)", `vec4(position, float(${id}), 1.0)`)),
-    str("vs"), str("fs"), str(label)));
+  // Only the linked program's active attributes decide; the source mentions both IDs in a comment.
+  const source = `// gl_VertexID gl_InstanceID\n${SPRITE_GLSL}`;
+  const pipeline = (id, label, attributes) => {
+    backend.createShader(id + 10, decodeShaderSource(bytes(str("wgsl"), str(source), str("vs"), str("fs"), str(label))));
+    gl.activeAttributes = attributes;
+    backend.createPipeline(id, { ...decodePipeline({ color: 1 }), shaderId: id + 10 });
+  };
   backend.createBuffer(1, 512, UNIFORM_USAGE);
   backend.createBuffer(2, 64, INDEX_USAGE);
   backend.createTexture(3, decodeTextureDesc(SPRITE_TEXTURE));
-  backend.createShader(4, shader("vertex id", "gl_VertexID"));
-  backend.createShader(5, shader("instance id", "gl_InstanceID"));
-  backend.createPipeline(6, { ...decodePipeline({ color: 1 }), shaderId: 4 });
-  backend.createPipeline(7, { ...decodePipeline({ color: 1 }), shaderId: 5 });
+  pipeline(6, "vertex id", ["position", "gl_VertexID", "uv"]);
+  pipeline(7, "instance id", ["gl_InstanceID", "position", "uv"]);
+  pipeline(8, "neither", ["position", "uv"]);
   const submit = (pipeline, draw) => backend.submitFrame(surfacePass({ op: "setPipeline", pipeline },
     { op: "setUniformBuffer", binding: 0, buffer: 1, offset: 0 }, { op: "setTexture", binding: 0, texture: 3 },
     { op: "setIndexBuffer", buffer: 2, format: "uint32", offset: 0 }, draw));
@@ -566,6 +572,7 @@ test("the WebGL2 backend rejects draw offsets that gl_VertexID or gl_InstanceID 
   submit(6, draw(5, 1));
   submit(6, drawIndexed(0, 2));
   submit(7, drawIndexed(-1, 0));
+  submit(8, drawIndexed(1, 2));
 });
 
 test("WebGL2 viewports round fractional edges instead of truncating them", () => {
@@ -588,6 +595,7 @@ test("destroying the WebGL2 backend deletes its GL objects and stops reporting c
   gl.canvas.dispatchEvent(new Event("webglcontextlost"));
   assert.deepEqual(failures, ["The WebGL2 context was lost."]);
   backend.destroy();
+  assert.deepEqual(gl.calls.filter(([fn]) => fn === "useProgram").at(-1), ["useProgram", null]);
   // Every object is deleted rather than the context lost, so a later run can use the canvas.
   const createdObjects = Object.entries(gl.created)
     .flatMap(([kind, count]) => Array.from({ length: count }, (_, i) => `${kind}${i + 1}`));

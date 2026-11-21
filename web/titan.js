@@ -983,7 +983,7 @@ export function createWebGL2Backend(gl, fail) {
       const label = s.label ? `shader "${s.label}"` : `shader ${id}`;
       const stages = s.glsl && [compile(gl.VERTEX_SHADER, "vertex", glslStage("VERTEX", s.glsl), label),
         compile(gl.FRAGMENT_SHADER, "fragment", glslStage("FRAGMENT", s.glsl), label)];
-      shaders.set(id, { label, glsl: s.glsl, stages });
+      shaders.set(id, { label, stages });
     },
     destroyShader(id) {
       for (const shader of shaders.get(id)?.stages ?? []) gl.deleteShader(shader);
@@ -993,6 +993,10 @@ export function createWebGL2Backend(gl, fail) {
       const shader = lookup(shaders, d.shaderId, "shader");
       if (!shader.stages) throw new Error(`${shader.label} has no GLSL source, which WebGL2 needs`);
       const program = link(shader.stages, shader.label);
+      // The linked program lists the built-ins it reads as active attributes, so comments and
+      // dead code that mention gl_VertexID or gl_InstanceID do not count.
+      const attributes = Array.from({ length: gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES) },
+        (_, i) => gl.getActiveAttrib(program, i).name);
       const uniformBindings = [];
       for (let i = 0; i < gl.getProgramParameter(program, gl.ACTIVE_UNIFORM_BLOCKS); i++) {
         const binding = glslBinding(gl.getActiveUniformBlockName(program, i));
@@ -1013,8 +1017,8 @@ export function createWebGL2Backend(gl, fail) {
       const { blend, depthStencil, primitive } = d;
       pipelines.set(id, {
         program, uniformBindings, textureBindings, label: shader.label,
-        usesVertexId: /\bgl_VertexID\b/.test(shader.glsl),
-        usesInstanceId: /\bgl_InstanceID\b/.test(shader.glsl),
+        usesVertexId: attributes.includes("gl_VertexID"),
+        usesInstanceId: attributes.includes("gl_InstanceID"),
         blend: blend && {
           factors: [blend.color.srcFactor, blend.color.dstFactor, blend.alpha.srcFactor, blend.alpha.dstFactor].map(factor),
           operations: [blend.color.operation, blend.alpha.operation].map(operation),
@@ -1052,6 +1056,7 @@ export function createWebGL2Backend(gl, fail) {
     },
     // Deletes every GL object instead of losing the context, so a later run can reuse the canvas.
     destroy() {
+      gl.useProgram(null); // A bound program outlives deleteProgram.
       gl.canvas.removeEventListener("webglcontextlost", onContextLost);
       for (const { buffer } of buffers.values()) gl.deleteBuffer(buffer);
       for (const { texture, sampler } of textures.values()) {
