@@ -1,6 +1,6 @@
 [package]
 name = "titan-wasm"
-description = "Titan's browser backend: a WebGPU device and app runner over a direct WASM/JS bridge."
+description = "Titan's browser backend: a WebGPU device, Web Audio output, and app runner over a direct WASM/JS bridge."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,13 @@ readme.workspace = true
 titan-app = { path = "../titan-app" }
 titan-core = { path = "../titan-core" }
 titan-gpu = { path = "../titan-gpu" }
+
+# Only `AudioOutput` uses it, which exists on wasm32 alone; tests run its core on the host.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+titan-audio = { path = "../titan-audio" }
+
+[dev-dependencies]
+titan-audio = { path = "../titan-audio" }
 
 [[example]]
 name = "triangle"

@@ -1,11 +1,12 @@
 // Checks titan.js's decoders against the wire layouts and tags in crates/titan-wasm/src/abi.rs,
-// and its WebGL2 backend against a fake GL context.
+// its WebGL2 backend against a fake GL context, and its audio streaming against fake Web Audio.
 // Run with `node --test web/titan.test.mjs`.
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { KEY_MAP, mapMouseButton, decodeTextureDesc, decodeShaderSource, decodePipelineDesc,
   decodeFrame, shaderBindings, GL_NAMES, glTextureFormat, glSamplerParams, glslStage, glslBinding, glRect,
-  createWebGL2Backend } from "./titan.js";
+  createWebGL2Backend, AUDIO_LEAD_SECS, planAudioChunk, renderAudioQuantum, createAudioHost } from "./titan.js";
 
 // The WebGPU name of each Rust wire enum variant, indexed by its tag in abi.rs.
 const TEXTURE_FORMATS = ["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb",
@@ -604,4 +605,239 @@ test("destroying the WebGL2 backend deletes its GL objects and stops reporting c
   assert.ok(createdObjects.includes("Framebuffer1") && createdObjects.includes("Texture2"));
   gl.canvas.dispatchEvent(new Event("webglcontextlost"));
   assert.equal(failures.length, 1);
+});
+
+test("planAudioChunk tops up to the lead, never re-mixes, and skips audio a stalled tab missed", () => {
+  assert.deepEqual(planAudioChunk(0, 0, 2880), { start: 0, frames: 2880 });
+  assert.deepEqual(planAudioChunk(2880, 800, 2880), { start: 2880, frames: 800 });
+  assert.deepEqual(planAudioChunk(3680, 800, 2880), { start: 3680, frames: 0 });
+  // Ahead of the target, as after `lead` shrinks or the context restarts: nothing, not negative.
+  assert.deepEqual(planAudioChunk(5000, 800, 2880), { start: 5000, frames: 0 });
+  // Fell behind by more than the lead: starts at the current frame, capped at `lead`.
+  assert.deepEqual(planAudioChunk(3680, 480_000, 2880), { start: 480_000, frames: 2880 });
+});
+
+// A chunk whose left sample at context frame f is f and right sample is -f.
+const audioChunk = (start, frames) => ({
+  start,
+  samples: Float32Array.from({ length: 2 * frames }, (_, i) => (i % 2 ? -1 : 1) * (start + (i >> 1))),
+});
+// The quantum renderAudioQuantum should produce at `frame`, with `covered(f)` frames audible.
+const expectedQuantum = (frame, covered) => {
+  const left = Array.from({ length: 128 }, (_, i) => (covered(frame + i) ? frame + i : 0));
+  return [left, left.map((v) => (v ? -v : 0))];
+};
+const renderQuantum = (queue, frame) => {
+  const [left, right] = [new Float32Array(128).fill(NaN), new Float32Array(128).fill(NaN)];
+  renderAudioQuantum(queue, frame, left, right);
+  return [Array.from(left), Array.from(right)];
+};
+
+test("renderAudioQuantum plays chunks at their frames, silences gaps, and drops what it consumed", () => {
+  const [straddlesStart, straddlesEnd, later] = [audioChunk(100, 60), audioChunk(200, 100), audioChunk(400, 10)];
+  const queue = [straddlesStart, straddlesEnd, later];
+  // Frames 128..159 from the first chunk, 160..199 an underrun, 200..255 from the second.
+  assert.deepEqual(renderQuantum(queue, 128), expectedQuantum(128, (f) => f < 160 || f >= 200));
+  assert.deepEqual(queue, [straddlesEnd, later]);
+  assert.deepEqual(renderQuantum(queue, 256), expectedQuantum(256, (f) => f < 300));
+  assert.deepEqual(queue, [later]);
+});
+
+test("renderAudioQuantum drops a chunk that arrives after its frames played", () => {
+  const queue = [audioChunk(0, 100), audioChunk(256, 128)];
+  assert.deepEqual(renderQuantum(queue, 128), expectedQuantum(128, () => false));
+  assert.equal(queue.length, 1);
+  assert.deepEqual(renderQuantum(queue, 256), expectedQuantum(256, () => true));
+  assert.deepEqual(queue, []);
+});
+
+// Fake Web Audio that records what createAudioHost does with it.
+function fakeWebAudio({ contextRate, addModule = () => Promise.resolve() } = {}) {
+  const fake = { contexts: [], nodes: [], blobs: [], revoked: [], errors: [], unlockTarget: new EventTarget() };
+  fake.deps = {
+    AudioContext: class {
+      constructor(options) {
+        Object.assign(this, { options, sampleRate: contextRate ?? options.sampleRate, state: "suspended",
+          currentTime: 0, resumes: 0, closes: 0, destination: {}, audioWorklet: { addModule } });
+        fake.contexts.push(this);
+      }
+      resume() {
+        this.resumes++;
+        this.state = "running";
+        return Promise.resolve();
+      }
+      close() {
+        this.closes++;
+        this.state = "closed";
+        return Promise.resolve();
+      }
+    },
+    AudioWorkletNode: class {
+      constructor(ctx, name, options) {
+        Object.assign(this, { ctx, name, options, posted: [], disconnected: false });
+        this.port = { postMessage: (message, transfer) => this.posted.push({ message, transfer }) };
+        fake.nodes.push(this);
+      }
+      connect(destination) { this.destination = destination; }
+      disconnect() { this.disconnected = true; }
+    },
+    URL: {
+      createObjectURL: (blob) => `blob:${fake.blobs.push(blob)}`,
+      revokeObjectURL: (url) => fake.revoked.push(url),
+    },
+    Blob: class { constructor(parts, { type }) { Object.assign(this, { text: parts.join(""), type }); } },
+    unlockTarget: fake.unlockTarget,
+    onError: (error) => fake.errors.push(error),
+  };
+  return fake;
+}
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+// A mix callback that records the frame counts it was asked for and returns a view into a larger
+// buffer, like a view into WASM memory.
+const recordingMix = () => {
+  const calls = [];
+  const mix = (frames) => {
+    calls.push(frames);
+    return new Float32Array(new ArrayBuffer(8 * (2 * frames + 4)), 16, 2 * frames).fill(calls.length);
+  };
+  return { calls, mix };
+};
+
+test("the audio host creates nothing until started and mixes nothing until its worklet loads", async () => {
+  const fake = fakeWebAudio();
+  const host = createAudioHost(fake.deps);
+  const { calls, mix } = recordingMix();
+  host.pump(mix);
+  host.stop();
+  assert.equal(fake.contexts.length, 0);
+
+  host.start(48_000);
+  const [ctx] = fake.contexts;
+  assert.deepEqual(ctx.options, { sampleRate: 48_000, latencyHint: "interactive" });
+  host.pump(mix);
+  assert.deepEqual(calls, []);
+
+  await settle();
+  const [node] = fake.nodes;
+  assert.deepEqual(node.options, { numberOfInputs: 0, outputChannelCount: [2] });
+  assert.equal(node.destination, ctx.destination);
+  assert.deepEqual(fake.revoked, ["blob:1"]);
+});
+
+test("the audio host posts each chunk at its timeline frame, as a transferred copy", async () => {
+  const fake = fakeWebAudio();
+  const host = createAudioHost(fake.deps);
+  const { calls, mix } = recordingMix();
+  host.start(48_000);
+  await settle();
+  const [[ctx], [node]] = [fake.contexts, fake.nodes];
+  const lead = Math.ceil(AUDIO_LEAD_SECS * 48_000);
+
+  host.pump(mix);
+  host.pump(mix); // Nothing played since, so nothing to top up.
+  ctx.currentTime = 0.02; // 960 frames played.
+  host.pump(mix);
+  ctx.currentTime = 10; // The tab was hidden.
+  host.pump(mix);
+  host.pump(() => undefined); // A failed mix posts nothing and advances nothing.
+  ctx.currentTime = 10.001; // 48 more frames.
+  host.pump(mix);
+
+  assert.deepEqual(calls, [lead, 960, lead, 48]);
+  assert.deepEqual(node.posted.map(({ message }) => message.start), [0, lead, 480_000, 480_000 + lead]);
+  for (const [i, { message, transfer }] of node.posted.entries()) {
+    assert.equal(message.samples.length, 2 * calls[i]);
+    assert.equal(message.samples.byteOffset, 0);
+    assert.equal(message.samples.buffer.byteLength, 8 * calls[i]); // Not the whole "memory".
+    assert.ok(message.samples.every((s) => s === i + 1));
+    assert.deepEqual(transfer, [message.samples.buffer]);
+  }
+});
+
+test("the audio worklet module plays posted chunks at the context's current frame", async () => {
+  const fake = fakeWebAudio();
+  createAudioHost(fake.deps).start(48_000);
+  await settle();
+  const [blob] = fake.blobs;
+  assert.equal(blob.type, "text/javascript");
+
+  const processors = new Map();
+  const scope = {
+    currentFrame: 0,
+    AudioWorkletProcessor: class { constructor() { this.port = {}; } },
+    registerProcessor: (name, processor) => processors.set(name, processor),
+  };
+  vm.runInNewContext(blob.text, scope);
+  const processor = new (processors.get(fake.nodes[0].name))();
+  processor.port.onmessage({ data: audioChunk(100, 60) });
+  scope.currentFrame = 128;
+  const outputs = [[new Float32Array(128), new Float32Array(128)]];
+  assert.equal(processor.process([], outputs), true);
+  assert.deepEqual(outputs[0].map((channel) => Array.from(channel)), expectedQuantum(128, (f) => f < 160));
+});
+
+test("the first gesture resumes a suspended context, and later ones do not", async () => {
+  const fake = fakeWebAudio();
+  const host = createAudioHost(fake.deps);
+  host.start(48_000);
+  const [ctx] = fake.contexts;
+  fake.unlockTarget.dispatchEvent(new Event("keydown"));
+  assert.equal(ctx.resumes, 1);
+  await settle();
+  for (const type of ["pointerdown", "pointerup", "keydown"]) fake.unlockTarget.dispatchEvent(new Event(type));
+  assert.equal(ctx.resumes, 1);
+
+  // Stopping before any gesture removes the listeners too.
+  host.stop();
+  host.start(48_000);
+  host.stop();
+  fake.unlockTarget.dispatchEvent(new Event("pointerdown"));
+  assert.equal(fake.contexts[1].resumes, 0);
+});
+
+test("the audio host plays one context at a time, and stop closes it once", async () => {
+  const fake = fakeWebAudio();
+  const host = createAudioHost(fake.deps);
+  const { calls, mix } = recordingMix();
+  host.start(48_000);
+  assert.throws(() => host.start(44_100), /already playing/);
+  assert.equal(fake.contexts.length, 1);
+  await settle();
+
+  host.stop();
+  host.stop();
+  const [[ctx], [node]] = [fake.contexts, fake.nodes];
+  assert.equal(ctx.closes, 1);
+  assert.equal(node.disconnected, true);
+  host.pump(mix);
+  assert.deepEqual(calls, []);
+
+  host.start(44_100);
+  assert.equal(fake.contexts.length, 2);
+  host.stop();
+});
+
+test("the audio host fails loudly when the worklet or the sample rate is unavailable", async () => {
+  const rejected = fakeWebAudio({ addModule: () => Promise.reject(new Error("no worklet")) });
+  createAudioHost(rejected.deps).start(48_000);
+  await settle();
+  assert.deepEqual(rejected.errors.map((e) => e.message), ["no worklet"]);
+  assert.deepEqual(rejected.revoked, ["blob:1"]);
+
+  // A failure after stop belongs to a context nobody uses any more.
+  const stopped = fakeWebAudio({ addModule: () => Promise.reject(new Error("no worklet")) });
+  const host = createAudioHost(stopped.deps);
+  host.start(48_000);
+  host.stop();
+  await settle();
+  assert.deepEqual(stopped.errors, []);
+
+  const resampled = fakeWebAudio({ contextRate: 44_100 });
+  const resampledHost = createAudioHost(resampled.deps);
+  assert.throws(() => resampledHost.start(48_000), /44100 Hz, not the mixer's 48000 Hz/);
+  assert.equal(resampled.contexts[0].closes, 1);
+  assert.throws(() => resampledHost.start(48_000), /44100 Hz/); // Not "already playing".
+
+  const missing = fakeWebAudio();
+  assert.throws(() => createAudioHost({ ...missing.deps, AudioContext: undefined }).start(48_000), /no Web Audio/);
 });

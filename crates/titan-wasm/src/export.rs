@@ -17,9 +17,11 @@
 /// | `titan_pointer_move(x: f32, y: f32)` | |
 /// | `titan_pointer_button(button: u32, down: u32)` | |
 /// | `titan_scroll(dx: f32, dy: f32)` | |
+/// | `titan_audio_mix(frames: u32)` | pointer to `2 * frames` interleaved stereo `f32`s, valid until the next call; null on error |
 ///
-/// An export that returns -1 first logs the error through the host's `log` import, so the page
-/// can show it. On other targets the macro only type-checks `ctor` and `config`.
+/// An export that returns -1 or null first logs the error through the host's `log` import, so
+/// the page can show it. `titan_audio_mix` fails when no `AudioOutput` is playing or `frames`
+/// is over 65536. On other targets the macro only type-checks `ctor` and `config`.
 ///
 /// ```ignore
 /// titan_wasm::export_app!(MyGame::new());
@@ -79,6 +81,12 @@ macro_rules! export_app {
             extern "C" fn titan_scroll(dx: f32, dy: f32) {
                 $crate::__private::scroll(dx, dy);
             }
+
+            #[cfg(target_arch = "wasm32")]
+            #[unsafe(no_mangle)]
+            extern "C" fn titan_audio_mix(frames: u32) -> *const f32 {
+                $crate::__private::audio_mix(frames)
+            }
         };
     };
 }
@@ -87,10 +95,12 @@ macro_rules! export_app {
 #[cfg(target_arch = "wasm32")]
 pub mod glue {
     use crate::abi::LOG_ERROR;
+    use crate::audio::{MAX_MIX_FRAMES, MIX};
     use crate::bridge::{HostBridge, WasmBridge};
     use crate::runner::{WebConfig, WebRunner, surface_size};
     use alloc::boxed::Box;
     use core::cell::RefCell;
+    use core::ptr::null;
     use titan_app::{App, AppAction, InputState, SurfaceSize};
     use titan_gpu::{FrameCommands, GpuDevice, GpuError};
 
@@ -215,5 +225,27 @@ pub mod glue {
     /// `titan_scroll`.
     pub fn scroll(dx: f32, dy: f32) {
         with_runner(|r| r.on_scroll(dx, dy));
+    }
+
+    /// `titan_audio_mix`.
+    pub fn audio_mix(frames: u32) -> *const f32 {
+        let mut mix = MIX.0.borrow_mut();
+        let Some(mix) = mix.as_mut() else {
+            WasmBridge.log(
+                LOG_ERROR,
+                "titan_audio_mix called with no AudioOutput playing",
+            );
+            return null();
+        };
+        match mix(frames) {
+            Some(mixed) => mixed,
+            None => {
+                let message = alloc::format!(
+                    "titan_audio_mix: {frames} frames is over the limit of {MAX_MIX_FRAMES}"
+                );
+                WasmBridge.log(LOG_ERROR, &message);
+                null()
+            }
+        }
     }
 }
