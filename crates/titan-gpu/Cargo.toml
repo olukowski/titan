@@ -1,0 +1,15 @@
+[package]
+name = "titan-gpu"
+description = "Titan GPU abstraction: resource handles, descriptors, frame command lists, and a recording device."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+
+[lints]
+workspace = true
