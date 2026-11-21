@@ -430,7 +430,12 @@ async function createWebGPUBackend(canvas, adapter, fail) {
   const surfaceFormat = canvasFormat.endsWith("-srgb") ? canvasFormat : `${canvasFormat}-srgb`;
   device.lost.then((info) => fail(new Error(`The GPU device was lost (${info.reason}): ${info.message}`)));
   device.addEventListener("uncapturederror", (e) => fail(new Error(`WebGPU error: ${e.error.message}`)));
-  context.configure({ device, format: canvasFormat, viewFormats: [surfaceFormat], alphaMode: "opaque" });
+  try {
+    context.configure({ device, format: canvasFormat, viewFormats: [surfaceFormat], alphaMode: "opaque" });
+  } catch (error) {
+    device.destroy(); // runTitan never receives this backend, so its shutdown cannot.
+    throw error;
+  }
 
   const buffers = new Map();
   const textures = new Map();
@@ -614,7 +619,8 @@ export const GL_NAMES = {
     min: "MIN", max: "MAX" },
   compare: { never: "NEVER", less: "LESS", "less-equal": "LEQUAL", equal: "EQUAL", "greater-equal": "GEQUAL",
     greater: "GREATER", "not-equal": "NOTEQUAL", always: "ALWAYS" },
-  // WebGL2 always restarts strips at the maximum index value, as WebGPU strips do.
+  // WebGL2 restarts every draw at the maximum index value, lists included: a uint16 list cannot
+  // use index 65535, so meshes with 65536+ vertices need uint32 indices.
   topology: { "triangle-list": "TRIANGLES", "triangle-strip": "TRIANGLE_STRIP", "line-list": "LINES",
     "line-strip": "LINE_STRIP", "point-list": "POINTS" },
   cullFace: { none: null, front: "FRONT", back: "BACK" },
@@ -670,8 +676,14 @@ export function glslBinding(name) {
   return Number(match[1]);
 }
 
-/** The bottom-left-origin GL y of a top-left-origin WebGPU rect. */
-export const flipY = (y, height, targetHeight) => targetHeight - y - height;
+/**
+ * The `[x, y, width, height]` GL rect of a top-left-origin WebGPU rect, with GL's bottom-left
+ * origin. GL truncates fractional rects, so each edge is rounded to the nearest pixel instead.
+ */
+export function glRect(x, y, width, height, targetHeight) {
+  const [x0, x1, y0, y1] = [x, x + width, y, y + height].map(Math.round);
+  return [x0, targetHeight - y1, x1 - x0, y1 - y0];
+}
 
 const [VERTEX_USAGE, INDEX_USAGE, UNIFORM_USAGE, STORAGE_USAGE] = [1, 2, 4, 8];
 const NO_STORAGE = "storage buffers are not supported on WebGL2";
@@ -698,7 +710,8 @@ void main() {
  * it to the canvas.
  */
 export function createWebGL2Backend(gl, fail) {
-  gl.canvas.addEventListener("webglcontextlost", () => fail(new Error("The WebGL2 context was lost.")));
+  const onContextLost = () => fail(new Error("The WebGL2 context was lost."));
+  gl.canvas.addEventListener("webglcontextlost", onContextLost);
   const uniformAlignment = gl.getParameter(gl.UNIFORM_BUFFER_OFFSET_ALIGNMENT);
   const maxUniformSize = gl.getParameter(gl.MAX_UNIFORM_BLOCK_SIZE);
   const buffers = new Map();
@@ -732,8 +745,9 @@ export function createWebGL2Backend(gl, fail) {
     }
     return program;
   };
-  const presentProgram = link([compile(gl.VERTEX_SHADER, "vertex", PRESENT_VERTEX, "present"),
-    compile(gl.FRAGMENT_SHADER, "fragment", PRESENT_FRAGMENT, "present")], "present");
+  const presentStages = [compile(gl.VERTEX_SHADER, "vertex", PRESENT_VERTEX, "present"),
+    compile(gl.FRAGMENT_SHADER, "fragment", PRESENT_FRAGMENT, "present")];
+  const presentProgram = link(presentStages, "present");
   const vao = gl.createVertexArray();
   const presentVao = gl.createVertexArray();
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -814,8 +828,15 @@ export function createWebGL2Backend(gl, fail) {
     const uniforms = new Map();
     const boundTextures = new Map();
     // WebGL2 has no base vertex or first instance, so they move the attribute offsets instead.
+    // gl_VertexID and gl_InstanceID cannot see that move.
     const bindResources = (baseVertex, firstInstance) => {
       if (!pipeline) throw new Error("draw without a pipeline");
+      if (baseVertex && pipeline.usesVertexId) {
+        throw new Error(`${pipeline.label}: WebGL2 cannot apply baseVertex ${baseVertex} to gl_VertexID`);
+      }
+      if (firstInstance && pipeline.usesInstanceId) {
+        throw new Error(`${pipeline.label}: WebGL2 cannot apply firstInstance ${firstInstance} to gl_InstanceID`);
+      }
       for (const binding of pipeline.uniformBindings) {
         const c = uniforms.get(binding);
         if (!c) throw new Error(`a draw needs a uniform buffer at binding ${binding}`);
@@ -886,12 +907,12 @@ export function createWebGL2Backend(gl, fail) {
         case "setStorageBuffer": throw new Error(NO_STORAGE);
         case "setTexture": boundTextures.set(c.binding, lookup(textures, c.texture, "texture")); break;
         case "setViewport":
-          gl.viewport(c.x, flipY(c.y, c.height, height), c.width, c.height);
+          gl.viewport(...glRect(c.x, c.y, c.width, c.height, height));
           gl.depthRange(c.minDepth, c.maxDepth);
           break;
         case "setScissor":
           gl.enable(gl.SCISSOR_TEST);
-          gl.scissor(c.x, flipY(c.y, c.height, height), c.width, c.height);
+          gl.scissor(...glRect(c.x, c.y, c.width, c.height, height));
           break;
         case "draw":
           bindResources(0, c.firstInstance);
@@ -962,7 +983,7 @@ export function createWebGL2Backend(gl, fail) {
       const label = s.label ? `shader "${s.label}"` : `shader ${id}`;
       const stages = s.glsl && [compile(gl.VERTEX_SHADER, "vertex", glslStage("VERTEX", s.glsl), label),
         compile(gl.FRAGMENT_SHADER, "fragment", glslStage("FRAGMENT", s.glsl), label)];
-      shaders.set(id, { label, stages });
+      shaders.set(id, { label, glsl: s.glsl, stages });
     },
     destroyShader(id) {
       for (const shader of shaders.get(id)?.stages ?? []) gl.deleteShader(shader);
@@ -991,7 +1012,9 @@ export function createWebGL2Backend(gl, fail) {
       const operation = (name) => gl[GL_NAMES.blendOperation[name]];
       const { blend, depthStencil, primitive } = d;
       pipelines.set(id, {
-        program, uniformBindings, textureBindings,
+        program, uniformBindings, textureBindings, label: shader.label,
+        usesVertexId: /\bgl_VertexID\b/.test(shader.glsl),
+        usesInstanceId: /\bgl_InstanceID\b/.test(shader.glsl),
         blend: blend && {
           factors: [blend.color.srcFactor, blend.color.dstFactor, blend.alpha.srcFactor, blend.alpha.dstFactor].map(factor),
           operations: [blend.color.operation, blend.alpha.operation].map(operation),
@@ -1027,7 +1050,23 @@ export function createWebGL2Backend(gl, fail) {
       const error = gl.getError();
       if (error !== gl.NO_ERROR) throw new Error(`WebGL2 error 0x${error.toString(16)} while drawing a frame`);
     },
-    destroy() { gl.getExtension("WEBGL_lose_context")?.loseContext(); },
+    // Deletes every GL object instead of losing the context, so a later run can reuse the canvas.
+    destroy() {
+      gl.canvas.removeEventListener("webglcontextlost", onContextLost);
+      for (const { buffer } of buffers.values()) gl.deleteBuffer(buffer);
+      for (const { texture, sampler } of textures.values()) {
+        gl.deleteTexture(texture);
+        gl.deleteSampler(sampler);
+      }
+      for (const { stages } of shaders.values()) for (const shader of stages ?? []) gl.deleteShader(shader);
+      for (const { program } of pipelines.values()) gl.deleteProgram(program);
+      for (const { framebuffer } of framebuffers.values()) gl.deleteFramebuffer(framebuffer);
+      if (surface) gl.deleteTexture(surface.texture);
+      for (const shader of presentStages) gl.deleteShader(shader);
+      gl.deleteProgram(presentProgram);
+      gl.deleteVertexArray(vao);
+      gl.deleteVertexArray(presentVao);
+    },
   };
 }
 

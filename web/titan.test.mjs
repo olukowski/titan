@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { KEY_MAP, mapMouseButton, decodeTextureDesc, decodeShaderSource, decodePipelineDesc,
-  decodeFrame, shaderBindings, GL_NAMES, glTextureFormat, glSamplerParams, glslStage, glslBinding, flipY,
+  decodeFrame, shaderBindings, GL_NAMES, glTextureFormat, glSamplerParams, glslStage, glslBinding, glRect,
   createWebGL2Backend } from "./titan.js";
 
 // The WebGPU name of each Rust wire enum variant, indexed by its tag in abi.rs.
@@ -347,10 +347,14 @@ test("glslBinding reads the _binding<N> suffix and rejects names without a valid
   }
 });
 
-test("flipY converts a top-left-origin rect to GL's bottom-left origin", () => {
-  assert.equal(flipY(0, 600, 600), 0); // Full target.
-  assert.equal(flipY(0, 10, 600), 590); // Top strip.
-  assert.equal(flipY(20, 50, 600), 530);
+test("glRect converts a top-left-origin rect to GL's bottom-left origin, rounding each edge", () => {
+  assert.deepEqual(glRect(0, 0, 800, 600, 600), [0, 0, 800, 600]); // Full target.
+  assert.deepEqual(glRect(0, 0, 800, 10, 600), [0, 590, 800, 10]); // Top strip.
+  assert.deepEqual(glRect(10, 20, 100, 50, 600), [10, 530, 100, 50]);
+  // GL would truncate this to an empty rect, though it covers the pixel centered at (4.5, 3.5).
+  assert.deepEqual(glRect(4, 3, 0.9, 0.9, 8), [4, 4, 1, 1]);
+  // Edges round independently, so equal sizes can cover different pixel counts.
+  assert.deepEqual(glRect(0.4, 0.6, 1.5, 1.5, 8), [0, 6, 2, 1]);
 });
 
 test("WebGL2 tables: texture formats, mip-aware min filter, and integer vs normalized attributes", () => {
@@ -421,8 +425,9 @@ function fakeGl() {
   const created = {};
   const gl = {
     calls,
+    created,
     failCompile: false,
-    canvas: { addEventListener() {} },
+    canvas: new EventTarget(),
     drawingBufferWidth: 800,
     drawingBufferHeight: 600,
     TEXTURE0: 0x84c0,
@@ -529,4 +534,66 @@ test("the WebGL2 backend fails loudly on what it cannot run", () => {
   assert.throws(() => backend.submitFrame(frame()), /a draw needs a uniform buffer at binding 0/);
   assert.throws(() => backend.submitFrame(frame([3, u32(0, 5, 128)])), /offset 128 must be a multiple of 256/);
   assert.throws(() => backend.submitFrame(frame([3, u32(0, 5, 0)])), /a draw needs a texture at binding 0/);
+});
+
+// A decoded frame of one surface pass, which loads the surface and runs `commands`.
+const surfacePass = (...commands) => [{ color: { target: 0, loadOp: "load" }, depth: null, commands }];
+const SPRITE_TEXTURE = bytes(u32(2, 2, 1), 1, u32(0b1001), [1, 1, 0, 0], str(""));
+
+test("the WebGL2 backend rejects draw offsets that gl_VertexID or gl_InstanceID cannot see", () => {
+  const gl = fakeGl();
+  const backend = createWebGL2Backend(gl, assert.fail);
+  const shader = (label, id) => decodeShaderSource(bytes(str("wgsl"),
+    str(SPRITE_GLSL.replace("vec4(position, 0.0, 1.0)", `vec4(position, float(${id}), 1.0)`)),
+    str("vs"), str("fs"), str(label)));
+  backend.createBuffer(1, 512, UNIFORM_USAGE);
+  backend.createBuffer(2, 64, INDEX_USAGE);
+  backend.createTexture(3, decodeTextureDesc(SPRITE_TEXTURE));
+  backend.createShader(4, shader("vertex id", "gl_VertexID"));
+  backend.createShader(5, shader("instance id", "gl_InstanceID"));
+  backend.createPipeline(6, { ...decodePipeline({ color: 1 }), shaderId: 4 });
+  backend.createPipeline(7, { ...decodePipeline({ color: 1 }), shaderId: 5 });
+  const submit = (pipeline, draw) => backend.submitFrame(surfacePass({ op: "setPipeline", pipeline },
+    { op: "setUniformBuffer", binding: 0, buffer: 1, offset: 0 }, { op: "setTexture", binding: 0, texture: 3 },
+    { op: "setIndexBuffer", buffer: 2, format: "uint32", offset: 0 }, draw));
+  const draw = (firstVertex, firstInstance) => ({ op: "draw", vertexCount: 3, instanceCount: 1, firstVertex, firstInstance });
+  const drawIndexed = (baseVertex, firstInstance) =>
+    ({ op: "drawIndexed", indexCount: 3, instanceCount: 1, firstIndex: 0, baseVertex, firstInstance });
+  assert.throws(() => submit(6, drawIndexed(1, 0)), /shader "vertex id": WebGL2 cannot apply baseVertex 1 to gl_VertexID/);
+  assert.throws(() => submit(7, draw(0, 1)), /shader "instance id": WebGL2 cannot apply firstInstance 1 to gl_InstanceID/);
+  assert.throws(() => submit(7, drawIndexed(0, 2)), /firstInstance 2 to gl_InstanceID/);
+  // drawArrays passes firstVertex natively, and each offset is fine for a shader not reading its ID.
+  submit(6, draw(5, 1));
+  submit(6, drawIndexed(0, 2));
+  submit(7, drawIndexed(-1, 0));
+});
+
+test("WebGL2 viewports round fractional edges instead of truncating them", () => {
+  const gl = fakeGl();
+  const backend = createWebGL2Backend(gl, assert.fail);
+  backend.submitFrame(surfacePass({ op: "setViewport", x: 4, y: 3, width: 0.9, height: 0.9, minDepth: 0, maxDepth: 1 }));
+  const viewports = gl.calls.filter(([fn]) => fn === "viewport").map(([, ...args]) => args);
+  assert.deepEqual(viewports, [[0, 0, 800, 600], [4, 596, 1, 1], [0, 0, 800, 600]]);
+});
+
+test("destroying the WebGL2 backend deletes its GL objects and stops reporting context loss", () => {
+  const gl = fakeGl();
+  const failures = [];
+  const backend = createWebGL2Backend(gl, (error) => failures.push(error.message));
+  backend.createBuffer(1, 512, UNIFORM_USAGE);
+  backend.createTexture(2, decodeTextureDesc(SPRITE_TEXTURE));
+  backend.createShader(3, decodeShaderSource(bytes(str("wgsl"), str(SPRITE_GLSL), str("vs"), str("fs"), str(""))));
+  backend.createPipeline(4, { ...decodePipeline({ color: 1 }), shaderId: 3 });
+  backend.submitFrame(surfacePass()); // Creates the surface texture and its framebuffer.
+  gl.canvas.dispatchEvent(new Event("webglcontextlost"));
+  assert.deepEqual(failures, ["The WebGL2 context was lost."]);
+  backend.destroy();
+  // Every object is deleted rather than the context lost, so a later run can use the canvas.
+  const createdObjects = Object.entries(gl.created)
+    .flatMap(([kind, count]) => Array.from({ length: count }, (_, i) => `${kind}${i + 1}`));
+  const deleted = gl.calls.filter(([fn]) => fn.startsWith("delete")).map(([, object]) => object);
+  assert.deepEqual(deleted.sort(), createdObjects.sort());
+  assert.ok(createdObjects.includes("Framebuffer1") && createdObjects.includes("Texture2"));
+  gl.canvas.dispatchEvent(new Event("webglcontextlost"));
+  assert.equal(failures.length, 1);
 });
