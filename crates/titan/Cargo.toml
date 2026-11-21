@@ -11,6 +11,7 @@ readme.workspace = true
 [dependencies]
 titan-2d = { path = "../titan-2d" }
 titan-app = { path = "../titan-app" }
+titan-assets = { path = "../titan-assets" }
 titan-core = { path = "../titan-core" }
 titan-gpu = { path = "../titan-gpu" }
 titan-wasm = { path = "../titan-wasm" }

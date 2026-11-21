@@ -1,0 +1,8 @@
+# Breakout's sprites in sheet.qoi. The bevels are gray so the game tints them; the panel is
+# solid white. `cargo test -p titan --test breakout_replay` checks sheet.qoi against the
+# generator in tests/breakout_replay.rs, and rewrites it with TITAN_BLESS=1.
+atlas 48 22
+brick 0 0 32 12
+ball 34 0 12 12
+paddle 0 14 32 8
+panel 34 14 2 2
