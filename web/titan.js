@@ -1,8 +1,10 @@
-// Titan's browser host: runs a Titan WASM app on WebGPU with no dependencies.
+// Titan's browser host: runs a Titan WASM app on WebGPU, or on WebGL2 where WebGPU is
+// unavailable, with no dependencies.
 //
 // Rust validates every call and sends resource ids and byte payloads, laid out as documented in
-// crates/titan-wasm/src/abi.rs. This module owns the WebGPU objects, the canvas, and DOM input.
-// The decoders are exported so they can be checked against real Rust-encoded bytes in Node.
+// crates/titan-wasm/src/abi.rs. This module decodes them once and hands them to a backend that
+// owns the GPU objects; it also owns the canvas and DOM input. The decoders and the WebGL2
+// translation are exported so they can be checked in Node.
 
 const TEXTURE_FORMATS = ["rgba8unorm", "rgba8unorm-srgb", "bgra8unorm", "bgra8unorm-srgb",
   "r8unorm", "depth32float", "depth24plus-stencil8"];
@@ -418,69 +420,27 @@ function lookup(map, id, kind) {
   return value;
 }
 
-/**
- * Loads the Titan app at `wasmUrl` and runs it on `canvas` until it exits or fails.
- * Resolves to `{ dispose }` once running; rejects if WebGPU or the module cannot start.
- * Later failures, including WebGPU validation errors, stop the app and call `onError`.
- */
-export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
-  if (!navigator.gpu) {
-    throw new Error("WebGPU is not supported in this browser. Try a recent Chrome, Edge, or " +
-      "Safari, or enable WebGPU in the browser's settings.");
-  }
+/** Creates the WebGPU backend: the device, the configured canvas context, and every GPU object. */
+async function createWebGPUBackend(canvas, adapter, fail) {
   const context = canvas.getContext("webgpu");
   if (!context) throw new Error("Could not acquire a WebGPU canvas context.");
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) throw new Error("WebGPU is available, but no GPU adapter was found.");
   const device = await adapter.requestDevice();
   const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
   // Render through an sRGB view so shader output is gamma-encoded like on native surfaces.
   const surfaceFormat = canvasFormat.endsWith("-srgb") ? canvasFormat : `${canvasFormat}-srgb`;
-
-  // "starting" until runTitan resolves, then "running" until exit, failure, or dispose.
-  let state = "starting";
-  let startupError = null;
-  let frameHandle = 0;
-  let observer = null;
-  let lastError = null;
-  const listeners = [];
-  const shutdown = () => {
-    if (state === "stopped") return;
-    // Stopped first, so the device loss from destroy() below is not reported as a failure.
-    state = "stopped";
-    cancelAnimationFrame(frameHandle);
-    observer?.disconnect();
-    for (const [target, type, fn] of listeners) target.removeEventListener(type, fn);
-    device.destroy();
-  };
-  const fail = (error) => {
-    if (state === "starting") {
-      startupError ??= error;
-    } else if (state === "running") {
-      shutdown();
-      onError(error);
-    }
-  };
   device.lost.then((info) => fail(new Error(`The GPU device was lost (${info.reason}): ${info.message}`)));
   device.addEventListener("uncapturederror", (e) => fail(new Error(`WebGPU error: ${e.error.message}`)));
+  try {
+    context.configure({ device, format: canvasFormat, viewFormats: [surfaceFormat], alphaMode: "opaque" });
+  } catch (error) {
+    device.destroy(); // runTitan never receives this backend, so its shutdown cannot.
+    throw error;
+  }
 
   const buffers = new Map();
   const textures = new Map();
   const shaders = new Map();
   const pipelines = new Map();
-  let memory = null;
-  let pendingError = new Uint8Array(0);
-  const bytes = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
-  // Wraps an import so a thrown error becomes Titan's error convention: the message's length.
-  const fallible = (fn) => (...args) => {
-    try {
-      fn(...args);
-      return 0;
-    } catch (error) {
-      pendingError = textEncoder.encode(String(error?.message ?? error) || "unknown host error");
-      return pendingError.length;
-    }
-  };
 
   // Rust checks that an offset lies inside its buffer; these are the device's WebGPU limits.
   function bufferBinding(entry, { buffer: id, offset }) {
@@ -564,44 +524,18 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
     }
   }
 
-  function submitFrame(passes) {
-    const encoder = device.createCommandEncoder();
-    let surfaceView = null;
-    for (const { color, depth, commands } of passes) {
-      const desc = { colorAttachments: [] };
-      if (color) {
-        const view = color.target === SURFACE_ID
-          ? (surfaceView ??= context.getCurrentTexture().createView({ format: surfaceFormat }))
-          : lookup(textures, color.target, "texture").attachmentView;
-        desc.colorAttachments.push({ view, loadOp: color.loadOp, clearValue: color.clearValue, storeOp: color.storeOp });
-      }
-      if (depth) {
-        const target = lookup(textures, depth.target, "texture");
-        desc.depthStencilAttachment = { view: target.attachmentView, depthLoadOp: depth.loadOp,
-          depthClearValue: depth.clearValue, depthStoreOp: depth.storeOp };
-        if (target.format === "depth24plus-stencil8") {
-          Object.assign(desc.depthStencilAttachment, { stencilLoadOp: "clear", stencilStoreOp: "discard" });
-        }
-      }
-      const pass = encoder.beginRenderPass(desc);
-      runPass(pass, commands);
-      pass.end();
-    }
-    device.queue.submit([encoder.finish()]);
-  }
-
-  const imports = {
-    surface_format: () => TEXTURE_FORMATS.indexOf(surfaceFormat),
-    create_buffer: fallible((id, size, usage, labelPtr, labelLen) => {
-      const label = textDecoder.decode(bytes(labelPtr, labelLen)) || undefined;
+  return {
+    name: "webgpu",
+    surfaceFormat,
+    maxTextureSize: device.limits.maxTextureDimension2D,
+    createBuffer(id, size, usage, label) {
       buffers.set(id, { buffer: device.createBuffer({ label, size, usage: gpuUsage(usage, BUFFER_USAGE) }), size });
-    }),
-    write_buffer: fallible((id, offset, ptr, len) => {
-      device.queue.writeBuffer(lookup(buffers, id, "buffer").buffer, offset, memory.buffer, ptr, len);
-    }),
-    destroy_buffer: (id) => { buffers.get(id)?.buffer.destroy(); buffers.delete(id); },
-    create_texture: fallible((id, ptr, len) => {
-      const d = decodeTextureDesc(bytes(ptr, len));
+    },
+    writeBuffer(id, offset, data) {
+      device.queue.writeBuffer(lookup(buffers, id, "buffer").buffer, offset, data);
+    },
+    destroyBuffer(id) { buffers.get(id)?.buffer.destroy(); buffers.delete(id); },
+    createTexture(id, d) {
       const texture = device.createTexture({ label: d.label, size: [d.width, d.height],
         mipLevelCount: d.mipLevelCount, format: d.format, usage: gpuUsage(d.usage, TEXTURE_USAGE) });
       const full = texture.createView();
@@ -613,28 +547,21 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
         sampler: device.createSampler({ ...d.sampler, mipmapFilter: d.sampler.minFilter }),
         bytesPerPixel: d.format === "r8unorm" ? 1 : 4,
       });
-    }),
-    write_texture: fallible((id, ptr, len) => {
+    },
+    writeTexture(id, data) {
       const t = lookup(textures, id, "texture");
-      device.queue.writeTexture({ texture: t.texture }, memory.buffer,
-        { offset: ptr, bytesPerRow: t.width * t.bytesPerPixel, rowsPerImage: t.height }, [t.width, t.height]);
-    }),
-    destroy_texture: (id) => { textures.get(id)?.texture.destroy(); textures.delete(id); },
-    create_shader: fallible((id, ptr, len) => {
-      const s = decodeShaderSource(bytes(ptr, len));
+      device.queue.writeTexture({ texture: t.texture }, data,
+        { bytesPerRow: t.width * t.bytesPerPixel, rowsPerImage: t.height }, [t.width, t.height]);
+    },
+    destroyTexture(id) { textures.get(id)?.texture.destroy(); textures.delete(id); },
+    createShader(id, s) {
       shaders.set(id, { module: device.createShaderModule({ label: s.label, code: s.wgsl }),
         vertexEntry: s.vertexEntry, fragmentEntry: s.fragmentEntry,
         bindings: shaderBindings(s.wgsl, s.vertexEntry, s.fragmentEntry) });
-    }),
-    destroy_shader: (id) => { shaders.delete(id); },
-    create_pipeline: fallible((id, ptr, len) => {
-      const d = decodePipelineDesc(bytes(ptr, len));
+    },
+    destroyShader(id) { shaders.delete(id); },
+    createPipeline(id, d) {
       const shader = lookup(shaders, d.shaderId, "shader");
-      for (const { srcFactor, dstFactor, operation } of d.blend ? [d.blend.color, d.blend.alpha] : []) {
-        if ((operation === "min" || operation === "max") && (srcFactor !== "one" || dstFactor !== "one")) {
-          throw new Error(`${operation} blending needs src and dst factors of one`);
-        }
-      }
       // Explicit layouts, so declared-but-unused bindings stay in them and every bind group fits.
       const groupCount = shader.bindings[1].size ? 2 : shader.bindings[0].size ? 1 : 0;
       const layouts = shader.bindings.slice(0, groupCount)
@@ -651,9 +578,574 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
       const strip = d.primitive.topology.endsWith("-strip");
       pipelines.set(id, { pipeline: device.createRenderPipeline(desc), layouts, bindings: shader.bindings,
         desc, strips: strip ? new Map() : null });
+    },
+    destroyPipeline(id) { pipelines.delete(id); },
+    submitFrame(passes) {
+      const encoder = device.createCommandEncoder();
+      let surfaceView = null;
+      for (const { color, depth, commands } of passes) {
+        const desc = { colorAttachments: [] };
+        if (color) {
+          const view = color.target === SURFACE_ID
+            ? (surfaceView ??= context.getCurrentTexture().createView({ format: surfaceFormat }))
+            : lookup(textures, color.target, "texture").attachmentView;
+          desc.colorAttachments.push({ view, loadOp: color.loadOp, clearValue: color.clearValue, storeOp: color.storeOp });
+        }
+        if (depth) {
+          const target = lookup(textures, depth.target, "texture");
+          desc.depthStencilAttachment = { view: target.attachmentView, depthLoadOp: depth.loadOp,
+            depthClearValue: depth.clearValue, depthStoreOp: depth.storeOp };
+          if (target.format === "depth24plus-stencil8") {
+            Object.assign(desc.depthStencilAttachment, { stencilLoadOp: "clear", stencilStoreOp: "discard" });
+          }
+        }
+        const pass = encoder.beginRenderPass(desc);
+        runPass(pass, commands);
+        pass.end();
+      }
+      device.queue.submit([encoder.finish()]);
+    },
+    destroy() { device.destroy(); },
+  };
+}
+
+// WebGL2 enum names per WebGPU value. The backend resolves each as `gl[name]`, so this module
+// needs no numeric GL constants.
+export const GL_NAMES = {
+  blendFactor: { zero: "ZERO", one: "ONE", "src-alpha": "SRC_ALPHA", "one-minus-src-alpha": "ONE_MINUS_SRC_ALPHA",
+    "dst-alpha": "DST_ALPHA", "one-minus-dst-alpha": "ONE_MINUS_DST_ALPHA", src: "SRC_COLOR",
+    "one-minus-src": "ONE_MINUS_SRC_COLOR", dst: "DST_COLOR", "one-minus-dst": "ONE_MINUS_DST_COLOR" },
+  blendOperation: { add: "FUNC_ADD", subtract: "FUNC_SUBTRACT", "reverse-subtract": "FUNC_REVERSE_SUBTRACT",
+    min: "MIN", max: "MAX" },
+  compare: { never: "NEVER", less: "LESS", "less-equal": "LEQUAL", equal: "EQUAL", "greater-equal": "GEQUAL",
+    greater: "GREATER", "not-equal": "NOTEQUAL", always: "ALWAYS" },
+  // WebGL2 restarts every draw at the maximum index value, lists included: a uint16 list cannot
+  // use index 65535, so meshes with 65536+ vertices need uint32 indices.
+  topology: { "triangle-list": "TRIANGLES", "triangle-strip": "TRIANGLE_STRIP", "line-list": "LINES",
+    "line-strip": "LINE_STRIP", "point-list": "POINTS" },
+  cullFace: { none: null, front: "FRONT", back: "BACK" },
+  frontFace: { ccw: "CCW", cw: "CW" },
+  indexFormat: { uint16: "UNSIGNED_SHORT", uint32: "UNSIGNED_INT" },
+  addressMode: { "clamp-to-edge": "CLAMP_TO_EDGE", repeat: "REPEAT", "mirror-repeat": "MIRRORED_REPEAT" },
+  // `integer` attributes go through vertexAttribIPointer, so shaders read them as uint or int.
+  vertexFormat: {
+    float32: { size: 1, type: "FLOAT", normalized: false, integer: false },
+    float32x2: { size: 2, type: "FLOAT", normalized: false, integer: false },
+    float32x3: { size: 3, type: "FLOAT", normalized: false, integer: false },
+    float32x4: { size: 4, type: "FLOAT", normalized: false, integer: false },
+    uint32: { size: 1, type: "UNSIGNED_INT", normalized: false, integer: true },
+    sint32: { size: 1, type: "INT", normalized: false, integer: true },
+    unorm8x4: { size: 4, type: "UNSIGNED_BYTE", normalized: true, integer: false },
+  },
+  textureFormat: {
+    rgba8unorm: { internalFormat: "RGBA8", format: "RGBA", type: "UNSIGNED_BYTE" },
+    "rgba8unorm-srgb": { internalFormat: "SRGB8_ALPHA8", format: "RGBA", type: "UNSIGNED_BYTE" },
+    r8unorm: { internalFormat: "R8", format: "RED", type: "UNSIGNED_BYTE" },
+    depth32float: { internalFormat: "DEPTH_COMPONENT32F", format: "DEPTH_COMPONENT", type: "FLOAT" },
+    "depth24plus-stencil8": { internalFormat: "DEPTH24_STENCIL8", format: "DEPTH_STENCIL", type: "UNSIGNED_INT_24_8" },
+  },
+};
+
+/** The `{ internalFormat, format, type }` GL names for a WebGPU texture format. */
+export function glTextureFormat(format) {
+  const names = GL_NAMES.textureFormat[format];
+  if (!names) throw new Error(`texture format ${format} is not supported on WebGL2; use rgba8unorm instead`);
+  return names;
+}
+
+/** The samplerParameteri name/value pairs for a decoded sampler, as GL names. */
+export function glSamplerParams(sampler, mipLevelCount) {
+  const filter = (mode) => (mode === "linear" ? "LINEAR" : "NEAREST");
+  const min = filter(sampler.minFilter);
+  return {
+    // WebGPU's sampler filters between mip levels with the min filter too.
+    TEXTURE_MIN_FILTER: mipLevelCount > 1 ? `${min}_MIPMAP_${min}` : min,
+    TEXTURE_MAG_FILTER: filter(sampler.magFilter),
+    TEXTURE_WRAP_S: GL_NAMES.addressMode[sampler.addressModeU],
+    TEXTURE_WRAP_T: GL_NAMES.addressMode[sampler.addressModeV],
+  };
+}
+
+/** One stage of a Titan GLSL source, which wraps each stage in `#ifdef TITAN_<STAGE>`. */
+export const glslStage = (stage, source) => `#version 300 es\n#define TITAN_${stage}\n${source}`;
+
+/** The Titan binding a GLSL uniform block or sampler names with its `_binding<N>` suffix. */
+export function glslBinding(name) {
+  const match = /_binding(0|[1-9]\d*)$/.exec(name);
+  if (!match) throw new Error(`GLSL uniform "${name}" must end in _binding<N> to name its Titan binding`);
+  return Number(match[1]);
+}
+
+/**
+ * The `[x, y, width, height]` GL rect of a top-left-origin WebGPU rect, with GL's bottom-left
+ * origin. GL truncates fractional rects, so each edge is rounded to the nearest pixel instead.
+ */
+export function glRect(x, y, width, height, targetHeight) {
+  const [x0, x1, y0, y1] = [x, x + width, y, y + height].map(Math.round);
+  return [x0, targetHeight - y1, x1 - x0, y1 - y0];
+}
+
+const [VERTEX_USAGE, INDEX_USAGE, UNIFORM_USAGE, STORAGE_USAGE] = [1, 2, 4, 8];
+const NO_STORAGE = "storage buffers are not supported on WebGL2";
+const SAMPLER_TYPES = ["SAMPLER_2D", "SAMPLER_2D_SHADOW", "INT_SAMPLER_2D", "UNSIGNED_INT_SAMPLER_2D"];
+
+// Copies the sRGB surface texture to the canvas. Fetching decodes it to linear, so this encodes
+// it again: the default framebuffer stores what it is given.
+const PRESENT_VERTEX = `#version 300 es
+void main() {
+  gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0);
+}`;
+const PRESENT_FRAGMENT = `#version 300 es
+precision highp float;
+uniform highp sampler2D surface;
+out vec4 color;
+void main() {
+  vec3 c = texelFetch(surface, ivec2(gl_FragCoord.xy), 0).rgb;
+  color = vec4(mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)), 1.0);
+}`;
+
+/**
+ * Creates the WebGL2 backend on `gl`. Surface passes draw into an sRGB texture, so blending
+ * happens in linear space like WebGPU's -srgb view, and each frame that drew it ends by copying
+ * it to the canvas.
+ */
+export function createWebGL2Backend(gl, fail) {
+  const onContextLost = () => fail(new Error("The WebGL2 context was lost."));
+  gl.canvas.addEventListener("webglcontextlost", onContextLost);
+  const uniformAlignment = gl.getParameter(gl.UNIFORM_BUFFER_OFFSET_ALIGNMENT);
+  const maxUniformSize = gl.getParameter(gl.MAX_UNIFORM_BLOCK_SIZE);
+  const buffers = new Map();
+  const textures = new Map();
+  const shaders = new Map();
+  const pipelines = new Map();
+  const framebuffers = new Map(); // "<color id>/<depth id>" to { framebuffer, ids }.
+  let surface = null; // { texture, width, height }, sized to the drawing buffer.
+  let enabledAttributes = new Set();
+
+  const compile = (type, stage, source, label) => {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error(`${label}: the GLSL ${stage} stage failed to compile:\n${log}`);
+    }
+    return shader;
+  };
+  const link = ([vertex, fragment], label) => {
+    const program = gl.createProgram();
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(program);
+      gl.deleteProgram(program);
+      throw new Error(`${label}: the GLSL program failed to link:\n${log}`);
+    }
+    return program;
+  };
+  const presentStages = [compile(gl.VERTEX_SHADER, "vertex", PRESENT_VERTEX, "present"),
+    compile(gl.FRAGMENT_SHADER, "fragment", PRESENT_FRAGMENT, "present")];
+  const presentProgram = link(presentStages, "present");
+  const vao = gl.createVertexArray();
+  const presentVao = gl.createVertexArray();
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+  const dropFramebuffers = (id) => {
+    for (const [key, { framebuffer, ids }] of framebuffers) {
+      if (!ids.includes(id)) continue;
+      gl.deleteFramebuffer(framebuffer);
+      framebuffers.delete(key);
+    }
+  };
+  const target = (id) => {
+    if (id !== SURFACE_ID) return lookup(textures, id, "texture");
+    const { drawingBufferWidth: width, drawingBufferHeight: height } = gl;
+    if (surface?.width !== width || surface.height !== height) {
+      if (surface) {
+        gl.deleteTexture(surface.texture);
+        dropFramebuffers(SURFACE_ID);
+      }
+      surface = { texture: gl.createTexture(), width, height };
+      gl.bindTexture(gl.TEXTURE_2D, surface.texture);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.SRGB8_ALPHA8, width, height);
+    }
+    return surface;
+  };
+  const bindFramebuffer = (colorId, depthId) => {
+    const key = `${colorId}/${depthId}`;
+    let entry = framebuffers.get(key);
+    if (!entry) {
+      entry = { framebuffer: gl.createFramebuffer(), ids: [colorId, depthId] };
+      gl.bindFramebuffer(gl.FRAMEBUFFER, entry.framebuffer);
+      if (colorId !== undefined) {
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target(colorId).texture, 0);
+      }
+      if (depthId !== undefined) {
+        const depth = target(depthId);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, depth.stencil ? gl.DEPTH_STENCIL_ATTACHMENT : gl.DEPTH_ATTACHMENT,
+          gl.TEXTURE_2D, depth.texture, 0);
+      }
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        throw new Error(`WebGL2 cannot render to this pass's attachments (status ${status})`);
+      }
+      framebuffers.set(key, entry);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, entry.framebuffer);
+  };
+
+  // GL stores rendered rows bottom-up, so a texture target sampled later is upside down relative
+  // to WebGPU. Only the surface, which the present pass copies row for row, is unaffected.
+  function runPass({ color, depth, commands }) {
+    const colorTarget = color && target(color.target);
+    const depthTarget = depth && target(depth.target);
+    const { width, height } = colorTarget ?? depthTarget;
+    bindFramebuffer(color?.target, depth?.target);
+    // WebGPU starts every pass with a full viewport and no scissor.
+    gl.viewport(0, 0, width, height);
+    gl.depthRange(0, 1);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.colorMask(true, true, true, true);
+    let clear = 0;
+    if (color?.loadOp === "clear") {
+      const { r, g, b, a } = color.clearValue;
+      gl.clearColor(r, g, b, a);
+      clear |= gl.COLOR_BUFFER_BIT;
+    }
+    if (depth?.loadOp === "clear") {
+      gl.depthMask(true);
+      gl.clearDepth(depth.clearValue);
+      clear |= gl.DEPTH_BUFFER_BIT;
+    }
+    if (depthTarget?.stencil) clear |= gl.STENCIL_BUFFER_BIT; // As the WebGPU backend's stencilLoadOp.
+    if (clear) gl.clear(clear);
+
+    let pipeline = null;
+    let index = null;
+    const vertexBuffers = [];
+    const uniforms = new Map();
+    const boundTextures = new Map();
+    // WebGL2 has no base vertex or first instance, so they move the attribute offsets instead.
+    // gl_VertexID and gl_InstanceID cannot see that move.
+    const bindResources = (baseVertex, firstInstance) => {
+      if (!pipeline) throw new Error("draw without a pipeline");
+      if (baseVertex && pipeline.usesVertexId) {
+        throw new Error(`${pipeline.label}: WebGL2 cannot apply baseVertex ${baseVertex} to gl_VertexID`);
+      }
+      if (firstInstance && pipeline.usesInstanceId) {
+        throw new Error(`${pipeline.label}: WebGL2 cannot apply firstInstance ${firstInstance} to gl_InstanceID`);
+      }
+      for (const binding of pipeline.uniformBindings) {
+        const c = uniforms.get(binding);
+        if (!c) throw new Error(`a draw needs a uniform buffer at binding ${binding}`);
+        const { buffer, size } = lookup(buffers, c.buffer, "buffer");
+        const bound = size - c.offset;
+        const where = `uniform buffer at binding ${binding}`;
+        if (c.offset % uniformAlignment) {
+          throw new Error(`${where}: offset ${c.offset} must be a multiple of ${uniformAlignment}`);
+        }
+        if (bound <= 0) throw new Error(`${where}: offset ${c.offset} leaves no bytes of its ${size}-byte buffer`);
+        // No block can exceed MAX_UNIFORM_BLOCK_SIZE (16 KiB at minimum), so bind at most that much.
+        gl.bindBufferRange(gl.UNIFORM_BUFFER, binding, buffer, c.offset, Math.min(bound, maxUniformSize));
+      }
+      for (const binding of pipeline.textureBindings) {
+        const t = boundTextures.get(binding);
+        if (!t) throw new Error(`a draw needs a texture at binding ${binding}`);
+        gl.activeTexture(gl.TEXTURE0 + binding);
+        gl.bindTexture(gl.TEXTURE_2D, t.texture);
+        gl.bindSampler(binding, t.sampler);
+      }
+      const used = new Set();
+      pipeline.buffers.forEach(({ arrayStride, stepMode, attributes }, slot) => {
+        const instance = stepMode === "instance";
+        const start = vertexBuffers[slot].offset + (instance ? firstInstance : baseVertex) * arrayStride;
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffers[slot].buffer);
+        for (const { location, offset, size, type, normalized, integer } of attributes) {
+          if (start + offset < 0) {
+            throw new Error(`baseVertex ${baseVertex} moves attribute ${location} before its buffer's start`);
+          }
+          gl.enableVertexAttribArray(location);
+          used.add(location);
+          if (integer) gl.vertexAttribIPointer(location, size, type, arrayStride, start + offset);
+          else gl.vertexAttribPointer(location, size, type, normalized, arrayStride, start + offset);
+          gl.vertexAttribDivisor(location, instance ? 1 : 0);
+        }
+      });
+      for (const location of enabledAttributes) if (!used.has(location)) gl.disableVertexAttribArray(location);
+      enabledAttributes = used;
+    };
+    for (const c of commands) {
+      switch (c.op) {
+        case "setPipeline": {
+          pipeline = lookup(pipelines, c.pipeline, "pipeline");
+          const { program, blend, depthTest, cullFace, frontFace } = pipeline;
+          gl.useProgram(program);
+          if (blend) {
+            gl.enable(gl.BLEND);
+            gl.blendFuncSeparate(...blend.factors);
+            gl.blendEquationSeparate(...blend.operations);
+          } else gl.disable(gl.BLEND);
+          if (depthTest) {
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(depthTest.func);
+            gl.depthMask(depthTest.write);
+          } else gl.disable(gl.DEPTH_TEST);
+          if (cullFace) {
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(cullFace);
+          } else gl.disable(gl.CULL_FACE);
+          gl.frontFace(frontFace);
+          break;
+        }
+        case "setVertexBuffer":
+          vertexBuffers[c.slot] = { buffer: lookup(buffers, c.buffer, "buffer").buffer, offset: c.offset };
+          break;
+        case "setIndexBuffer": index = { ...c, buffer: lookup(buffers, c.buffer, "buffer").buffer }; break;
+        case "setUniformBuffer": uniforms.set(c.binding, c); break;
+        case "setStorageBuffer": throw new Error(NO_STORAGE);
+        case "setTexture": boundTextures.set(c.binding, lookup(textures, c.texture, "texture")); break;
+        case "setViewport":
+          gl.viewport(...glRect(c.x, c.y, c.width, c.height, height));
+          gl.depthRange(c.minDepth, c.maxDepth);
+          break;
+        case "setScissor":
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(...glRect(c.x, c.y, c.width, c.height, height));
+          break;
+        case "draw":
+          bindResources(0, c.firstInstance);
+          gl.drawArraysInstanced(pipeline.mode, c.firstVertex, c.vertexCount, c.instanceCount);
+          break;
+        case "drawIndexed": {
+          bindResources(c.baseVertex, c.firstInstance);
+          // Bound per draw: buffer writes rebind ELEMENT_ARRAY_BUFFER, which is VAO state.
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index.buffer);
+          const indexSize = index.format === "uint16" ? 2 : 4;
+          gl.drawElementsInstanced(pipeline.mode, c.indexCount, gl[GL_NAMES.indexFormat[index.format]],
+            index.offset + c.firstIndex * indexSize, c.instanceCount);
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    name: "webgl2",
+    surfaceFormat: "rgba8unorm-srgb",
+    maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    createBuffer(id, size, usage) {
+      if (usage & STORAGE_USAGE) throw new Error(NO_STORAGE);
+      const index = usage & INDEX_USAGE;
+      if (index && usage & (VERTEX_USAGE | UNIFORM_USAGE)) {
+        throw new Error("an index buffer cannot also be a vertex or uniform buffer on WebGL2");
+      }
+      // A WebGL buffer first bound to ELEMENT_ARRAY_BUFFER can never be bound to another target.
+      const bufferTarget = index ? gl.ELEMENT_ARRAY_BUFFER : gl.COPY_WRITE_BUFFER;
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(bufferTarget, buffer);
+      gl.bufferData(bufferTarget, size, gl.DYNAMIC_DRAW);
+      buffers.set(id, { buffer, size, target: bufferTarget });
+    },
+    writeBuffer(id, offset, data) {
+      const b = lookup(buffers, id, "buffer");
+      gl.bindBuffer(b.target, b.buffer);
+      gl.bufferSubData(b.target, offset, data);
+    },
+    destroyBuffer(id) { gl.deleteBuffer(buffers.get(id)?.buffer ?? null); buffers.delete(id); },
+    createTexture(id, d) {
+      const { internalFormat, format, type } = glTextureFormat(d.format);
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texStorage2D(gl.TEXTURE_2D, d.mipLevelCount, gl[internalFormat], d.width, d.height);
+      const sampler = gl.createSampler();
+      for (const [param, value] of Object.entries(glSamplerParams(d.sampler, d.mipLevelCount))) {
+        gl.samplerParameteri(sampler, gl[param], gl[value]);
+      }
+      textures.set(id, { texture, sampler, width: d.width, height: d.height, format: gl[format], type: gl[type],
+        stencil: d.format === "depth24plus-stencil8" });
+    },
+    writeTexture(id, data) {
+      const t = lookup(textures, id, "texture");
+      gl.bindTexture(gl.TEXTURE_2D, t.texture);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, t.width, t.height, t.format, t.type, data);
+    },
+    destroyTexture(id) {
+      const t = textures.get(id);
+      if (!t) return;
+      gl.deleteTexture(t.texture);
+      gl.deleteSampler(t.sampler);
+      dropFramebuffers(id);
+      textures.delete(id);
+    },
+    createShader(id, s) {
+      const label = s.label ? `shader "${s.label}"` : `shader ${id}`;
+      const stages = s.glsl && [compile(gl.VERTEX_SHADER, "vertex", glslStage("VERTEX", s.glsl), label),
+        compile(gl.FRAGMENT_SHADER, "fragment", glslStage("FRAGMENT", s.glsl), label)];
+      shaders.set(id, { label, stages });
+    },
+    destroyShader(id) {
+      for (const shader of shaders.get(id)?.stages ?? []) gl.deleteShader(shader);
+      shaders.delete(id);
+    },
+    createPipeline(id, d) {
+      const shader = lookup(shaders, d.shaderId, "shader");
+      if (!shader.stages) throw new Error(`${shader.label} has no GLSL source, which WebGL2 needs`);
+      const program = link(shader.stages, shader.label);
+      // The linked program lists the built-ins it reads as active attributes, so comments and
+      // dead code that mention gl_VertexID or gl_InstanceID do not count.
+      const attributes = Array.from({ length: gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES) },
+        (_, i) => gl.getActiveAttrib(program, i).name);
+      const uniformBindings = [];
+      for (let i = 0; i < gl.getProgramParameter(program, gl.ACTIVE_UNIFORM_BLOCKS); i++) {
+        const binding = glslBinding(gl.getActiveUniformBlockName(program, i));
+        gl.uniformBlockBinding(program, i, binding);
+        uniformBindings.push(binding);
+      }
+      const textureBindings = [];
+      gl.useProgram(program);
+      for (let i = 0; i < gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i++) {
+        const { name, type } = gl.getActiveUniform(program, i);
+        if (!SAMPLER_TYPES.some((samplerType) => gl[samplerType] === type)) continue;
+        const binding = glslBinding(name);
+        gl.uniform1i(gl.getUniformLocation(program, name), binding); // Texture unit `binding`.
+        textureBindings.push(binding);
+      }
+      const factor = (name) => gl[GL_NAMES.blendFactor[name]];
+      const operation = (name) => gl[GL_NAMES.blendOperation[name]];
+      const { blend, depthStencil, primitive } = d;
+      pipelines.set(id, {
+        program, uniformBindings, textureBindings, label: shader.label,
+        usesVertexId: attributes.includes("gl_VertexID"),
+        usesInstanceId: attributes.includes("gl_InstanceID"),
+        blend: blend && {
+          factors: [blend.color.srcFactor, blend.color.dstFactor, blend.alpha.srcFactor, blend.alpha.dstFactor].map(factor),
+          operations: [blend.color.operation, blend.alpha.operation].map(operation),
+        },
+        depthTest: depthStencil && { func: gl[GL_NAMES.compare[depthStencil.depthCompare]],
+          write: depthStencil.depthWriteEnabled },
+        cullFace: primitive.cullMode === "none" ? null : gl[GL_NAMES.cullFace[primitive.cullMode]],
+        frontFace: gl[GL_NAMES.frontFace[primitive.frontFace]],
+        mode: gl[GL_NAMES.topology[primitive.topology]],
+        buffers: d.buffers.map(({ arrayStride, stepMode, attributes }) => ({
+          arrayStride, stepMode,
+          attributes: attributes.map(({ format, offset, shaderLocation }) => {
+            const { size, type, normalized, integer } = GL_NAMES.vertexFormat[format];
+            return { location: shaderLocation, offset, size, type: gl[type], normalized, integer };
+          }),
+        })),
+      });
+    },
+    destroyPipeline(id) { gl.deleteProgram(pipelines.get(id)?.program ?? null); pipelines.delete(id); },
+    submitFrame(passes) {
+      gl.bindVertexArray(vao);
+      for (const pass of passes) runPass(pass);
+      if (passes.some(({ color }) => color?.target === SURFACE_ID)) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, surface.width, surface.height);
+        for (const cap of [gl.SCISSOR_TEST, gl.BLEND, gl.DEPTH_TEST, gl.CULL_FACE]) gl.disable(cap);
+        gl.useProgram(presentProgram);
+        gl.bindVertexArray(presentVao);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, surface.texture);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
+      const error = gl.getError();
+      if (error !== gl.NO_ERROR) throw new Error(`WebGL2 error 0x${error.toString(16)} while drawing a frame`);
+    },
+    // Deletes every GL object instead of losing the context, so a later run can reuse the canvas.
+    destroy() {
+      gl.useProgram(null); // A bound program outlives deleteProgram.
+      gl.canvas.removeEventListener("webglcontextlost", onContextLost);
+      for (const { buffer } of buffers.values()) gl.deleteBuffer(buffer);
+      for (const { texture, sampler } of textures.values()) {
+        gl.deleteTexture(texture);
+        gl.deleteSampler(sampler);
+      }
+      for (const { stages } of shaders.values()) for (const shader of stages ?? []) gl.deleteShader(shader);
+      for (const { program } of pipelines.values()) gl.deleteProgram(program);
+      for (const { framebuffer } of framebuffers.values()) gl.deleteFramebuffer(framebuffer);
+      if (surface) gl.deleteTexture(surface.texture);
+      for (const shader of presentStages) gl.deleteShader(shader);
+      gl.deleteProgram(presentProgram);
+      gl.deleteVertexArray(vao);
+      gl.deleteVertexArray(presentVao);
+    },
+  };
+}
+
+/**
+ * Loads the Titan app at `wasmUrl` and runs it on `canvas` until it exits or fails.
+ * Renders with WebGPU, or with WebGL2 where WebGPU has no adapter (WebGL2 needs GLSL shaders).
+ * Resolves to `{ dispose, backend }` once running, where `backend` is "webgpu" or "webgl2";
+ * rejects if neither API or the module can start. Later failures, including WebGPU validation
+ * errors and WebGL2 context loss, stop the app and call `onError`.
+ */
+export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
+  // "starting" until runTitan resolves, then "running" until exit, failure, or dispose.
+  let state = "starting";
+  let startupError = null;
+  let frameHandle = 0;
+  let observer = null;
+  let lastError = null;
+  let backend = null;
+  const listeners = [];
+  const shutdown = () => {
+    if (state === "stopped") return;
+    // Stopped first, so the device or context loss from destroy() is not reported as a failure.
+    state = "stopped";
+    cancelAnimationFrame(frameHandle);
+    observer?.disconnect();
+    for (const [target, type, fn] of listeners) target.removeEventListener(type, fn);
+    backend?.destroy();
+  };
+  const fail = (error) => {
+    if (state === "starting") {
+      startupError ??= error;
+    } else if (state === "running") {
+      shutdown();
+      onError(error);
+    }
+  };
+
+  let memory = null;
+  let pendingError = new Uint8Array(0);
+  const bytes = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
+  // Wraps an import so a thrown error becomes Titan's error convention: the message's length.
+  const fallible = (fn) => (...args) => {
+    try {
+      fn(...args);
+      return 0;
+    } catch (error) {
+      pendingError = textEncoder.encode(String(error?.message ?? error) || "unknown host error");
+      return pendingError.length;
+    }
+  };
+
+  const imports = {
+    surface_format: () => TEXTURE_FORMATS.indexOf(backend.surfaceFormat),
+    create_buffer: fallible((id, size, usage, labelPtr, labelLen) => {
+      backend.createBuffer(id, size, usage, textDecoder.decode(bytes(labelPtr, labelLen)) || undefined);
     }),
-    destroy_pipeline: (id) => { pipelines.delete(id); },
-    submit_frame: fallible((ptr, len) => submitFrame(decodeFrame(bytes(ptr, len)))),
+    write_buffer: fallible((id, offset, ptr, len) => backend.writeBuffer(id, offset, bytes(ptr, len))),
+    destroy_buffer: (id) => backend.destroyBuffer(id),
+    create_texture: fallible((id, ptr, len) => backend.createTexture(id, decodeTextureDesc(bytes(ptr, len)))),
+    write_texture: fallible((id, ptr, len) => backend.writeTexture(id, bytes(ptr, len))),
+    destroy_texture: (id) => backend.destroyTexture(id),
+    create_shader: fallible((id, ptr, len) => backend.createShader(id, decodeShaderSource(bytes(ptr, len)))),
+    destroy_shader: (id) => backend.destroyShader(id),
+    create_pipeline: fallible((id, ptr, len) => {
+      const d = decodePipelineDesc(bytes(ptr, len));
+      for (const { srcFactor, dstFactor, operation } of d.blend ? [d.blend.color, d.blend.alpha] : []) {
+        if ((operation === "min" || operation === "max") && (srcFactor !== "one" || dstFactor !== "one")) {
+          throw new Error(`${operation} blending needs src and dst factors of one`);
+        }
+      }
+      backend.createPipeline(id, d);
+    }),
+    destroy_pipeline: (id) => backend.destroyPipeline(id),
+    submit_frame: fallible((ptr, len) => backend.submitFrame(decodeFrame(bytes(ptr, len)))),
     read_error: (ptr, len) => bytes(ptr, len).set(pendingError.subarray(0, len)),
     log: (level, ptr, len) => {
       const message = textDecoder.decode(bytes(ptr, len));
@@ -673,9 +1165,9 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
     .map(([name, fn]) => [name, (...args) => fn(...args.map((arg) => arg >>> 0))]));
 
   const failed = (name) => new Error(lastError ?? `${name} failed`);
-  const maxSize = device.limits.maxTextureDimension2D;
   let lastScale = 0;
   const resizeCanvas = (width, height, scale) => {
+    const maxSize = backend.maxTextureSize;
     [width, height] = [Math.min(width, maxSize), Math.min(height, maxSize)];
     if (width === canvas.width && height === canvas.height && scale === lastScale) return false;
     [canvas.width, canvas.height, lastScale] = [width, height, scale];
@@ -684,11 +1176,22 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
 
   let app;
   try {
-    context.configure({ device, format: canvasFormat, viewFormats: [surfaceFormat], alphaMode: "opaque" });
+    // Before any getContext call: a canvas with a "webgpu" context can no longer give a WebGL2 one.
+    const adapter = await navigator.gpu?.requestAdapter();
+    if (adapter) {
+      backend = await createWebGPUBackend(canvas, adapter, fail);
+    } else {
+      const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, depth: false, stencil: false });
+      if (!gl) {
+        throw new Error(`This browser supports neither WebGPU${navigator.gpu ? " (no GPU adapter found)" : ""} ` +
+          "nor WebGL2. Try a recent Chrome, Edge, Firefox, or Safari, with hardware acceleration enabled.");
+      }
+      backend = createWebGL2Backend(gl, fail);
+    }
     const response = await fetch(wasmUrl);
     if (!response.ok) throw new Error(`Could not load ${wasmUrl}: HTTP ${response.status} ${response.statusText}`);
     const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), { titan: unsignedImports });
-    // Device loss or a WebGPU error while awaiting above aborts startup; nothing awaits below.
+    // Device or context loss while awaiting above aborts startup; nothing awaits below.
     if (startupError) throw startupError;
     app = instance.exports;
     memory = app.memory;
@@ -828,5 +1331,5 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
   };
   frameHandle = requestAnimationFrame(tick);
 
-  return { dispose: shutdown };
+  return { dispose: shutdown, backend: backend.name };
 }
