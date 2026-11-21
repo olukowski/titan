@@ -11,11 +11,14 @@ extern crate alloc;
 
 pub(crate) mod level;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
+use core::fmt;
 use level::{BrickKind, Level};
 use titan::app::{App, AppAction, InputState, KeyCode, MouseButton, SurfaceSize};
 use titan::assets::{Atlas, decode_qoi};
+use titan::audio::{AudioMixer, Envelope, PlayParams, Sfx, Sound, Waveform};
 use titan::core::math::sin_cos;
 use titan::core::{Color, Handle, Rect, Vec2};
 use titan::gpu::{
@@ -93,6 +96,136 @@ pub(crate) enum Phase {
     Lost,
 }
 
+/// Something the simulation did that makes a sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoundEvent {
+    Paddle,
+    /// A side wall or the ceiling.
+    Wall,
+    /// A brick took a hit and survived.
+    Brick,
+    /// A brick was destroyed.
+    BrickBreak,
+    /// The ball fell with lives to spare.
+    Miss,
+    Won,
+    Lost,
+}
+
+impl SoundEvent {
+    /// Every event in declaration order, so `ALL[event as usize] == event`.
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Paddle,
+        Self::Wall,
+        Self::Brick,
+        Self::BrickBreak,
+        Self::Miss,
+        Self::Won,
+        Self::Lost,
+    ];
+}
+
+/// Plays each [`SoundEvent`] a step produces, after the step.
+pub(crate) type Speaker = Box<dyn FnMut(SoundEvent)>;
+
+/// The rate the sound bank renders and mixes at.
+pub(crate) const SAMPLE_RATE: u32 = 48_000;
+
+/// One rendered sound per [`SoundEvent`], indexed by `event as usize`.
+#[derive(Debug)]
+pub(crate) struct Sounds([Handle<Sound>; SoundEvent::ALL.len()]);
+
+impl Sounds {
+    /// Renders every effect once and registers it with `mixer`. The effects are part of the
+    /// program, so a bad one panics rather than returning an error.
+    pub(crate) fn new(mixer: &mut AudioMixer) -> Self {
+        let rate = mixer.sample_rate();
+        Self(SoundEvent::ALL.map(|event| {
+            let sound = sfx(event)
+                .render(rate)
+                .unwrap_or_else(|e| panic!("breakout {event:?} sfx: {e}"));
+            mixer.add_sound(sound)
+        }))
+    }
+
+    pub(crate) fn play(&self, mixer: &mut AudioMixer, event: SoundEvent) {
+        mixer.play(self.0[event as usize], PlayParams::new());
+    }
+}
+
+/// Short chiptune effects; gains stay low so a burst of overlapping voices does not clip.
+fn sfx(event: SoundEvent) -> Sfx {
+    const BLIP: Sfx = Sfx {
+        waveform: Waveform::Square,
+        frequency: 440.0,
+        end_frequency: None,
+        duration: 0.05,
+        envelope: Envelope {
+            attack: 0.002,
+            decay: 0.04,
+            sustain: 0.5,
+            release: 0.05,
+        },
+        gain: 0.22,
+        seed: 0,
+    };
+    let swell = |decay, sustain, release| Envelope {
+        decay,
+        sustain,
+        release,
+        ..BLIP.envelope
+    };
+    match event {
+        SoundEvent::Paddle => BLIP,
+        SoundEvent::Wall => Sfx {
+            waveform: Waveform::Triangle,
+            frequency: 330.0,
+            duration: 0.03,
+            gain: 0.3,
+            ..BLIP
+        },
+        SoundEvent::Brick => Sfx {
+            frequency: 660.0,
+            duration: 0.04,
+            gain: 0.2,
+            ..BLIP
+        },
+        SoundEvent::BrickBreak => Sfx {
+            frequency: 660.0,
+            end_frequency: Some(1320.0),
+            duration: 0.08,
+            ..BLIP
+        },
+        SoundEvent::Miss => Sfx {
+            waveform: Waveform::Saw,
+            frequency: 330.0,
+            end_frequency: Some(110.0),
+            duration: 0.35,
+            envelope: swell(0.1, 0.6, 0.1),
+            gain: 0.2,
+            ..BLIP
+        },
+        SoundEvent::Won => Sfx {
+            waveform: Waveform::Triangle,
+            frequency: 440.0,
+            end_frequency: Some(1320.0),
+            duration: 0.6,
+            envelope: swell(0.2, 0.7, 0.3),
+            gain: 0.3,
+            ..BLIP
+        },
+        SoundEvent::Lost => Sfx {
+            waveform: Waveform::Saw,
+            frequency: 220.0,
+            end_frequency: Some(55.0),
+            duration: 0.9,
+            envelope: swell(0.3, 0.6, 0.4),
+            gain: 0.2,
+            ..BLIP
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Brick {
     rect: Rect,
@@ -115,6 +248,8 @@ struct Game {
     previous_ball: Vec2,
     ball_velocity: Vec2,
     bricks: Vec<Brick>,
+    /// What happened this step, in order, for the app to play.
+    sounds: Vec<SoundEvent>,
 }
 
 impl Game {
@@ -149,6 +284,7 @@ impl Game {
             previous_ball: Vec2::ZERO,
             ball_velocity: Vec2::ZERO,
             bricks,
+            sounds: Vec::new(),
         };
         game.serve();
         game
@@ -207,6 +343,7 @@ impl Game {
             self.ball.y += self.ball_velocity.y * h;
             self.collide_y();
             if self.bricks.is_empty() {
+                self.sounds.push(SoundEvent::Won);
                 self.phase = Phase::Won;
                 self.ball_velocity = Vec2::ZERO;
                 return;
@@ -214,9 +351,11 @@ impl Game {
             if self.ball.y + BALL_HALF < 0.0 {
                 self.lives -= 1;
                 if self.lives == 0 {
+                    self.sounds.push(SoundEvent::Lost);
                     self.phase = Phase::Lost;
                     self.ball_velocity = Vec2::ZERO;
                 } else {
+                    self.sounds.push(SoundEvent::Miss);
                     self.serve();
                 }
                 return;
@@ -229,9 +368,11 @@ impl Game {
         if ball.min.x < PLAY_LEFT {
             self.ball.x = PLAY_LEFT + BALL_HALF;
             self.ball_velocity.x = self.ball_velocity.x.abs();
+            self.sounds.push(SoundEvent::Wall);
         } else if ball.max.x > PLAY_RIGHT {
             self.ball.x = PLAY_RIGHT - BALL_HALF;
             self.ball_velocity.x = -self.ball_velocity.x.abs();
+            self.sounds.push(SoundEvent::Wall);
         } else if let Some(brick) = self.hit_brick(ball) {
             self.ball.x = if self.ball_velocity.x > 0.0 {
                 brick.min.x - BALL_HALF
@@ -247,6 +388,7 @@ impl Game {
         if ball.max.y > PLAY_TOP {
             self.ball.y = PLAY_TOP - BALL_HALF;
             self.ball_velocity.y = -self.ball_velocity.y.abs();
+            self.sounds.push(SoundEvent::Wall);
         } else if let Some(brick) = self.hit_brick(ball) {
             self.ball.y = if self.ball_velocity.y > 0.0 {
                 brick.min.y - BALL_HALF
@@ -264,6 +406,7 @@ impl Game {
             let (sin, cos) = sin_cos(offset * MAX_BOUNCE_ANGLE);
             self.ball_velocity = Vec2::new(sin, cos) * self.ball_speed;
             self.ball.y = PADDLE_TOP + BALL_HALF;
+            self.sounds.push(SoundEvent::Paddle);
         }
     }
 
@@ -277,6 +420,9 @@ impl Game {
         if brick.hits_left == 0 {
             self.score += brick.kind.points();
             self.bricks.remove(index);
+            self.sounds.push(SoundEvent::BrickBreak);
+        } else {
+            self.sounds.push(SoundEvent::Brick);
         }
         Some(rect)
     }
@@ -371,16 +517,25 @@ impl Graphics {
 }
 
 /// Breakout as a Titan [`App`].
-#[derive(Debug)]
 pub(crate) struct BreakoutApp {
     level: Level,
     game: Game,
     surface: SurfaceSize,
     graphics: Option<Graphics>,
+    speaker: Option<Speaker>,
+}
+
+impl fmt::Debug for BreakoutApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BreakoutApp")
+            .field("level", &self.level)
+            .field("game", &self.game)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BreakoutApp {
-    /// A game of the built-in level.
+    /// A muted game of the built-in level.
     pub(crate) fn new() -> Self {
         Self::with_level(Level::classic())
     }
@@ -391,7 +546,13 @@ impl BreakoutApp {
             level,
             surface: SurfaceSize::default(),
             graphics: None,
+            speaker: None,
         }
+    }
+
+    /// Plays this game's sounds through `speaker`, or mutes it with `None`.
+    pub(crate) fn with_speaker(self, speaker: Option<Speaker>) -> Self {
+        Self { speaker, ..self }
     }
 
     #[cfg(test)]
@@ -461,6 +622,10 @@ impl App for BreakoutApp {
                     self.game = Game::new(&self.level);
                 }
             }
+        }
+        match &mut self.speaker {
+            Some(speaker) => self.game.sounds.drain(..).for_each(speaker),
+            None => self.game.sounds.clear(),
         }
         AppAction::Continue
     }

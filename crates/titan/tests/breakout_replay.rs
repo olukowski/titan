@@ -1,15 +1,19 @@
-//! Breakout's level format, its gameplay rules, its generated sprite sheet, and a 1,260-frame
-//! headless replay that must reproduce the same game and the same GPU frames every time.
+//! Breakout's level format, its gameplay rules and sounds, its generated sprite sheet, and a
+//! 1,260-frame headless replay that must reproduce the same game, GPU frames, and sounds every
+//! time.
 
 #[path = "../examples/breakout_game/mod.rs"]
 mod breakout;
 
 use breakout::level::{Level, LevelError, LevelErrorKind};
-use breakout::{BreakoutApp, Phase, Snapshot};
+use breakout::{BreakoutApp, Phase, SAMPLE_RATE, Snapshot, SoundEvent, Sounds};
+use std::cell::RefCell;
+use std::rc::Rc;
 use titan::app::{
     Event, EventLog, HeadlessConfig, HeadlessRunner, KeyCode, MouseButton, SurfaceSize,
 };
 use titan::assets::{Atlas, Image, encode_qoi};
+use titan::audio::AudioMixer;
 use titan::core::Vec2;
 use titan::gpu::{DrawCmd, RecordedFrame, RenderCmd};
 
@@ -22,6 +26,17 @@ fn level(grid: &str) -> Level {
 
 fn run(app: BreakoutApp) -> HeadlessRunner<BreakoutApp> {
     HeadlessRunner::new(app, HeadlessConfig::default()).unwrap()
+}
+
+/// Every sound a game has played so far, in order.
+type Heard = Rc<RefCell<Vec<SoundEvent>>>;
+
+/// Runs `app` with a speaker that records its sounds.
+fn listen(app: BreakoutApp) -> (HeadlessRunner<BreakoutApp>, Heard) {
+    let heard = Heard::default();
+    let sink = Rc::clone(&heard);
+    let app = app.with_speaker(Some(Box::new(move |event| sink.borrow_mut().push(event))));
+    (run(app), heard)
 }
 
 fn tick(runner: &mut HeadlessRunner<BreakoutApp>, events: &[Event]) -> Snapshot {
@@ -472,7 +487,7 @@ fn bricks_score_when_destroyed_and_silver_takes_two_hits() {
     assert!(hit.ball_velocity.y < 0.0, "it bounces back down");
 
     // One full-width silver brick: whatever the ball does, it hits that brick on the way up.
-    let mut runner = run(BreakoutApp::with_level(level("S")));
+    let (mut runner, heard) = listen(BreakoutApp::with_level(level("S")));
     tap(&mut runner, KeyCode::Space);
     let damaged = tick_until(&mut runner, 120, |s| s.ball_velocity.y < 0.0);
     assert_eq!((damaged.score, damaged.bricks_remaining), (0, 1));
@@ -489,11 +504,20 @@ fn bricks_score_when_destroyed_and_silver_takes_two_hits() {
         (Phase::Won, 100, 0)
     );
     assert_eq!(won.ball_velocity, Vec2::ZERO);
+    assert_eq!(
+        *heard.borrow(),
+        [
+            SoundEvent::Brick,
+            SoundEvent::Miss,
+            SoundEvent::BrickBreak,
+            SoundEvent::Won
+        ]
+    );
 }
 
 #[test]
 fn clearing_the_level_wins_and_space_restarts() {
-    let mut runner = run(BreakoutApp::with_level(level("B")));
+    let (mut runner, heard) = listen(BreakoutApp::with_level(level("B")));
     tap(&mut runner, KeyCode::Space);
     let won = tick_until(&mut runner, 120, |s| s.phase == Phase::Won);
     assert_eq!((won.score, won.bricks_remaining, won.lives), (10, 0, 2));
@@ -509,12 +533,14 @@ fn clearing_the_level_wins_and_space_restarts() {
         (restarted.phase, restarted.score, restarted.bricks_remaining),
         (Phase::Ready, 0, 1)
     );
+    // The win sounds once, not on every frozen frame.
+    assert_eq!(*heard.borrow(), [SoundEvent::BrickBreak, SoundEvent::Won]);
 }
 
 #[test]
 fn falling_balls_cost_lives_until_the_game_is_lost_and_enter_restarts() {
     // The paddle runs to the far left after each launch, so the ball falls past it.
-    let mut runner = run(BreakoutApp::with_level(level("B.........")));
+    let (mut runner, heard) = listen(BreakoutApp::with_level(level("B.........")));
     for lives_left in [1, 0] {
         tap(&mut runner, KeyCode::Space);
         tick(&mut runner, &[Event::KeyDown(KeyCode::ArrowLeft)]);
@@ -537,6 +563,42 @@ fn falling_balls_cost_lives_until_the_game_is_lost_and_enter_restarts() {
         (restarted.phase, restarted.lives, restarted.score),
         (Phase::Ready, 2, 0)
     );
+    // Only the last ball sounds the loss.
+    assert_eq!(
+        *heard.borrow(),
+        [
+            SoundEvent::Wall,
+            SoundEvent::Miss,
+            SoundEvent::Wall,
+            SoundEvent::Lost
+        ]
+    );
+}
+
+#[test]
+fn every_sound_effect_renders_and_plays_audibly_without_clipping() {
+    let mut mixer = AudioMixer::new(SAMPLE_RATE).unwrap();
+    let sounds = Sounds::new(&mut mixer);
+    // 50 ms of interleaved stereo.
+    let mut out = vec![0.0; 2 * SAMPLE_RATE as usize / 20];
+    let mut peak = |mixer: &mut AudioMixer| {
+        mixer.mix(&mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+        out.iter().fold(0.0_f32, |peak, s| peak.max(s.abs()))
+    };
+    for (index, event) in SoundEvent::ALL.into_iter().enumerate() {
+        assert_eq!(event as usize, index, "ALL is in declaration order");
+        sounds.play(&mut mixer, event);
+        let loudest = peak(&mut mixer);
+        // The mixer clamps to 1.0, so staying below it means the effect does not clip.
+        assert!((0.05..1.0).contains(&loudest), "{event:?}: peak {loudest}");
+        mixer.stop_all();
+    }
+    for event in SoundEvent::ALL {
+        sounds.play(&mut mixer, event);
+    }
+    let together = peak(&mut mixer);
+    assert!(together < 1.0, "every effect at once peaks at {together}");
 }
 
 #[test]
@@ -574,11 +636,18 @@ const REPLAY_FRAMES: usize = 1260;
 
 /// Plays the classic level for `REPLAY_FRAMES` frames with a simple autopilot that chases the
 /// ball with the arrow keys, then A/D, serves with Space, and also moves the pointer and resizes
-/// the surface. Returns the recorded input, the finished run, and how often the ball bounced off
-/// the paddle and the side walls.
-fn record_autopilot() -> (EventLog, HeadlessRunner<BreakoutApp>, u32, u32) {
+/// the surface. Returns the recorded input, the finished run, how often the ball bounced off
+/// the paddle and the side walls, and each sound with the frame that played it.
+fn record_autopilot() -> (
+    EventLog,
+    HeadlessRunner<BreakoutApp>,
+    u32,
+    u32,
+    Vec<(usize, SoundEvent)>,
+) {
     let mut log = EventLog::new();
-    let mut runner = run(BreakoutApp::new());
+    let (mut runner, heard) = listen(BreakoutApp::new());
+    let mut sounds = Vec::new();
     let (mut paddle_bounces, mut side_bounces) = (0, 0);
     let mut held: Option<KeyCode> = None;
     for frame in 0..REPLAY_FRAMES {
@@ -626,6 +695,7 @@ fn record_autopilot() -> (EventLog, HeadlessRunner<BreakoutApp>, u32, u32) {
         }
         runner.tick_frame(dt, &events).unwrap();
         log.push_frame(dt, events);
+        sounds.extend(heard.borrow_mut().drain(..).map(|event| (frame, event)));
 
         let after = runner.app().snapshot();
         if before.ball_velocity.y < 0.0
@@ -640,12 +710,13 @@ fn record_autopilot() -> (EventLog, HeadlessRunner<BreakoutApp>, u32, u32) {
             side_bounces += 1;
         }
     }
-    (log, runner, paddle_bounces, side_bounces)
+    (log, runner, paddle_bounces, side_bounces, sounds)
 }
 
 #[test]
 fn a_recorded_game_replays_identically_from_its_text_log() {
-    let (recorded_log, recorded, paddle_bounces, side_bounces) = record_autopilot();
+    let (recorded_log, recorded, paddle_bounces, side_bounces, recorded_sounds) =
+        record_autopilot();
     let text = recorded_log.to_string();
     let log = EventLog::parse(&text).unwrap();
     assert_eq!(log, recorded_log);
@@ -664,12 +735,12 @@ fn a_recorded_game_replays_identically_from_its_text_log() {
     assert!(lines.iter().any(|l| l.starts_with("pointer_move ")));
 
     let replay = || {
-        let mut runner = run(BreakoutApp::new());
+        let (mut runner, heard) = listen(BreakoutApp::new());
         let summary = runner.replay(&log).unwrap();
-        (summary, runner)
+        (summary, runner, heard.take())
     };
-    let (first_summary, first) = replay();
-    let (second_summary, second) = replay();
+    let (first_summary, first, first_sounds) = replay();
+    let (second_summary, second, second_sounds) = replay();
 
     assert_eq!(first_summary, second_summary);
     assert_eq!(first_summary.frames_run, REPLAY_FRAMES);
@@ -685,11 +756,46 @@ fn a_recorded_game_replays_identically_from_its_text_log() {
     assert_eq!(first.gpu().frames(), second.gpu().frames());
     assert_eq!(first.gpu().events(), second.gpu().events());
     assert_eq!(first.gpu().frames(), recorded.gpu().frames());
+    assert_eq!(first_sounds, second_sounds);
+    let sounds: Vec<SoundEvent> = recorded_sounds.iter().map(|&(_, event)| event).collect();
+    assert_eq!(first_sounds, sounds, "the replay sounds like the live run");
+
+    // The run's exact soundtrack: how often each sound played, and when the first ones did.
+    let count = |kind| sounds.iter().filter(|&&event| event == kind).count();
+    let counts = SoundEvent::ALL.map(|kind| (kind, count(kind)));
+    assert_eq!(
+        counts,
+        [
+            (SoundEvent::Paddle, 12),
+            (SoundEvent::Wall, 4),
+            (SoundEvent::Brick, 0),
+            (SoundEvent::BrickBreak, 12),
+            (SoundEvent::Miss, 0),
+            (SoundEvent::Won, 0),
+            (SoundEvent::Lost, 0),
+        ]
+    );
+    assert_eq!(
+        recorded_sounds[..5],
+        [
+            (50, SoundEvent::BrickBreak),
+            (99, SoundEvent::Paddle),
+            (148, SoundEvent::BrickBreak),
+            (195, SoundEvent::Paddle),
+            (199, SoundEvent::Wall),
+        ]
+    );
 
     // Real gameplay happened.
     assert!(paddle_bounces >= 3, "{paddle_bounces} paddle bounces");
     assert!(side_bounces >= 1, "{side_bounces} side wall bounces");
     assert!(state.score > 0 && state.bricks_remaining < 60, "{state:?}");
+    // The sounds agree with the independent counters; the ceiling also sounds `Wall`.
+    assert_eq!(count(SoundEvent::Paddle), paddle_bounces as usize);
+    assert!(count(SoundEvent::Wall) >= side_bounces as usize);
+    // No restart happened, so every missing brick broke and every missing life was a miss.
+    assert_eq!(count(SoundEvent::BrickBreak), 60 - state.bricks_remaining);
+    assert_eq!(count(SoundEvent::Miss), 3 - state.lives as usize);
     assert_eq!(first.gpu().frames().len(), REPLAY_FRAMES);
     first
         .gpu()

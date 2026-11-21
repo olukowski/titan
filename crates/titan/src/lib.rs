@@ -8,6 +8,7 @@
 //! - [`app`]: the `App` trait, input, replayable event logs, and a headless runner.
 //! - [`render2d`]: a batched 2D quad and sprite renderer.
 //! - [`assets`]: RGBA8 images, the QOI codec, and plaintext sprite atlases.
+//! - [`audio`]: sounds, WAV decoding, a procedural SFX synth, and a deterministic stereo mixer.
 //! - [`wasm`]: the browser backend and its `export_app!` macro.
 //! - `macos` (macOS only): the native AppKit and Metal backend.
 //!
@@ -19,6 +20,7 @@
 pub use titan_2d as render2d;
 pub use titan_app as app;
 pub use titan_assets as assets;
+pub use titan_audio as audio;
 pub use titan_core as core;
 pub use titan_gpu as gpu;
 #[cfg(target_os = "macos")]
