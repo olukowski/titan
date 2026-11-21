@@ -1075,12 +1075,152 @@ export function createWebGL2Backend(gl, fail) {
   };
 }
 
+// Audio: Rust mixes on the main thread and an AudioWorklet plays. Every chunk the main thread
+// posts carries its start frame on the AudioContext's timeline, and the worklet plays each frame
+// exactly when that timeline reaches it. Each animation frame tops the mixed audio up to
+// AUDIO_LEAD_SECS past the context's current time, so the lead bounds both the buffering and the
+// added latency of a sound the app starts. Late data never shifts the timeline: the worklet drops
+// it and plays silence, so latency cannot drift.
+//
+// 60 ms covers the gap until the next top-up (16.7 ms at 60 Hz, 33 ms if one frame is dropped),
+// plus how far the audio thread renders ahead of the main thread's `currentTime` (up to one device
+// buffer, about 10-20 ms), plus a few ms of postMessage delivery.
+export const AUDIO_LEAD_SECS = 0.06;
+const AUDIO_PROCESSOR = "titan-audio";
+// Activation-triggering events: the first one lets a suspended context resume.
+const UNLOCK_EVENTS = ["pointerdown", "pointerup", "keydown"];
+
+/**
+ * Plans the next chunk to mix: from `written` (the frame after the last one posted) up to
+ * `played + lead`, where `played` is the context's current frame. A stalled main thread (a hidden
+ * tab) skips ahead to `played` instead of mixing audio that can no longer play, so the mixer
+ * resumes where it paused. Returns `{ start, frames }`, with `frames` at most `lead`.
+ */
+export function planAudioChunk(written, played, lead) {
+  const start = Math.max(written, played);
+  return { start, frames: Math.max(0, played + lead - start) };
+}
+
+/**
+ * Fills one render quantum starting at context frame `frame` from `queue`, an array of
+ * `{ start, samples }` chunks (interleaved stereo, sorted by `start`), and removes the chunks that
+ * end by the quantum's end. Frames no chunk covers are silent. Runs inside the worklet, so it
+ * must not use anything else in this module.
+ */
+export function renderAudioQuantum(queue, frame, left, right) {
+  left.fill(0);
+  right.fill(0);
+  const end = frame + left.length;
+  for (const { start, samples } of queue) {
+    if (start >= end) break;
+    const from = Math.max(start, frame);
+    const to = Math.min(start + samples.length / 2, end);
+    for (let f = from; f < to; f++) {
+      left[f - frame] = samples[2 * (f - start)];
+      right[f - frame] = samples[2 * (f - start) + 1];
+    }
+  }
+  while (queue.length > 0 && queue[0].start + queue[0].samples.length / 2 <= end) queue.shift();
+}
+
+// A worklet runs in its own global scope and loads only whole modules, so its module is built
+// from source: renderAudioQuantum plus a processor that queues the chunks the main thread posts.
+// The processor calls it by a local name, since a minifier may rename the function itself.
+const AUDIO_WORKLET_SOURCE = `const render = ${renderAudioQuantum};
+registerProcessor(${JSON.stringify(AUDIO_PROCESSOR)}, class extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.queue = [];
+    this.port.onmessage = ({ data }) => this.queue.push(data);
+  }
+  process(inputs, [[left, right]]) {
+    render(this.queue, currentFrame, left, right);
+    return true;
+  }
+});
+`;
+
+/**
+ * The page's audio: nothing until `start(sampleRate)` creates an AudioContext at that rate, which
+ * then plays what `pump` mixes until `stop`. `deps` supplies `AudioContext`, `AudioWorkletNode`,
+ * `URL`, and `Blob`, the `unlockTarget` whose input events resume a suspended context, and
+ * `onError` for failures after `start` returns.
+ */
+export function createAudioHost({ AudioContext, AudioWorkletNode, URL, Blob, unlockTarget, onError }) {
+  // The playing context and its stream state, or null.
+  let live = null;
+  const removeUnlock = (session) => {
+    for (const type of UNLOCK_EVENTS) unlockTarget.removeEventListener(type, session.unlock);
+  };
+  return {
+    /** Starts playing at `sampleRate`; throws if audio is already playing or cannot start. */
+    start(sampleRate) {
+      if (live) throw new Error("audio is already playing");
+      if (!AudioContext || !AudioWorkletNode) throw new Error("this browser has no Web Audio AudioWorklet");
+      const ctx = new AudioContext({ sampleRate, latencyHint: "interactive" });
+      if (ctx.sampleRate !== sampleRate) {
+        ctx.close();
+        throw new Error(`the AudioContext runs at ${ctx.sampleRate} Hz, not the mixer's ${sampleRate} Hz`);
+      }
+      // Browsers expose AudioWorklet only to secure contexts.
+      if (!ctx.audioWorklet) {
+        ctx.close();
+        throw new Error("AudioWorklet needs a secure context (HTTPS or localhost)");
+      }
+      const session = { ctx, node: null, written: 0, lead: Math.ceil(AUDIO_LEAD_SECS * sampleRate) };
+      session.unlock = () => ctx.resume().then(() => {
+        if (ctx.state === "running") removeUnlock(session);
+      }, (error) => {
+        if (live === session) onError(error);
+      });
+      for (const type of UNLOCK_EVENTS) unlockTarget.addEventListener(type, session.unlock);
+      live = session;
+      const url = URL.createObjectURL(new Blob([AUDIO_WORKLET_SOURCE], { type: "text/javascript" }));
+      ctx.audioWorklet.addModule(url).then(() => {
+        if (live !== session) return;
+        session.node = new AudioWorkletNode(ctx, AUDIO_PROCESSOR, { numberOfInputs: 0, outputChannelCount: [2] });
+        session.node.connect(ctx.destination);
+      }).catch((error) => {
+        if (live === session) onError(error);
+      }).finally(() => URL.revokeObjectURL(url));
+    },
+    /** Closes the context, if one is playing. */
+    stop() {
+      if (!live) return;
+      const { ctx, node } = live;
+      removeUnlock(live);
+      live = null;
+      node?.disconnect();
+      ctx.close();
+    },
+    /**
+     * Tops up the worklet's audio. `mix(frames)` returns `2 * frames` interleaved samples, or
+     * nothing after it has reported a failure. Does nothing until the worklet has loaded.
+     */
+    pump(mix) {
+      const session = live;
+      if (!session?.node) return;
+      const { ctx } = session;
+      const played = Math.floor(ctx.currentTime * ctx.sampleRate);
+      const { start, frames } = planAudioChunk(session.written, played, session.lead);
+      if (frames === 0) return;
+      const mixed = mix(frames);
+      if (!mixed) return;
+      // A copy, since WASM memory can detach on growth, transferred rather than cloned.
+      const samples = mixed.slice();
+      session.node.port.postMessage({ start, samples }, [samples.buffer]);
+      session.written = start + frames;
+    },
+  };
+}
+
 /**
  * Loads the Titan app at `wasmUrl` and runs it on `canvas` until it exits or fails.
  * Renders with WebGPU, or with WebGL2 where WebGPU has no adapter (WebGL2 needs GLSL shaders).
  * Resolves to `{ dispose, backend }` once running, where `backend` is "webgpu" or "webgl2";
  * rejects if neither API or the module can start. Later failures, including WebGPU validation
- * errors and WebGL2 context loss, stop the app and call `onError`.
+ * errors and WebGL2 context loss, stop the app and call `onError`. An app that starts an
+ * `AudioOutput` is heard once the user first presses a key or pointer button on the page.
  */
 export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
   // "starting" until runTitan resolves, then "running" until exit, failure, or dispose.
@@ -1099,6 +1239,7 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
     observer?.disconnect();
     for (const [target, type, fn] of listeners) target.removeEventListener(type, fn);
     backend?.destroy();
+    audio.stop();
   };
   const fail = (error) => {
     if (state === "starting") {
@@ -1108,6 +1249,9 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
       onError(error);
     }
   };
+  // Creates no AudioContext unless the app starts audio.
+  const audio = createAudioHost({ AudioContext: globalThis.AudioContext,
+    AudioWorkletNode: globalThis.AudioWorkletNode, URL, Blob, unlockTarget: window, onError: fail });
 
   let memory = null;
   let pendingError = new Uint8Array(0);
@@ -1146,6 +1290,8 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
     }),
     destroy_pipeline: (id) => backend.destroyPipeline(id),
     submit_frame: fallible((ptr, len) => backend.submitFrame(decodeFrame(bytes(ptr, len)))),
+    audio_start: fallible((sampleRate) => audio.start(sampleRate)),
+    audio_stop: () => audio.stop(),
     read_error: (ptr, len) => bytes(ptr, len).set(pendingError.subarray(0, len)),
     log: (level, ptr, len) => {
       const message = textDecoder.decode(bytes(ptr, len));
@@ -1311,6 +1457,16 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
   }, { passive: false });
   listen(canvas, "contextmenu", (e) => e.preventDefault());
 
+  // A view of the next `frames` mixed stereo frames in WASM memory, or nothing after a failure.
+  const mixAudio = (frames) => {
+    const ptr = callExport("titan_audio_mix", frames);
+    if (!ptr) {
+      fail(failed("titan_audio_mix"));
+      return undefined;
+    }
+    return new Float32Array(memory.buffer, ptr >>> 0, 2 * frames);
+  };
+
   let previous = performance.now();
   const tick = (now) => {
     if (state !== "running") return;
@@ -1327,6 +1483,7 @@ export async function runTitan({ canvas, wasmUrl, onError = console.error }) {
       if (result === 1) shutdown();
       else if (result < 0) fail(failed("titan_frame"));
     }
+    if (state === "running") audio.pump(mixAudio);
     if (state === "running") frameHandle = requestAnimationFrame(tick);
   };
   frameHandle = requestAnimationFrame(tick);

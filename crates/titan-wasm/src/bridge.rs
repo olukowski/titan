@@ -98,6 +98,8 @@ pub trait HostBridge {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm::WasmBridge;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use wasm::{host_error, imports};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -110,7 +112,7 @@ mod wasm {
     /// The functions `web/titan.js` provides as the `titan` import module. Each fallible import
     /// returns 0 on success or the byte length of an error message, which `read_error` then
     /// copies out. Pointers and lengths name ranges of this module's linear memory.
-    mod imports {
+    pub(crate) mod imports {
         #[link(wasm_import_module = "titan")]
         unsafe extern "C" {
             pub(super) safe fn surface_format() -> u32;
@@ -143,6 +145,8 @@ mod wasm {
             pub(super) unsafe fn submit_frame(cmd_ptr: *const u8, cmd_len: u32) -> u32;
             pub(super) unsafe fn read_error(dst_ptr: *mut u8, dst_len: u32);
             pub(super) unsafe fn log(level: u32, msg_ptr: *const u8, msg_len: u32);
+            pub(crate) safe fn audio_start(sample_rate: u32) -> u32;
+            pub(crate) safe fn audio_stop();
         }
     }
 
@@ -156,17 +160,21 @@ mod wasm {
         (bytes.as_ptr(), bytes.len() as u32)
     }
 
-    /// Turns an import's return value into a result, fetching the error message if there is one.
-    fn check(error_len: u32) -> Result<(), GpuError> {
+    /// Fetches the error message of a fallible import that returned `error_len`, or returns
+    /// `None` if it succeeded.
+    pub(crate) fn host_error(error_len: u32) -> Option<String> {
         if error_len == 0 {
-            return Ok(());
+            return None;
         }
         let mut message = vec![0; error_len as usize];
         // SAFETY: `message` is `error_len` writable bytes, which the import fills.
         unsafe { imports::read_error(message.as_mut_ptr(), error_len) };
-        Err(GpuError::Backend(
-            String::from_utf8_lossy(&message).into_owned(),
-        ))
+        Some(String::from_utf8_lossy(&message).into_owned())
+    }
+
+    /// Turns an import's return value into a result, fetching the error message if there is one.
+    fn check(error_len: u32) -> Result<(), GpuError> {
+        host_error(error_len).map_or(Ok(()), |message| Err(GpuError::Backend(message)))
     }
 
     impl HostBridge for WasmBridge {
