@@ -5,6 +5,8 @@
 
 #![no_std]
 
+pub use titan_core as core;
+
 /// The version of the `titan` crate, as set in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
