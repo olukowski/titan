@@ -1,0 +1,16 @@
+[package]
+name = "titan-app"
+description = "Titan app layer: the App trait, input state, replayable event logs, and a headless runner."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-gpu = { path = "../titan-gpu" }
+
+[lints]
+workspace = true
