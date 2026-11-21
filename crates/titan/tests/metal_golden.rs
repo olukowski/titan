@@ -166,7 +166,7 @@ fn camera_maps_y_up_world_to_top_left_pixels_and_pans_and_zooms() {
     let sprites = [
         // Pixels x 32..48, y 24..32: just up and right of center.
         Sprite::solid(rect(10.0, 10.0, 18.0, 14.0), color(RED)),
-        // Pixels x 12..20, y 44..52: a pan in the wrong direction moves it off-screen.
+        // Pixels x 12..20, y 44..52.
         Sprite::solid(rect(0.0, 0.0, 4.0, 4.0), color(GREEN)),
     ];
     let pixels = scene.render((64, 64), ClearColor::BLACK, &camera, &sprites);
@@ -194,8 +194,8 @@ fn textured_quads_sample_upright_texels_regions_and_tints() {
     let sprites = [
         // Top-left 32×32 pixels: the whole texture, the right way up.
         Sprite::textured(rect(0.0, 32.0, 32.0, 64.0), checker),
-        // Top-right: only the top-right (green) texel, stretched.
-        Sprite::textured(rect(32.0, 32.0, 64.0, 64.0), checker).with_uv(rect(0.5, 0.0, 1.0, 0.5)),
+        // Top-right: only the bottom-right (white) texel, stretched.
+        Sprite::textured(rect(32.0, 32.0, 64.0, 64.0), checker).with_uv(rect(0.5, 0.5, 1.0, 1.0)),
         // Bottom-left: the whole texture times the tint.
         Sprite::textured(rect(0.0, 0.0, 32.0, 32.0), checker).with_color(color(tint)),
     ];
@@ -205,10 +205,10 @@ fn textured_quads_sample_upright_texels_regions_and_tints() {
         ((24, 8), GREEN),
         ((8, 24), BLUE),
         ((24, 24), WHITE),
-        ((40, 8), GREEN),
-        ((56, 8), GREEN),
-        ((40, 24), GREEN),
-        ((56, 24), GREEN),
+        ((40, 8), WHITE),
+        ((56, 8), WHITE),
+        ((40, 24), WHITE),
+        ((56, 24), WHITE),
         // Red, green, blue, and white texels, each multiplied by (1, 128/255, 0).
         ((8, 40), RED),
         ((24, 40), [0, 128, 0, 255]),
@@ -222,12 +222,11 @@ fn textured_quads_sample_upright_texels_regions_and_tints() {
 #[test]
 fn translucent_quads_blend_color_and_alpha_over_what_is_below() {
     let mut scene = Scene::new();
-    let src = [255, 0, 0, 64];
-    let dst_opaque = BLUE;
+    let half_blue = [0, 0, 255, 128];
     let sprites = [
-        Sprite::solid(rect(0.0, 0.0, 32.0, 64.0), color(dst_opaque)),
-        // Straddles the opaque blue quad and the transparent clear.
-        Sprite::solid(rect(16.0, 16.0, 48.0, 48.0), color(src)),
+        Sprite::solid(rect(0.0, 0.0, 32.0, 64.0), color(half_blue)),
+        // Straddles the half-transparent blue quad and the transparent clear.
+        Sprite::solid(rect(16.0, 16.0, 48.0, 48.0), color([255, 0, 0, 64])),
     ];
     let pixels = scene.render(
         (64, 64),
@@ -237,14 +236,10 @@ fn translucent_quads_blend_color_and_alpha_over_what_is_below() {
     );
 
     // `BlendState::ALPHA_BLENDING`: color = src * src.a + dst * (1 - src.a),
-    // alpha = src.a + dst.a * (1 - src.a).
-    let blend = |dst: Rgba| -> Rgba {
-        let a = f32::from(src[3]) / 255.0;
-        let rgb = |i: usize| (f32::from(src[i]) * a + f32::from(dst[i]) * (1.0 - a)).round() as u8;
-        let alpha = (f32::from(src[3]) + f32::from(dst[3]) * (1.0 - a)).round() as u8;
-        [rgb(0), rgb(1), rgb(2), alpha]
-    };
-    for ((x, y), expected) in [((24, 32), blend(dst_opaque)), ((40, 32), blend([0; 4]))] {
+    // alpha = src.a + dst.a * (1 - src.a). The blue quad lands on the clear as
+    // (0, 0, 128, 128); the red quad (a = 64/255) over it gives (64, 0, 96, 160), and over
+    // the clear (64, 0, 0, 64).
+    for ((x, y), expected) in [((24, 32), [64, 0, 96, 160]), ((40, 32), [64, 0, 0, 64])] {
         let actual = pixels.at(x, y);
         assert!(
             actual
@@ -254,10 +249,7 @@ fn translucent_quads_blend_color_and_alpha_over_what_is_below() {
             "pixel ({x}, {y}) is {actual:?}, expected {expected:?}"
         );
     }
-    // Sanity-pin the formula's output: (64, 0, 191, 255) over blue, (64, 0, 0, 64) over clear.
-    assert_eq!(blend(dst_opaque), [64, 0, 191, 255]);
-    assert_eq!(blend([0; 4]), [64, 0, 0, 64]);
-    pixels.assert(&[((8, 32), BLUE), ((56, 32), [0; 4])]);
+    pixels.assert(&[((8, 32), [0, 0, 128, 128]), ((56, 32), [0; 4])]);
     scene.destroy(&[]);
 }
 
