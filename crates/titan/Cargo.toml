@@ -8,5 +8,8 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 
+[dependencies]
+titan-core = { path = "../titan-core" }
+
 [lints]
 workspace = true
